@@ -1,0 +1,26 @@
+[package]
+name = "git-system-tray"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+blocking = []
+
+[dependencies]
+tray-icon = "0.21.1"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+winit = "0.30.0-alpha.4"
+winapi = { version = "0.3.9", features = ["winuser"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio_schedule = "0.3.2"
+open = "5.3.2"
+oauth2 = "5.0.0"
+url = "2.5.7"
+serde_json = "1.0.145"
+
+[[bin]]
+edition = "2018"
+name = "github_notifications_trayicon"
+path = "src/main.rs"
