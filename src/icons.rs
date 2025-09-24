@@ -1,21 +1,27 @@
-use tray_icon::Icon;
-use image::io::Reader as ImageReader;
-use image::ImageFormat;
+/// Icon management for GitHub Tray Icon.
+use std::path::Path;
 
-const GITHUB_ICON: &[u8] = include_bytes!("../assets/github.ico");
-const GITHUB_BLUE_ICON: &[u8] = include_bytes!("../assets/github_blue.ico");
+const GITHUB_ICON: &[u8] = include_bytes!("../assets/github.png");
+const GITHUB_BLUE_ICON: &[u8] = include_bytes!("../assets/github_blue.png");
 
-fn icon_from_ico_bytes(bytes: &[u8]) -> Icon {
-    let img = ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Ico)
-        .decode()
-        .expect("Failed to decode icon bytes");
-    let rgba = img.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    Icon::from_rgba(rgba.into_raw(), width, height).expect("Failed to create Icon from RGBA")
+/// Writes icon bytes to a file, logging errors if they occur.
+fn write_to_icon_file(bytes: &[u8], path: &str) {
+    if let Err(e) = std::fs::write(path, bytes) {
+        eprintln!("Failed to write icon file '{}': {e}", path);
+    }
 }
 
-pub fn load_icons() -> (Icon, Icon) {
-    let icon = icon_from_ico_bytes(GITHUB_ICON);
-    let icon_with_notification = icon_from_ico_bytes(GITHUB_BLUE_ICON);
-    (icon, icon_with_notification)
+/// Creates icon files in the asset directory and returns their paths as strings.
+pub fn create_icons(app_asset_path: &Path) -> (String, String) {
+    if let Err(e) = std::fs::create_dir_all(&app_asset_path) {
+        eprintln!("Failed to create assets directory: {e}");
+    }
+    let github_icon_path = app_asset_path.join("github.png");
+    let github_blue_icon_path = app_asset_path.join("github_blue.png");
+    write_to_icon_file(GITHUB_ICON, github_icon_path.to_str().unwrap_or("github.png"));
+    write_to_icon_file(GITHUB_BLUE_ICON, github_blue_icon_path.to_str().unwrap_or("github_blue.png"));
+    (
+        github_icon_path.to_str().unwrap_or("").to_string(),
+        github_blue_icon_path.to_str().unwrap_or("").to_string(),
+    )
 }
