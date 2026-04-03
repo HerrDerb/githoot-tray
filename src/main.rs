@@ -1,3 +1,6 @@
+// On Windows, use the "windows" subsystem so no console window is created.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! Main entry point for the GitHub Tray Icon application.
 //! Handles cross-platform initialization and tray icon setup.
 
@@ -5,8 +8,6 @@ mod access_token;
 mod github;
 mod icons;
 mod scheduler;
-
-use crate::scheduler::start_notification_scheduler;
 
 /// Returns the path to the application's asset directory in the user's home.
 /// Creates the directory if it does not exist.
@@ -17,14 +18,16 @@ fn get_app_asset_path() -> std::path::PathBuf {
     assets_path
 }
 
+// ─── Linux ────────────────────────────────────────────────────────────────────
+
 #[cfg(target_os = "linux")]
-#[tokio::main]
-async fn main() {
+fn main() {
     use gtk::prelude::*;
     use gtk::{Menu, MenuItem};
     use libappindicator::{AppIndicator, AppIndicatorStatus};
 
     gtk::init().expect("Failed to initialize GTK.");
+
     let app_asset_path = get_app_asset_path();
     let (icon_path, icon_with_notification_path) = icons::create_icons(&app_asset_path);
     let access_token = access_token::get_access_token(&app_asset_path);
@@ -40,84 +43,155 @@ async fn main() {
             eprintln!("Failed to open browser: {e}");
         }
     });
+    let quit_item = MenuItem::with_label("Quit");
+    quit_item.connect_activate(|_| gtk::main_quit());
     menu.append(&item);
+    menu.append(&quit_item);
     menu.show_all();
     indicator.set_menu(&mut menu);
 
-    start_notification_scheduler(
-        indicator,
-        icon_path.to_string(),
-        icon_with_notification_path.to_string(),
-        access_token,
-    );
-    gtk::main();
-}
-
-#[cfg(target_os = "windows")]
-#[tokio::main]
-async fn main() {
-    use std::sync::mpsc;
-    use std::thread;
-    use tray_icon::{TrayIconBuilder, TrayIconEvent, menu::Menu, menu::MenuItem};
-    use winit::event::Event as WinitEvent;
-    use winit::event_loop::{ControlFlow, EventLoop};
-
-    // Set up asset path and icons
-    let app_asset_path = get_app_asset_path();
-    let (icon_path, icon_with_notification_path) = icons::create_icons(&app_asset_path);
-    let access_token = access_token::get_access_token(&app_asset_path).await;
-
-    // Build tray icon and menu
-    let mut menu = Menu::new();
-    let open_github_item = MenuItem::new("Open GitHub Notifications", true, None);
-    menu.append(&open_github_item);
-
-    let tray_icon = TrayIconBuilder::new()
-        .with_tooltip("GitHub Notifications")
-        .with_icon(icon_path.clone())
-        .with_menu(menu)
-        .build()
-        .expect("Failed to create tray icon");
-
-    // Channel for tray icon events
-    let (tx, rx) = mpsc::channel();
-    TrayIconEvent::set_event_handler(Some(move |event| {
-        let _ = tx.send(event.clone());
-    }));
-
-    // Spawn a thread to handle menu item clicks
-    let open_github_item_clone = open_github_item.clone();
-    thread::spawn(move || {
-        loop {
-            if open_github_item_clone.is_clicked() {
-                if let Err(e) = open::that("https://github.com/notifications") {
-                    eprintln!("Failed to open browser: {e}");
-                }
-            }
-            thread::sleep(std::time::Duration::from_millis(200));
-        }
-    });
-
-    // Start notification scheduler (dummy indicator for Windows, just pass tray_icon)
     scheduler::start_notification_scheduler(
-        tray_icon,
+        indicator,
         icon_path,
         icon_with_notification_path,
         access_token,
-    )
-    .await;
+    );
 
-    // Event loop to keep the application running
-    let event_loop = EventLoop::new();
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        match event {
-            WinitEvent::LoopDestroyed => return,
-            _ => {}
+    gtk::main();
+}
+
+// ─── Windows ──────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn main() {
+    use scheduler::TrayEvent;
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+    use tray_icon::TrayIconBuilder;
+    use winit::application::ApplicationHandler;
+    use winit::event::WindowEvent;
+    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+    use winit::window::WindowId;
+
+    // ── Single-instance guard ────────────────────────────────────────────────
+    // CreateMutexW returns the existing handle if the named mutex already exists,
+    // and GetLastError() reports ERROR_ALREADY_EXISTS. We intentionally never
+    // call CloseHandle so the mutex lives until the process exits.
+    // SetLastError(0) clears any stale error left by DLL/runtime init so that
+    // the GetLastError check is always based on CreateMutexW's own result.
+    unsafe {
+        use std::ptr::null_mut;
+        use winapi::um::errhandlingapi::{GetLastError, SetLastError};
+        use winapi::um::synchapi::CreateMutexW;
+
+        let name: Vec<u16> = "Local\\GitSystemTray\0".encode_utf16().collect();
+        SetLastError(0);
+        let handle = CreateMutexW(null_mut(), 0, name.as_ptr());
+
+        if handle.is_null() {
+            eprintln!("Warning: could not create single-instance mutex (err {})", GetLastError());
+        } else if GetLastError() == 0xB7 {
+            // ERROR_ALREADY_EXISTS — another instance owns the mutex
+            access_token::win_msgbox(
+                "Already Running",
+                "git-system-tray is already running.",
+            );
+            return;
         }
-        // Handle tray icon events if needed (future extension)
-        while let Ok(_event) = rx.try_recv() {
-            // Handle tray icon events here if needed
+        // On a fresh mutex (first instance) GetLastError() is 0 — fall through.
+    }
+
+    let app_asset_path = get_app_asset_path();
+    let access_token = access_token::get_access_token(&app_asset_path);
+
+    // Decode the embedded PNG assets into Icon objects on the main thread.
+    let (normal_icon, notification_icon) = icons::load_tray_icons();
+
+    // Build the tray menu.
+    let open_item = MenuItem::new("Open GitHub Notifications", true, None);
+    let open_item_id = open_item.id().clone();
+    let quit_item = MenuItem::new("Quit", true, None);
+    let quit_item_id = quit_item.id().clone();
+    let menu = Menu::new();
+    menu.append(&open_item).expect("Failed to append menu item");
+    menu.append(&quit_item).expect("Failed to append quit item");
+
+    // Build the tray icon (must be created on the main thread on Windows).
+    let tray_icon = TrayIconBuilder::new()
+        .with_tooltip("GitHub Notifications")
+        .with_icon(normal_icon.clone())
+        .with_menu(Box::new(menu))
+        .build()
+        .expect("Failed to create tray icon");
+
+    // Create the winit event loop with a custom event type so the background
+    // thread can wake the loop and deliver notification updates.
+    let event_loop: EventLoop<TrayEvent> = EventLoop::with_user_event()
+        .build()
+        .expect("Failed to create event loop");
+    let proxy = event_loop.create_proxy();
+
+    // Launch the polling thread; it communicates back via the proxy.
+    scheduler::start_notification_scheduler(access_token, proxy);
+
+    // ── Application handler ──────────────────────────────────────────────────
+
+    struct App {
+        tray_icon: tray_icon::TrayIcon,
+        normal_icon: tray_icon::Icon,
+        notification_icon: tray_icon::Icon,
+        open_item_id: tray_icon::menu::MenuId,
+        quit_item_id: tray_icon::menu::MenuId,
+    }
+
+    impl ApplicationHandler<TrayEvent> for App {
+        fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+        fn window_event(
+            &mut self,
+            _event_loop: &ActiveEventLoop,
+            _id: WindowId,
+            _event: WindowEvent,
+        ) {
         }
-    });
+
+        /// Called when the background thread delivers a notification-state update.
+        fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: TrayEvent) {
+            let TrayEvent::NotificationUpdate(has_notifications) = event;
+            let icon = if has_notifications {
+                &self.notification_icon
+            } else {
+                &self.normal_icon
+            };
+            if let Err(e) = self.tray_icon.set_icon(Some(icon.clone())) {
+                eprintln!("Failed to update tray icon: {e}");
+            }
+        }
+
+        fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            // Keep the loop sleeping until the next event arrives so we don't
+            // burn CPU.
+            event_loop.set_control_flow(ControlFlow::Wait);
+
+            // Handle tray menu clicks.
+            if let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == self.open_item_id {
+                    if let Err(e) = open::that("https://github.com/notifications") {
+                        eprintln!("Failed to open browser: {e}");
+                    }
+                } else if event.id == self.quit_item_id {
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
+    let mut app = App {
+        tray_icon,
+        normal_icon,
+        notification_icon,
+        open_item_id,
+        quit_item_id,
+    };
+
+    event_loop.run_app(&mut app).expect("Event loop failed");
 }
