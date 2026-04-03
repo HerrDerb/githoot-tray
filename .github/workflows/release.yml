@@ -43,7 +43,9 @@ jobs:
   # ── 2. Build release binaries for Windows and Linux ─────────────────────────
   build:
     needs: release-notes
+    if: always()
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest

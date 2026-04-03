@@ -20,35 +20,38 @@ pub fn start_notification_scheduler(
     icon_with_notification_path: String,
     access_token: String,
 ) {
-    use glib::MainContext;
     use std::sync::{Arc, Mutex};
 
-    let (sender, receiver) = MainContext::channel(glib::Priority::Default);
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let rx = Arc::new(Mutex::new(rx));
 
-    // Background thread: do all blocking network I/O here, never on the GTK main loop.
+    // Background thread: all blocking network I/O lives here.
     std::thread::spawn(move || {
         let http_client = reqwest::blocking::Client::new();
         loop {
             let has_notifications = get_unread_notification_count(&http_client, &access_token)
                 .map(|c| c > 0)
                 .unwrap_or(false);
-            if sender.send(has_notifications).is_err() {
+            if tx.send(has_notifications).is_err() {
                 break; // receiver dropped – main loop exited
             }
             std::thread::sleep(POLL_INTERVAL);
         }
     });
 
-    // GTK main-loop thread: update the indicator icon whenever a result arrives.
+    // GTK main-loop timer: drains any pending results from the background thread.
+    // Runs every second — cheap since it only checks a channel, not the network.
     let indicator = Arc::new(Mutex::new(indicator));
-    receiver.attach(None, move |has_notifications| {
-        let icon = if has_notifications {
-            icon_with_notification_path.as_str()
-        } else {
-            icon_path.as_str()
-        };
-        if let Ok(mut ind) = indicator.lock() {
-            ind.set_icon(icon);
+    glib::timeout_add_local(Duration::from_secs(1), move || {
+        while let Ok(has_notifications) = rx.lock().unwrap().try_recv() {
+            let icon = if has_notifications {
+                icon_with_notification_path.as_str()
+            } else {
+                icon_path.as_str()
+            };
+            if let Ok(mut ind) = indicator.lock() {
+                ind.set_icon(icon);
+            }
         }
         glib::ControlFlow::Continue
     });
