@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 1. Populate release notes with commits since the previous tag ────────────
+  release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so git log can reach the previous tag
+
+      - name: Generate and attach release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+
+          # Find the tag immediately before this one (version-sorted, excluding current)
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${CURRENT_TAG}$" | head -1)
+
+          if [ -n "$PREV_TAG" ]; then
+            printf "## Changes since %s\n\n" "$PREV_TAG" > notes.md
+            git log "${PREV_TAG}..HEAD" --oneline --no-merges >> notes.md
+          else
+            printf "## All commits\n\n" > notes.md
+            git log --oneline --no-merges >> notes.md
+          fi
+
+          gh release edit "$CURRENT_TAG" --notes-file notes.md
+
+  # ── 2. Build release binaries for Windows and Linux ─────────────────────────
+  build:
+    needs: release-notes
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: git-system-tray.exe
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: git-system-tray
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-dev \
+            libappindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Attach binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
+            --clobber
