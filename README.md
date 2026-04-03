@@ -2,6 +2,8 @@
 
 A lightweight Rust system tray app that watches your GitHub notifications and changes its icon the moment something new arrives.
 
+> **Transparency notice:** This project was largely built with the assistance of [GitHub Copilot](https://github.com/features/copilot). The architecture, bug fixes, OAuth flow, CI pipeline, and documentation were all developed through an AI-assisted session. The human author reviewed, guided, and directed the work throughout.
+
 ---
 
 ## Features
