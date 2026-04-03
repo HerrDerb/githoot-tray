@@ -4,11 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const ACCESS_TOKEN_FILE: &str = "access_token.txt";
-
-/// OAuth App client_id — register your app at https://github.com/settings/developers
-/// (OAuth App → enable Device Flow, scope "notifications").
-/// The client_id is public; no secret is required for the Device Code flow.
-const GITHUB_CLIENT_ID: &str = "Ov23liQOulR09MctoH6D";
+const CLIENT_ID_FILE: &str = "client_id.txt";
 
 const NOTIFICATION_SCOPE: &str = "notifications";
 
@@ -29,7 +25,7 @@ struct TokenPollResponse {
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
 
-/// Shows a message-box dialog on Windows (no-op on other platforms).
+/// Shows a message-box dialog on Windows.
 /// `pub` so `main.rs` can reuse it for the single-instance warning.
 #[cfg(target_os = "windows")]
 pub fn win_msgbox(title: &str, msg: &str) {
@@ -48,10 +44,20 @@ pub fn win_msgbox(title: &str, msg: &str) {
     }
 }
 
-/// Displays the device-code prompt to the user.
-/// On Windows (no console) this opens a MessageBox in a background thread so
-/// polling can proceed even before the user dismisses the dialog.
-/// On Linux/macOS the code is printed to stdout.
+/// Blocks until the user confirms (Windows: OK button, Linux: Enter key).
+fn wait_for_user_confirmation(title: &str, msg: &str) {
+    #[cfg(target_os = "windows")]
+    win_msgbox(title, msg);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("\n{}: {}\nPress Enter to continue...", title, msg);
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
+/// Displays the device-code prompt. On Windows this opens a non-blocking
+/// MessageBox in a background thread so polling can proceed immediately.
 fn show_auth_prompt(user_code: &str, verification_uri: &str) {
     #[cfg(target_os = "windows")]
     {
@@ -86,11 +92,76 @@ fn show_auth_success() {
     println!("Authorization successful!");
 }
 
+// ── Client ID ─────────────────────────────────────────────────────────────────
+
+/// Returns the saved OAuth client ID, prompting the user to enter one if missing.
+pub fn get_client_id(app_asset_path: &Path) -> String {
+    let client_id_path = app_asset_path.join(CLIENT_ID_FILE);
+
+    if let Ok(saved) = std::fs::read_to_string(&client_id_path) {
+        let id = saved.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+
+    prompt_for_client_id(&client_id_path)
+}
+
+/// Writes a template file and opens it in the default editor, then waits for
+/// the user to confirm before reading the entered Client ID back.
+fn prompt_for_client_id(client_id_path: &Path) -> String {
+    let instructions = "# GitHub OAuth App Client ID\n\
+        #\n\
+        # 1. Go to https://github.com/settings/developers\n\
+        # 2. Create a new OAuth App (enable Device Flow, scope: notifications)\n\
+        # 3. Replace the line below with your Client ID and save the file\n\
+        \n\
+        YOUR_CLIENT_ID_HERE\n";
+
+    if let Err(e) = std::fs::write(client_id_path, instructions) {
+        eprintln!("Failed to create client_id.txt: {e}");
+        std::process::exit(1);
+    }
+
+    // Open the file in the default editor (non-blocking).
+    if let Err(e) = open::that(client_id_path) {
+        eprintln!("Could not open editor automatically: {e}");
+    }
+
+    wait_for_user_confirmation(
+        "GitHub Setup",
+        &format!(
+            "Enter your GitHub OAuth App Client ID in the file:\n{}\n\nSave the file, then click OK.",
+            client_id_path.display()
+        ),
+    );
+
+    let content = std::fs::read_to_string(client_id_path).unwrap_or_default();
+    let client_id = content
+        .lines()
+        .find(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if client_id.is_empty() || client_id == "YOUR_CLIENT_ID_HERE" {
+        eprintln!("No valid Client ID found. Please restart and enter your Client ID.");
+        std::process::exit(1);
+    }
+
+    // Overwrite the file with just the clean ID (strips comments for future reads).
+    let _ = std::fs::write(client_id_path, &client_id);
+
+    client_id
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Retrieves a valid GitHub access token, using the device code flow if needed.
 pub fn get_access_token(app_asset_path: &Path) -> String {
     let token_path = app_asset_path.join(ACCESS_TOKEN_FILE);
+    let client_id = get_client_id(app_asset_path);
 
     // Re-use an existing valid token to avoid re-authenticating on every launch.
     if let Ok(saved) = std::fs::read_to_string(&token_path) {
@@ -101,7 +172,7 @@ pub fn get_access_token(app_asset_path: &Path) -> String {
         eprintln!("Saved token is no longer valid — starting re-authentication.");
     }
 
-    let token = device_code_flow();
+    let token = device_code_flow(&client_id);
 
     if let Err(e) = std::fs::write(&token_path, &token) {
         eprintln!("Warning: could not save access token to disk: {e}");
@@ -111,7 +182,7 @@ pub fn get_access_token(app_asset_path: &Path) -> String {
 }
 
 /// Runs the GitHub Device Code OAuth flow and returns the access token.
-fn device_code_flow() -> String {
+fn device_code_flow(client_id: &str) -> String {
     let client = Client::new();
 
     // ── Step 1: request a device code ─────────────────────────────────────────
@@ -119,14 +190,13 @@ fn device_code_flow() -> String {
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
         .header("User-Agent", "git-system-tray")
-        .form(&[("client_id", GITHUB_CLIENT_ID), ("scope", NOTIFICATION_SCOPE)])
+        .form(&[("client_id", client_id), ("scope", NOTIFICATION_SCOPE)])
         .send()
         .expect("Failed to request device code")
         .json()
         .expect("Failed to parse device code response");
 
     // ── Step 2: prompt the user ────────────────────────────────────────────────
-    // Open the browser first so it's ready when the user sees the code.
     if let Err(e) = open::that(&dc.verification_uri) {
         eprintln!("(Could not open browser automatically: {e})");
     }
@@ -149,7 +219,7 @@ fn device_code_flow() -> String {
             .header("Accept", "application/json")
             .header("User-Agent", "git-system-tray")
             .form(&[
-                ("client_id", GITHUB_CLIENT_ID),
+                ("client_id", client_id),
                 ("device_code", dc.device_code.as_str()),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
@@ -164,9 +234,8 @@ fn device_code_flow() -> String {
         }
 
         match resp.error.as_deref() {
-            Some("authorization_pending") => { /* keep waiting */ }
+            Some("authorization_pending") => {}
             Some("slow_down") => {
-                // GitHub is asking us to back off; add 5 s per the spec
                 poll_interval += Duration::from_secs(5);
             }
             Some("expired_token") => {
@@ -204,3 +273,4 @@ fn verify_access_token(token: &str) -> bool {
         }
     }
 }
+
