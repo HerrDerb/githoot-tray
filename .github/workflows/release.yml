@@ -17,25 +17,60 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create release with changelog
+      - name: Create or update release with changelog
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           CURRENT_TAG="${{ github.ref_name }}"
 
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${CURRENT_TAG}$" | head -1)
+          # Pick the previous tag by ancestry, not by version order. Sorting all tags and taking
+          # the highest that isn't this one silently produces a BACKWARDS range whenever the tag
+          # being released is not the newest (e.g. releasing v1.0.2 while v1.0.3 exists computed
+          # "v1.0.3..v1.0.2", i.e. nothing). `--merged` restricts to tags reachable from this
+          # tag; the inner filter drops tags pointing at the same commit, so double-tagged
+          # commits give a consistent answer either way round.
+          #
+          # `|| true` matters: on the very first release the filters yield nothing and exit 1,
+          # and `head -1` can SIGPIPE `git tag`. Either would kill the step under `pipefail`.
+          CURRENT_SHA=$(git rev-list -n1 "$CURRENT_TAG")
+          PREV_TAG=$(git tag --merged "$CURRENT_TAG" --sort=-version:refname \
+            | grep -v "^${CURRENT_TAG}$" \
+            | while read -r t; do
+                if [ "$(git rev-list -n1 "$t")" != "$CURRENT_SHA" ]; then echo "$t"; fi
+              done \
+            | head -1 || true)
 
           if [ -n "$PREV_TAG" ]; then
-            printf "## Changes since %s\n\n" "$PREV_TAG" > notes.md
-            git log "${PREV_TAG}..HEAD" --oneline --no-merges >> notes.md
+            RANGE="${PREV_TAG}..${CURRENT_TAG}"
+            HEADING="## Changes since ${PREV_TAG}"
           else
-            printf "## All commits\n\n" > notes.md
-            git log --oneline --no-merges >> notes.md
+            RANGE="$CURRENT_TAG"
+            HEADING="## All commits"
           fi
 
-          gh release create "$CURRENT_TAG" \
-            --title "$CURRENT_TAG" \
-            --notes-file notes.md
+          # Re-tagging an already-released commit yields an empty range, which would otherwise
+          # produce a release body containing nothing but a heading.
+          CHANGELOG=$(git log ${RANGE} --oneline --no-merges)
+          printf '%s\n\n%s\n' "$HEADING" "${CHANGELOG:-_No new commits in this range._}" > notes.md
+
+          # The release may already exist. Creating one through the GitHub UI or with
+          # `gh release create` also creates the tag, and that tag push is what triggers this
+          # workflow — so the job can be triggered by the very release it is trying to create.
+          if gh release view "$CURRENT_TAG" >/dev/null 2>&1; then
+            EXISTING=$(gh release view "$CURRENT_TAG" --json body --jq '.body // ""' | tr -d '[:space:]')
+            if [ -z "$EXISTING" ]; then
+              echo "Release $CURRENT_TAG exists with empty notes — filling in the changelog."
+              gh release edit "$CURRENT_TAG" --notes-file notes.md
+            else
+              # Never clobber notes a human wrote by hand.
+              echo "Release $CURRENT_TAG already has notes — leaving them untouched."
+            fi
+          else
+            gh release create "$CURRENT_TAG" \
+              --title "$CURRENT_TAG" \
+              --notes-file notes.md
+          fi
 
   # ── 2. Build release binaries for Windows and Linux ─────────────────────────
   build:
