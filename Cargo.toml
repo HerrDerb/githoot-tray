@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-edition = "2018"
 name = "git-system-tray"
 path = "src/main.rs"
 
@@ -17,7 +16,9 @@ dirs = "6.0.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"
-glib = "0.21.3"
+# glib is deliberately NOT a direct dependency: `gtk` re-exports the exact glib it was built
+# against (`gtk::glib`). Declaring a separate version linked two Rust glib crates against the
+# same libglib-2.0, so the GTK main loop and our timer came from different bindings.
 libappindicator = "0.9.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]

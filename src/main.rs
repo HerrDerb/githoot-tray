@@ -7,15 +7,20 @@
 mod access_token;
 mod github;
 mod icons;
+mod log;
 mod scheduler;
+mod state;
+
+const NOTIFICATIONS_URL: &str = "https://github.com/notifications";
 
 /// Returns the path to the application's asset directory in the user's home.
 /// Creates the directory if it does not exist.
-fn get_app_asset_path() -> std::path::PathBuf {
-    let user_home = dirs::home_dir().expect("Could not find home directory");
+fn get_app_asset_path() -> Result<std::path::PathBuf, String> {
+    let user_home = dirs::home_dir().ok_or("could not find home directory")?;
     let assets_path = user_home.join(".github-trayicon");
-    std::fs::create_dir_all(&assets_path).expect("Failed to create assets directory");
-    assets_path
+    std::fs::create_dir_all(&assets_path)
+        .map_err(|e| format!("failed to create {}: {e}", assets_path.display()))?;
+    Ok(assets_path)
 }
 
 // ─── Linux ────────────────────────────────────────────────────────────────────
@@ -28,20 +33,41 @@ fn main() {
 
     gtk::init().expect("Failed to initialize GTK.");
 
-    let app_asset_path = get_app_asset_path();
+    let app_asset_path = match get_app_asset_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Fatal: {e}");
+            std::process::exit(1);
+        }
+    };
+    log::init(&app_asset_path);
+
     let (icon_path, icon_with_notification_path) = icons::create_icons(&app_asset_path);
-    let access_token = access_token::get_access_token(&app_asset_path);
+
+    let tokens = match access_token::TokenStore::load(&app_asset_path) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            logln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
     indicator.set_icon(icon_path.as_str());
 
+    // The poll loop waits on this channel, so a menu click can pull the next poll forward.
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
+
     let mut menu = Menu::new();
     let item = MenuItem::with_label("Open GitHub Notifications");
-    item.connect_activate(|_| {
-        if let Err(e) = open::that("https://github.com/notifications") {
-            eprintln!("Failed to open browser: {e}");
+    item.connect_activate(move |_| {
+        if let Err(e) = open::that(NOTIFICATIONS_URL) {
+            logln!("failed to open browser: {e}");
         }
+        // Whatever the user is about to read changes the answer, so re-poll soon rather than
+        // leaving a stale "unread" icon up for a whole interval.
+        let _ = wake_tx.send(scheduler::Wake::Refresh);
     });
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
@@ -54,7 +80,8 @@ fn main() {
         indicator,
         icon_path,
         icon_with_notification_path,
-        access_token,
+        tokens,
+        wake_rx,
     );
 
     gtk::main();
@@ -62,9 +89,22 @@ fn main() {
 
 // ─── Windows ──────────────────────────────────────────────────────────────────
 
+/// Reports a startup failure and exits.
+///
+/// With `windows_subsystem = "windows"` there is no console, so a bare `expect` would make the
+/// app vanish without a word — indistinguishable, from the user's side, from a tray icon that is
+/// simply wrong.
+#[cfg(target_os = "windows")]
+fn fatal(message: &str) -> ! {
+    logln!("fatal: {message}");
+    access_token::win_msgbox("git-system-tray", message);
+    std::process::exit(1);
+}
+
 #[cfg(target_os = "windows")]
 fn main() {
-    use scheduler::TrayEvent;
+    use scheduler::{TrayEvent, Update};
+    use state::IconState;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::TrayIconBuilder;
     use winit::application::ApplicationHandler;
@@ -91,20 +131,31 @@ fn main() {
             eprintln!("Warning: could not create single-instance mutex (err {})", GetLastError());
         } else if GetLastError() == 0xB7 {
             // ERROR_ALREADY_EXISTS — another instance owns the mutex
-            access_token::win_msgbox(
-                "Already Running",
-                "git-system-tray is already running.",
-            );
+            access_token::win_msgbox("Already Running", "git-system-tray is already running.");
             return;
         }
         // On a fresh mutex (first instance) GetLastError() is 0 — fall through.
     }
 
-    let app_asset_path = get_app_asset_path();
-    let access_token = access_token::get_access_token(&app_asset_path);
+    let app_asset_path = match get_app_asset_path() {
+        Ok(path) => path,
+        Err(e) => {
+            access_token::win_msgbox("git-system-tray", &format!("Fatal: {e}"));
+            std::process::exit(1);
+        }
+    };
+    log::init(&app_asset_path);
+
+    let tokens = match access_token::TokenStore::load(&app_asset_path) {
+        Ok(tokens) => tokens,
+        Err(e) => fatal(&format!("Could not authenticate with GitHub: {e}")),
+    };
 
     // Decode the embedded PNG assets into Icon objects on the main thread.
-    let (normal_icon, notification_icon) = icons::load_tray_icons();
+    let (normal_icon, notification_icon) = match icons::load_tray_icons() {
+        Ok(icons) => icons,
+        Err(e) => fatal(&e),
+    };
 
     // Build the tray menu.
     let open_item = MenuItem::new("Open GitHub Notifications", true, None);
@@ -112,26 +163,37 @@ fn main() {
     let quit_item = MenuItem::new("Quit", true, None);
     let quit_item_id = quit_item.id().clone();
     let menu = Menu::new();
-    menu.append(&open_item).expect("Failed to append menu item");
-    menu.append(&quit_item).expect("Failed to append quit item");
+    if let Err(e) = menu.append(&open_item) {
+        fatal(&format!("Failed to append menu item: {e}"));
+    }
+    if let Err(e) = menu.append(&quit_item) {
+        fatal(&format!("Failed to append quit item: {e}"));
+    }
 
     // Build the tray icon (must be created on the main thread on Windows).
-    let tray_icon = TrayIconBuilder::new()
+    let tray_icon = match TrayIconBuilder::new()
         .with_tooltip("GitHub Notifications")
         .with_icon(normal_icon.clone())
         .with_menu(Box::new(menu))
         .build()
-        .expect("Failed to create tray icon");
+    {
+        Ok(tray_icon) => tray_icon,
+        Err(e) => fatal(&format!("Failed to create tray icon: {e}")),
+    };
 
     // Create the winit event loop with a custom event type so the background
     // thread can wake the loop and deliver notification updates.
-    let event_loop: EventLoop<TrayEvent> = EventLoop::with_user_event()
-        .build()
-        .expect("Failed to create event loop");
+    let event_loop: EventLoop<TrayEvent> = match EventLoop::with_user_event().build() {
+        Ok(event_loop) => event_loop,
+        Err(e) => fatal(&format!("Failed to create event loop: {e}")),
+    };
     let proxy = event_loop.create_proxy();
 
+    // The poll loop waits on this channel, so a menu click can pull the next poll forward.
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
+
     // Launch the polling thread; it communicates back via the proxy.
-    scheduler::start_notification_scheduler(access_token, proxy);
+    scheduler::start_notification_scheduler(tokens, wake_rx, proxy);
 
     // ── Application handler ──────────────────────────────────────────────────
 
@@ -141,6 +203,42 @@ fn main() {
         notification_icon: tray_icon::Icon,
         open_item_id: tray_icon::menu::MenuId,
         quit_item_id: tray_icon::menu::MenuId,
+        wake_tx: std::sync::mpsc::Sender<scheduler::Wake>,
+        /// Which image the tray is actually showing, as far as we know. `None` means "unproven",
+        /// which forces the next update to re-apply rather than assume.
+        applied_notification_icon: Option<bool>,
+    }
+
+    impl App {
+        fn apply(&mut self, update: Update) {
+            // `Unknown` deliberately leaves the picture alone — a brief failure should change
+            // the words, not make the icon flap. Only a confirmed answer moves the image.
+            let wanted = match update.icon {
+                IconState::Unread => Some(true),
+                IconState::Clear => Some(false),
+                IconState::Unknown => None,
+            };
+
+            if let Some(want_notification) = wanted
+                && self.applied_notification_icon != Some(want_notification)
+            {
+                let icon = if want_notification {
+                    &self.notification_icon
+                } else {
+                    &self.normal_icon
+                };
+                match self.tray_icon.set_icon(Some(icon.clone())) {
+                    // Only record success. A failed update leaves this `None` so the next
+                    // poll retries instead of believing the icon is already correct.
+                    Ok(()) => self.applied_notification_icon = Some(want_notification),
+                    Err(e) => logln!("failed to update tray icon: {e}"),
+                }
+            }
+
+            if let Err(e) = self.tray_icon.set_tooltip(Some(&update.tooltip)) {
+                logln!("failed to update tray tooltip: {e}");
+            }
+        }
     }
 
     impl ApplicationHandler<TrayEvent> for App {
@@ -156,15 +254,8 @@ fn main() {
 
         /// Called when the background thread delivers a notification-state update.
         fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: TrayEvent) {
-            let TrayEvent::NotificationUpdate(has_notifications) = event;
-            let icon = if has_notifications {
-                &self.notification_icon
-            } else {
-                &self.normal_icon
-            };
-            if let Err(e) = self.tray_icon.set_icon(Some(icon.clone())) {
-                eprintln!("Failed to update tray icon: {e}");
-            }
+            let TrayEvent::Update(update) = event;
+            self.apply(update);
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -172,12 +263,17 @@ fn main() {
             // burn CPU.
             event_loop.set_control_flow(ControlFlow::Wait);
 
-            // Handle tray menu clicks.
-            if let Ok(event) = MenuEvent::receiver().try_recv() {
+            // Drain the whole queue. `if let` handled one event per wakeup and then slept on
+            // `ControlFlow::Wait`, so a second queued click sat unhandled until something else
+            // happened to wake the loop.
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == self.open_item_id {
-                    if let Err(e) = open::that("https://github.com/notifications") {
-                        eprintln!("Failed to open browser: {e}");
+                    if let Err(e) = open::that(NOTIFICATIONS_URL) {
+                        logln!("failed to open browser: {e}");
                     }
+                    // Whatever the user is about to read changes the answer, so re-poll soon
+                    // rather than leaving a stale "unread" icon up for a whole interval.
+                    let _ = self.wake_tx.send(scheduler::Wake::Refresh);
                 } else if event.id == self.quit_item_id {
                     event_loop.exit();
                 }
@@ -191,7 +287,13 @@ fn main() {
         notification_icon,
         open_item_id,
         quit_item_id,
+        wake_tx,
+        // The builder set the normal icon above, but treat that as unproven so the first
+        // confirmed poll always writes the image it wants.
+        applied_notification_icon: None,
     };
 
-    event_loop.run_app(&mut app).expect("Event loop failed");
+    if let Err(e) = event_loop.run_app(&mut app) {
+        fatal(&format!("Event loop failed: {e}"));
+    }
 }
