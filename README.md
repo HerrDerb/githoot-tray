@@ -62,6 +62,66 @@ asked again unless the token is revoked.
 
 ---
 
+## Tray menu
+
+| Item | Does |
+|---|---|
+| **Open GitHub Notifications** | Opens your notifications, then re-checks a few seconds later |
+| **Open Requested Reviews** | Opens exactly the PRs the red dot is counting, newest first |
+| **Set up review dot…** | One-click setup for the red dot (see below) |
+| **Quit** | Exits |
+
+The review list URL is generated from the same query the dot counts, so the page can never
+disagree with the icon.
+
+---
+
+## Optional: red dot for pending PR reviews
+
+A red dot appears in the upper-right of the tray icon when at least one open PR is awaiting your
+review (Dependabot and Renovate PRs excluded). **This is off until you configure a credential**,
+and the app works exactly as normal without it.
+
+### Quickest path: use the menu
+
+Click **Set up review dot…** in the tray menu. It creates `~/.github-trayicon/review_token.txt`
+(readable only by you), fills it with step-by-step instructions, and opens it in your editor.
+Paste a token over the placeholder line, save, and the dot starts working within a minute —
+**no restart needed**. To turn the dot back off, delete the file's contents.
+
+The rest of this section is the same thing done by hand.
+
+It needs a *second* credential, deliberately. `GET /notifications` only accepts classic
+OAuth-app tokens with the `notifications` scope, so that token cannot be narrowed — and the only
+classic scope that would let it search private repos is `repo`, which also grants **write** access
+to every repository you can reach. Rather than escalate the existing token that far, the review
+search gets its own narrow, read-only credential.
+
+Pick whichever you can actually obtain:
+
+### Option A — GitHub App (no manual rotation, ever)
+
+1. [Create a GitHub App](https://github.com/settings/apps/new). Set **Permissions → Repository →
+   Pull requests: Read-only**, enable **Device flow**, and leave the webhook off.
+2. Install it on the repos or org whose reviews should count.
+3. Put its **Client ID** in `~/.github-trayicon/review_client_id.txt`.
+
+On next start the app opens a browser prompt once. After that it renews itself with a refresh
+token — you never touch it again.
+
+### Option B — fine-grained personal access token
+
+1. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with
+   **Pull requests: Read-only** on the relevant repos.
+2. Put it in `~/.github-trayicon/review_token.txt`.
+
+Simpler, but you must replace it whenever it expires. Note that an organisation can enforce a
+maximum token lifetime, which may prevent you choosing "no expiration".
+
+If both files exist, the token in `review_token.txt` wins.
+
+---
+
 ## Troubleshooting
 
 The icon's tooltip always states what the app currently believes, including *why* it is unsure.
@@ -71,9 +131,19 @@ Windows, where the app runs without a console. The log never contains your token
 | Tooltip says | Meaning |
 |---|---|
 | `no unread notifications` / `unread notifications` | Confirmed by a successful poll |
-| `state unknown` | Several polls in a row failed — the icon is no longer trustworthy |
+| `N PR(s) awaiting your review` | The red dot is on; N comes straight from the search result |
+| `No reviews requested` | Review credential is configured and reports nothing pending |
+| *(no review line at all)* | Review credential is not configured — the dot is disabled |
+| `notification state unknown` / `Review state unknown` | Several polls in a row failed for that signal — that half of the icon is no longer trustworthy |
 | `rate limited, waiting Ns` | GitHub asked us to slow down; the last known icon is held |
-| `GitHub rejected the access token` | Re-authentication has been triggered automatically |
+| `GitHub rejected the credential` | Renewal has been triggered automatically |
+
+The two signals are independent: a failing review search never disturbs the blue notification
+icon, and vice versa. Each line in the log names which one it is:
+
+```
+unconditional poll → notifications→fresh reviews→fresh → No/Yes (next in 60s) [...]
+```
 
 ---
 

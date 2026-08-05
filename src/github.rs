@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NOTIFICATIONS_URL: &str = "https://api.github.com/notifications";
+const SEARCH_URL: &str = "https://api.github.com/search/issues";
 const AGENT: &str = "git-system-tray";
 
 /// Kept well under the 60s poll floor so a stalled request cannot delay the next one.
@@ -25,16 +26,35 @@ const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 /// Cap on how much of an error body ends up in a log line or tooltip.
 const MAX_DETAIL_CHARS: usize = 200;
 
+/// Turns a 2xx body into `(signal_present, exact_count_if_the_endpoint_gives_one)`.
+///
+/// The two endpoints differ only here: everything about status codes and rate limits is shared,
+/// so this is the single seam between them.
+type BodyParser = fn(&str) -> Result<(bool, Option<u32>), String>;
+
 /// We only ever ask whether the unread list is non-empty, so no fields are needed.
 #[derive(Debug, Deserialize)]
 struct Notification {}
+
+/// The one field we need from `/search/issues`. `total_count` is a required field of that
+/// response, and it counts matches across all pages — so `per_page=1` still gives a true total.
+#[derive(Debug, Deserialize)]
+struct SearchResult {
+    total_count: u32,
+}
 
 /// Everything GitHub can tell us, kept distinguishable because the caller must react
 /// differently to each one.
 #[derive(Debug)]
 pub enum PollResult {
-    /// A 200 with a usable body. `unread` is authoritative.
-    Fresh { unread: bool, etag: Option<String> },
+    /// A 200 with a usable body. `present` is authoritative.
+    Fresh {
+        present: bool,
+        etag: Option<String>,
+        /// Exact match count when the endpoint provides one (search does; notifications does
+        /// not, because we request `per_page=1` and only ask about presence).
+        count: Option<u32>,
+    },
     /// 304 — the notification list is unchanged, so whatever we already show is still right.
     NotModified,
     /// 401 — the token is dead. Waiting will not fix this; only re-authentication will.
@@ -79,13 +99,41 @@ pub fn build_client() -> reqwest::Result<Client> {
         .build()
 }
 
-/// Performs one poll. `etag` enables a conditional request; pass `None` to force a fresh read.
-pub fn poll(client: &Client, token: &str, etag: Option<&str>) -> PollResponse {
+/// Polls unread notifications. `etag` enables a conditional request; pass `None` to force a
+/// fresh read.
+pub fn poll_notifications(client: &Client, token: &str, etag: Option<&str>) -> PollResponse {
     // `all=false` is already the default, but stating it makes `!list.is_empty()` provably a
     // question about *unread* items. `per_page=1` because we need presence, not a count.
-    let mut request = client
+    let request = client
         .get(NOTIFICATIONS_URL)
-        .query(&[("all", "false"), ("per_page", "1")])
+        .query(&[("all", "false"), ("per_page", "1")]);
+
+    send(request, token, etag, parse_notifications)
+}
+
+/// Polls for pull requests awaiting the user's review.
+///
+/// No `If-None-Match` is sent: the search endpoint was measured to return no `etag` at all, and
+/// replaying one yields `200` rather than `304`, so a conditional request would only add a
+/// header for nothing. Note also that search has its own rate-limit resource — 30 requests per
+/// *minute*, independent of the 15000/hour core budget — which is why `classify` reads the
+/// rate-limit headers off whichever response it was handed rather than assuming a shared pool.
+pub fn poll_reviews(client: &Client, token: &str, query: &str) -> PollResponse {
+    let request = client
+        .get(SEARCH_URL)
+        .query(&[("q", query), ("per_page", "1")]);
+
+    send(request, token, None, parse_search_total)
+}
+
+/// Shared request/response plumbing for both endpoints.
+fn send(
+    request: reqwest::blocking::RequestBuilder,
+    token: &str,
+    etag: Option<&str>,
+    parse_ok: BodyParser,
+) -> PollResponse {
+    let mut request = request
         .header(ACCEPT, "application/vnd.github+json")
         .header(AUTHORIZATION, format!("Bearer {token}"))
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -118,9 +166,24 @@ pub fn poll(client: &Client, token: &str, etag: Option<&str>) -> PollResponse {
     };
 
     PollResponse {
-        result: classify(status, &headers, &body, unix_now()),
+        result: classify_with(status, &headers, &body, unix_now(), parse_ok),
         poll_interval,
     }
+}
+
+/// Success-body parser for `/notifications`: presence only, no count.
+fn parse_notifications(body: &str) -> Result<(bool, Option<u32>), String> {
+    serde_json::from_str::<Vec<Notification>>(body)
+        .map(|list| (!list.is_empty(), None))
+        // Previously `.unwrap_or_default()`, which turned a garbled payload into "no unread".
+        .map_err(|e| format!("unparseable notification payload: {e}"))
+}
+
+/// Success-body parser for `/search/issues`: exact count, so the tooltip can quote it.
+fn parse_search_total(body: &str) -> Result<(bool, Option<u32>), String> {
+    serde_json::from_str::<SearchResult>(body)
+        .map(|r| (r.total_count > 0, Some(r.total_count)))
+        .map_err(|e| format!("unparseable search payload: {e}"))
 }
 
 /// Maps one HTTP response onto a `PollResult`.
@@ -128,7 +191,17 @@ pub fn poll(client: &Client, token: &str, etag: Option<&str>) -> PollResponse {
 /// Pure on purpose — `now` is injected rather than read from the clock — so every branch below
 /// is unit-testable without a network or a fixture server. All of the historical bugs lived
 /// here, so this is where the tests point.
-pub fn classify(status: StatusCode, headers: &HeaderMap, body: &str, now: u64) -> PollResult {
+///
+/// The status handling is shared by both endpoints and only the success-body parser differs,
+/// via `parse_ok`. Duplicating this for search would mean two copies of the 304-before-non-2xx
+/// ordering and the rate-limit precedence — i.e. two places for the original bug to come back.
+pub fn classify_with(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    now: u64,
+    parse_ok: BodyParser,
+) -> PollResult {
     // ORDER MATTERS. `304` is not `is_success()`, so it has to be caught before the generic
     // non-2xx arm below. Getting this backwards is exactly the old bug: the documented
     // healthy answer for "nothing changed" would be logged as a failure and reported as
@@ -146,8 +219,8 @@ pub fn classify(status: StatusCode, headers: &HeaderMap, body: &str, now: u64) -
         return match rate_limit_wait(headers, now) {
             Some(retry_after) => PollResult::RateLimited { retry_after },
             // A 403 with no rate-limit signal is a different animal — most likely the token
-            // lacks the `notifications` scope. Backing off will not help, but claiming the
-            // inbox is empty is still the one unacceptable answer.
+            // lacks the scope or permission the endpoint needs. Backing off will not help, but
+            // claiming there is nothing pending is still the one unacceptable answer.
             None => PollResult::Transient(describe(status, body)),
         };
     }
@@ -156,13 +229,13 @@ pub fn classify(status: StatusCode, headers: &HeaderMap, body: &str, now: u64) -
         return PollResult::Transient(describe(status, body));
     }
 
-    match serde_json::from_str::<Vec<Notification>>(body) {
-        Ok(list) => PollResult::Fresh {
-            unread: !list.is_empty(),
+    match parse_ok(body) {
+        Ok((present, count)) => PollResult::Fresh {
+            present,
+            count,
             etag: header_string(headers, ETAG.as_str()),
         },
-        // Previously `.unwrap_or_default()`, which turned a garbled payload into "no unread".
-        Err(e) => PollResult::Transient(format!("unparseable notification payload: {e}")),
+        Err(why) => PollResult::Transient(why),
     }
 }
 
@@ -229,44 +302,108 @@ mod tests {
         map
     }
 
+    /// Shorthand: classify a NOTIFICATIONS response.
+    fn notif(status: StatusCode, h: &HeaderMap, body: &str, now: u64) -> PollResult {
+        classify_with(status, h, body, now, parse_notifications)
+    }
+
+    /// Shorthand: classify a SEARCH response.
+    fn search(status: StatusCode, h: &HeaderMap, body: &str, now: u64) -> PollResult {
+        classify_with(status, h, body, now, parse_search_total)
+    }
+
+    // ── Notifications body parsing ────────────────────────────────────────────
+
     #[test]
     fn empty_list_is_clear() {
-        let result = classify(StatusCode::OK, &headers(&[]), "[]", 0);
-        assert!(matches!(result, PollResult::Fresh { unread: false, .. }));
+        assert!(matches!(
+            notif(StatusCode::OK, &headers(&[]), "[]", 0),
+            PollResult::Fresh { present: false, .. }
+        ));
     }
 
     #[test]
     fn non_empty_list_is_unread_and_keeps_etag() {
-        let result = classify(StatusCode::OK, &headers(&[("etag", "\"abc\"")]), "[{}]", 0);
-        match result {
-            PollResult::Fresh { unread, etag } => {
-                assert!(unread);
+        match notif(StatusCode::OK, &headers(&[("etag", "\"abc\"")]), "[{}]", 0) {
+            PollResult::Fresh { present, etag, count } => {
+                assert!(present);
                 assert_eq!(etag.as_deref(), Some("\"abc\""));
+                assert_eq!(count, None, "notifications use per_page=1, so there is no true count");
             }
             other => panic!("expected Fresh, got {:?}", other),
         }
     }
 
-    /// The regression that matters most: 304 must never be read as "nothing unread".
+    /// Previously `.unwrap_or_default()` swallowed this into "no unread".
     #[test]
-    fn not_modified_is_not_a_failure_and_not_clear() {
-        let result = classify(StatusCode::NOT_MODIFIED, &headers(&[]), "", 0);
-        assert!(matches!(result, PollResult::NotModified));
+    fn malformed_notifications_body_is_transient_not_clear() {
+        assert!(matches!(
+            notif(StatusCode::OK, &headers(&[]), "not json at all", 0),
+            PollResult::Transient(_)
+        ));
+    }
+
+    // ── Search body parsing ───────────────────────────────────────────────────
+
+    #[test]
+    fn zero_total_count_means_no_review_pending() {
+        match search(StatusCode::OK, &headers(&[]), r#"{"total_count":0,"items":[]}"#, 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(!present);
+                assert_eq!(count, Some(0));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
     }
 
     #[test]
-    fn unauthorized_is_distinct_from_transient() {
-        let result = classify(StatusCode::UNAUTHORIZED, &headers(&[]), "{}", 0);
-        assert!(matches!(result, PollResult::Unauthorized));
+    fn positive_total_count_means_review_pending_and_reports_the_count() {
+        match search(StatusCode::OK, &headers(&[]), r#"{"total_count":7,"items":[{}]}"#, 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(present);
+                assert_eq!(count, Some(7), "total_count is free, so the tooltip can quote it");
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// A body without `total_count` must not read as "nothing to review".
+    #[test]
+    fn search_body_missing_total_count_is_transient() {
+        assert!(matches!(
+            search(StatusCode::OK, &headers(&[]), r#"{"items":[]}"#, 0),
+            PollResult::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_search_body_is_transient() {
+        assert!(matches!(
+            search(StatusCode::OK, &headers(&[]), "<html>502</html>", 0),
+            PollResult::Transient(_)
+        ));
+    }
+
+    // ── Status handling, shared by both endpoints ─────────────────────────────
+
+    /// The regression that matters most: 304 must never be read as "nothing pending".
+    #[test]
+    fn not_modified_is_not_a_failure_and_not_clear() {
+        assert!(matches!(notif(StatusCode::NOT_MODIFIED, &headers(&[]), "", 0), PollResult::NotModified));
+        assert!(matches!(search(StatusCode::NOT_MODIFIED, &headers(&[]), "", 0), PollResult::NotModified));
+    }
+
+    #[test]
+    fn unauthorized_is_distinct_from_transient_on_both_endpoints() {
+        assert!(matches!(notif(StatusCode::UNAUTHORIZED, &headers(&[]), "{}", 0), PollResult::Unauthorized));
+        assert!(matches!(search(StatusCode::UNAUTHORIZED, &headers(&[]), "{}", 0), PollResult::Unauthorized));
     }
 
     #[test]
     fn retry_after_takes_precedence() {
         let h = headers(&[("retry-after", "42"), ("x-ratelimit-remaining", "0")]);
-        match classify(StatusCode::FORBIDDEN, &h, "", 0) {
-            PollResult::RateLimited { retry_after } => {
-                assert_eq!(retry_after, Duration::from_secs(42))
-            }
+        match search(StatusCode::FORBIDDEN, &h, "", 0) {
+            PollResult::RateLimited { retry_after } => assert_eq!(retry_after, Duration::from_secs(42)),
             other => panic!("expected RateLimited, got {:?}", other),
         }
     }
@@ -274,10 +411,8 @@ mod tests {
     #[test]
     fn exhausted_quota_waits_for_reset() {
         let h = headers(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "1000")]);
-        match classify(StatusCode::FORBIDDEN, &h, "", 100) {
-            PollResult::RateLimited { retry_after } => {
-                assert_eq!(retry_after, Duration::from_secs(900))
-            }
+        match notif(StatusCode::FORBIDDEN, &h, "", 100) {
+            PollResult::RateLimited { retry_after } => assert_eq!(retry_after, Duration::from_secs(900)),
             other => panic!("expected RateLimited, got {:?}", other),
         }
     }
@@ -286,45 +421,41 @@ mod tests {
     #[test]
     fn stale_reset_falls_back_to_the_minimum() {
         let h = headers(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "50")]);
-        match classify(StatusCode::FORBIDDEN, &h, "", 9_999) {
-            PollResult::RateLimited { retry_after } => {
-                assert_eq!(retry_after, DEFAULT_RATE_LIMIT_WAIT)
-            }
+        match notif(StatusCode::FORBIDDEN, &h, "", 9_999) {
+            PollResult::RateLimited { retry_after } => assert_eq!(retry_after, DEFAULT_RATE_LIMIT_WAIT),
             other => panic!("expected RateLimited, got {:?}", other),
         }
     }
 
     #[test]
     fn forbidden_without_rate_limit_signal_is_transient() {
-        let result = classify(StatusCode::FORBIDDEN, &headers(&[]), "missing scope", 0);
-        assert!(matches!(result, PollResult::Transient(_)));
+        // e.g. the GitHub App lacks the Pull requests permission.
+        assert!(matches!(
+            search(StatusCode::FORBIDDEN, &headers(&[]), "missing permission", 0),
+            PollResult::Transient(_)
+        ));
     }
 
     #[test]
     fn too_many_requests_is_rate_limited() {
         let h = headers(&[("retry-after", "7")]);
         assert!(matches!(
-            classify(StatusCode::TOO_MANY_REQUESTS, &h, "", 0),
+            search(StatusCode::TOO_MANY_REQUESTS, &h, "", 0),
             PollResult::RateLimited { .. }
         ));
     }
 
     #[test]
     fn server_error_is_transient() {
-        let result = classify(StatusCode::INTERNAL_SERVER_ERROR, &headers(&[]), "boom", 0);
-        assert!(matches!(result, PollResult::Transient(_)));
-    }
-
-    /// Previously `.unwrap_or_default()` swallowed this into "no unread".
-    #[test]
-    fn malformed_body_is_transient_not_clear() {
-        let result = classify(StatusCode::OK, &headers(&[]), "not json at all", 0);
-        assert!(matches!(result, PollResult::Transient(_)));
+        assert!(matches!(
+            notif(StatusCode::INTERNAL_SERVER_ERROR, &headers(&[]), "boom", 0),
+            PollResult::Transient(_)
+        ));
     }
 
     #[test]
     fn truncate_respects_char_boundaries() {
-        assert_eq!(truncate("ünïcödé", 3), "ünï…");
+        assert_eq!(truncate("\u{fc}n\u{ef}c\u{f6}d\u{e9}", 3), "\u{fc}n\u{ef}\u{2026}");
         assert_eq!(truncate("short", 50), "short");
     }
 }
