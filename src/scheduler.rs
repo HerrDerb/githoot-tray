@@ -296,11 +296,20 @@ fn may_retry(last: &mut Option<Instant>) -> bool {
 #[cfg(target_os = "linux")]
 const UI_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The menu entries the poll loop keeps up to date: their text, and whether they are shown at all.
+///
+/// A struct rather than two more parameters, because the list was going to keep growing.
+#[cfg(target_os = "linux")]
+pub struct MenuItems {
+    pub notifications: gtk::MenuItem,
+    pub reviews: gtk::MenuItem,
+}
+
 #[cfg(target_os = "linux")]
 pub fn start_notification_scheduler(
     indicator: libappindicator::AppIndicator,
     icons: crate::icons::IconSet<String>,
-    reviews_item: gtk::MenuItem,
+    menu_items: MenuItems,
     tokens: TokenStore,
     reviews: Option<ReviewToken>,
     reviews_off: Option<String>,
@@ -337,13 +346,25 @@ pub fn start_notification_scheduler(
 
             if applied != Some(wanted) {
                 indicator.set_icon(icons.get(wanted.0, wanted.1).as_str());
+
+                // An entry that opens an empty list is a dead end, so it is hidden. `wanted` says
+                // it directly: the icon carries a signal exactly when that entry has somewhere to
+                // go. Its treatment of `Unknown` carries over too, so a failed poll leaves the menu
+                // as it was rather than hiding an entry we simply could not ask about.
+                //
+                // GTK has per-item visibility, so this is a flag rather than the remove-and-append
+                // dance the Windows side needs. `show_all` is called once during setup and never
+                // again, so nothing undoes these.
+                menu_items.notifications.set_visible(wanted.0);
+                menu_items.reviews.set_visible(wanted.1);
+
                 applied = Some(wanted);
             }
 
             // Only on change: relabelling a menu item is cheap, but some panels rebuild the whole
             // menu when an item changes, which would fight a user who has it open.
             if applied_label.as_deref() != Some(update.reviews_label.as_str()) {
-                reviews_item.set_label(&update.reviews_label);
+                menu_items.reviews.set_label(&update.reviews_label);
                 applied_label = Some(update.reviews_label.clone());
             }
 

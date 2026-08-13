@@ -150,10 +150,10 @@ fn main() {
     scheduler::start_notification_scheduler(
         indicator,
         icons,
-        // Cloned rather than moved: the menu keeps the original, and this handle is what the poll
-        // loop relabels with the count. GTK widgets are reference-counted, so both refer to the
-        // same item.
-        reviews_item.clone(),
+        // Cloned rather than moved: the menu keeps the originals, and these handles are what the
+        // poll loop relabels and shows or hides. GTK widgets are reference-counted, so both refer
+        // to the same items.
+        scheduler::MenuItems { notifications: item.clone(), reviews: reviews_item.clone() },
         tokens,
         reviews,
         reviews_off,
@@ -235,6 +235,10 @@ fn main() {
     };
 
     // Build the tray menu.
+    //
+    // Every entry starts present. Nothing has been polled yet, so both signals are `Unknown`, and
+    // starting empty would mean the first second of the app's life offers no way to reach GitHub.
+    // The first confirmed answer takes out whatever turns out to be empty.
     let open_item = MenuItem::new("Open GitHub Notifications", true, None);
     let open_item_id = open_item.id().clone();
     let reviews_item = MenuItem::new(state::REVIEWS_MENU_LABEL, true, None);
@@ -256,7 +260,9 @@ fn main() {
     let tray_icon = match TrayIconBuilder::new()
         .with_tooltip("GitHub Notifications")
         .with_icon(tray_icons.get(false, false).clone())
-        .with_menu(Box::new(menu))
+        // Cloned rather than moved: `Menu` is a reference-counted handle, and the app keeps one so
+        // it can take entries out later. The tray gets the same underlying menu.
+        .with_menu(Box::new(menu.clone()))
         .build()
     {
         Ok(tray_icon) => tray_icon,
@@ -282,10 +288,16 @@ fn main() {
     struct App {
         tray_icon: tray_icon::TrayIcon,
         icons: icons::IconSet<tray_icon::Icon>,
+        /// The menu itself, so entries can be taken out when there is nothing behind them. `muda`
+        /// has no per-item visibility, only `set_enabled`, so hiding means removing and re-adding.
+        menu: tray_icon::menu::Menu,
+        /// The items are held, not just their ids: they are re-appended when they come back, and
+        /// the review count is written into its text.
+        open_item: tray_icon::menu::MenuItem,
         open_item_id: tray_icon::menu::MenuId,
-        /// Held, not just its id: the count is written into this item's text on every change.
         reviews_item: tray_icon::menu::MenuItem,
         reviews_item_id: tray_icon::menu::MenuId,
+        quit_item: tray_icon::menu::MenuItem,
         quit_item_id: tray_icon::menu::MenuId,
         wake_tx: std::sync::mpsc::Sender<scheduler::Wake>,
         /// Which image the tray is actually showing, as `(unread, review_pending)`, as far as we
@@ -294,9 +306,38 @@ fn main() {
         applied: Option<(bool, bool)>,
         /// Likewise for the menu text, so an unchanged count does not rewrite the item.
         applied_label: Option<String>,
+        /// And for which entries the menu currently holds. Tracked separately from `applied`
+        /// because a failed `set_icon` must not also suppress the menu update.
+        applied_menu: Option<(bool, bool)>,
     }
 
     impl App {
+        /// Rebuilds the menu so it only offers actions that have something behind them.
+        ///
+        /// Everything is removed and re-appended in a fixed order, rather than computing insert
+        /// positions from the current contents: an off-by-one there silently reorders the menu,
+        /// and a full rebuild cannot.
+        ///
+        /// Only called when the set actually changes, which is rare. It can still land while the
+        /// user has the menu open, since nothing tells us whether it is showing.
+        fn rebuild_menu(&self, notifications: bool, reviews: bool) {
+            while self.menu.remove_at(0).is_some() {}
+
+            for (item, wanted, what) in [
+                (&self.open_item, notifications, "notifications"),
+                (&self.reviews_item, reviews, "reviews"),
+                // Quit is unconditional: a tray icon with no way out is a bug, not a tidy menu.
+                (&self.quit_item, true, "quit"),
+            ] {
+                if !wanted {
+                    continue;
+                }
+                if let Err(e) = self.menu.append(item) {
+                    logln!("failed to add the {what} menu item: {e}");
+                }
+            }
+        }
+
         fn apply(&mut self, update: Update) {
             // `Unknown` on either axis deliberately leaves that part of the picture alone — a
             // brief failure should change the words, not make the icon flap. So an unknown axis
@@ -327,6 +368,19 @@ fn main() {
             if self.applied_label.as_deref() != Some(update.reviews_label.as_str()) {
                 self.reviews_item.set_text(&update.reviews_label);
                 self.applied_label = Some(update.reviews_label);
+            }
+
+            // An entry that opens an empty list is just a dead end, so it is taken out. `wanted`
+            // serves double duty here: the icon shows a blue glyph exactly when there are unread
+            // notifications, which is exactly when that menu entry has somewhere to go, and the
+            // same holds for the dot and the reviews entry.
+            //
+            // Note this inherits `wanted`'s treatment of `Unknown`: an axis we have lost track of
+            // keeps whatever it last had. A failed poll must not remove an entry, because "I could
+            // not ask" is not the same as "there is nothing there".
+            if self.applied_menu != Some(wanted) {
+                self.rebuild_menu(wanted.0, wanted.1);
+                self.applied_menu = Some(wanted);
             }
         }
     }
@@ -399,12 +453,18 @@ fn main() {
     let mut app = App {
         tray_icon,
         icons: tray_icons,
+        menu,
+        open_item,
         open_item_id,
         reviews_item,
         reviews_item_id,
+        quit_item,
         quit_item_id,
         wake_tx,
         applied_label: None,
+        // The menu was built with every entry present, and that much we did do, so it is recorded
+        // as such. Only a confirmed empty answer will take one out.
+        applied_menu: Some((true, true)),
         // The builder set the plain icon above, but treat that as unproven so the first
         // confirmed poll always writes the image it wants.
         applied: None,
