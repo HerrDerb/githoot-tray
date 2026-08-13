@@ -1,4 +1,13 @@
-//! GitHub Device Code authentication and token storage.
+//! Notifications credential: `gh`, falling back to GitHub Device Code authentication.
+//!
+//! `gh`'s token is tried first, exactly as it is for the review search in `gh_cli` — one fewer
+//! credential for a user who already has `gh` set up to create and store. It is only usable here
+//! when its scopes are *known* to include `notifications`; unlike the review search, there is no
+//! live check afterwards that can catch a wrong guess and turn the feature off (see
+//! `gh_backed_token`), so an unknown scope set falls back rather than being optimistically
+//! accepted. Falling back means the OAuth App device flow below, which is the only path that
+//! existed before `gh` support was added: it prompts for a Client ID once, then authenticates via
+//! browser and stores the resulting token on disk.
 //!
 //! Every failure path here used to call `std::process::exit(1)`. That was survivable while the
 //! token was only ever fetched once from `main`, but the poll thread now re-authenticates when
@@ -6,6 +15,7 @@
 //! tray icon down instead of reporting a problem. So the flow returns `Result` and lets the
 //! caller decide whether the failure is fatal.
 
+use crate::gh_cli;
 use crate::logln;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -135,22 +145,126 @@ fn show_auth_success() {
     crate::dialog::message("GitHub Authorization", "Authorization successful!");
 }
 
+// ── Credential source ─────────────────────────────────────────────────────────
+
+/// Where the current token comes from, and what renewing it takes.
+///
+/// `Gh` persists nothing of its own — `gh` owns that credential's lifetime, storage and renewal,
+/// exactly as it does for the review credential in `gh_cli`. `DeviceFlow` is the pre-`gh` path:
+/// a user-registered OAuth App, a token saved to disk, and a browser round trip to replace it.
+enum Source {
+    Gh { host: String },
+    DeviceFlow { token_path: PathBuf, client_id: String },
+}
+
+/// Why `gh` did not supply the notifications token, as far as `load` needs to know.
+///
+/// Only "not on `PATH` at all" is worth interrupting startup for with a hint — everything else
+/// means `gh` is present and already known to the user (not logged in, wrong scope, a slow
+/// keyring), so it is logged and left there, the same way the other fallback reasons are.
+enum GhFallback {
+    NotInstalled,
+    Other,
+}
+
+/// Tries to source the notifications token from `gh`, the same way `gh_cli::ReviewToken` borrows
+/// one for the review search. `Err` on anything short of a token confirmed to carry the
+/// `notifications` scope — never treated as an application error, since not having `gh` (or not
+/// having refreshed its scopes) is a normal reason to fall back to the device flow.
+///
+/// Deliberately stricter than the review search's scope check: that one treats *unknown* scopes as
+/// good enough to proceed, because a wrong guess there is caught by a live check against GitHub's
+/// answer a moment later and the feature turns itself off (see `gh_cli::lacks_required_scope`'s use
+/// in `scheduler`). Nothing here re-checks after the fact — notifications are core to the app, not
+/// an optional dot — so an unknown scope set falls back instead of gambling on it.
+fn gh_backed_token() -> Result<(String, String), GhFallback> {
+    let host = gh_cli::host();
+
+    let account = match gh_cli::auth_status(&host) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            logln!("gh has no active account for {host} — using the notifications OAuth App instead");
+            return Err(GhFallback::Other);
+        }
+        Err(gh_cli::GhError::NotInstalled) => {
+            logln!("gh not found on PATH — using the notifications OAuth App instead");
+            return Err(GhFallback::NotInstalled);
+        }
+        Err(e) => {
+            logln!(
+                "gh unavailable ({}) — using the notifications OAuth App instead",
+                gh_cli::Unavailable::from(e).short()
+            );
+            return Err(GhFallback::Other);
+        }
+    };
+
+    if !gh_cli::has_scope(&account.scopes, gh_cli::NOTIFICATIONS_SCOPE) {
+        logln!(
+            "gh's token is not known to carry the notifications scope — using the notifications \
+             OAuth App instead. To use gh instead, run: gh auth refresh --scopes notifications"
+        );
+        return Err(GhFallback::Other);
+    }
+
+    match gh_cli::auth_token(&host) {
+        Ok(token) => {
+            logln!("notifications credential: gh cli, host {host}, login {}", account.login);
+            Ok((host, token))
+        }
+        Err(e) => {
+            logln!(
+                "gh auth token failed ({}) — using the notifications OAuth App instead",
+                gh_cli::Unavailable::from(e).short()
+            );
+            Err(GhFallback::Other)
+        }
+    }
+}
+
+/// Tells the user `gh` was not found and lets them choose whether to keep going with the OAuth App
+/// flow now, or exit so they can install `gh` first.
+///
+/// Startup only — this is `load`'s decision to make. `reauthenticate` never calls this: `gh` going
+/// missing mid-run is not a reason to interrupt a tray app the user is not looking at.
+fn offer_gh_install_hint() -> bool {
+    let title = "git-system-tray: GitHub CLI not found";
+    let msg = "This app can use the GitHub CLI (gh) for notifications if it is installed and \
+               logged in with the `notifications` scope — one less sign-in to manage.\n\n\
+               gh was not found on PATH. You can continue with a separate one-time sign-in \
+               instead, or exit now to install gh (https://cli.github.com) and run:\n\n    \
+               gh auth login\n    gh auth refresh --scopes notifications";
+    crate::dialog::confirm(title, msg, "Continue", "Exit")
+}
+
 // ── Token storage ─────────────────────────────────────────────────────────────
 
 /// Owns the access token and knows how to replace it.
 ///
 /// Lives on the poll thread so a mid-run 401 can be recovered from without restarting the app.
 pub struct TokenStore {
-    token_path: PathBuf,
-    client_id: String,
+    source: Source,
     token: String,
     http: Client,
 }
 
 impl TokenStore {
-    /// Startup path: reuse a saved token if it still works, otherwise run the device flow.
+    /// Startup path: prefer a `gh`-supplied token; otherwise reuse a saved device-flow token if it
+    /// still works, or run the device flow.
     pub fn load(app_asset_path: &Path) -> Result<Self, AuthError> {
         let http = build_client()?;
+
+        match gh_backed_token() {
+            Ok((host, token)) => return Ok(Self { source: Source::Gh { host }, token, http }),
+            Err(GhFallback::NotInstalled) => {
+                if !offer_gh_install_hint() {
+                    logln!("exiting at the user's request to install gh");
+                    std::process::exit(0);
+                }
+            }
+            Err(GhFallback::Other) => {}
+        }
+
         let client_id = get_client_id(app_asset_path)?;
         let token_path = app_asset_path.join(ACCESS_TOKEN_FILE);
 
@@ -164,7 +278,7 @@ impl TokenStore {
             if !token.is_empty() {
                 match check_access_token(&http, &token) {
                     TokenCheck::Valid => {
-                        return Ok(Self { token_path, client_id, token, http });
+                        return Ok(Self { source: Source::DeviceFlow { token_path, client_id }, token, http });
                     }
                     // Could not reach GitHub, so this says nothing about the token. Starting
                     // with a saved token beats refusing to start: a tray app is typically
@@ -172,7 +286,7 @@ impl TokenStore {
                     // already re-authenticates if the token turns out to be genuinely dead.
                     TokenCheck::Unreachable => {
                         logln!("could not reach GitHub to check the saved token — using it anyway");
-                        return Ok(Self { token_path, client_id, token, http });
+                        return Ok(Self { source: Source::DeviceFlow { token_path, client_id }, token, http });
                     }
                     TokenCheck::Rejected => {
                         logln!("saved token was rejected by GitHub — re-authenticating");
@@ -183,7 +297,7 @@ impl TokenStore {
 
         let token = device_code_flow(&http, &client_id)?;
         save_token(&token_path, &token);
-        Ok(Self { token_path, client_id, token, http })
+        Ok(Self { source: Source::DeviceFlow { token_path, client_id }, token, http })
     }
 
     pub fn token(&self) -> &str {
@@ -192,12 +306,29 @@ impl TokenStore {
 
     /// Mid-run recovery after GitHub rejects the token. Returns `Err` rather than exiting so
     /// the caller can back off and keep the tray icon alive.
+    ///
+    /// The `Gh` branch never falls back to the device flow: it mirrors
+    /// `gh_cli::ReviewToken::refresh`, simply re-asking `gh` for its current token, which is
+    /// correct for the common case (`gh` rotated the token underneath us) and otherwise degrades
+    /// the same way a rejected review token does — logged and retried no sooner than
+    /// `MIN_REAUTH_INTERVAL`, rather than switching credential sources mid-run.
     pub fn reauthenticate(&mut self) -> Result<(), AuthError> {
-        logln!("re-authenticating after GitHub rejected the current token");
-        let token = device_code_flow(&self.http, &self.client_id)?;
-        save_token(&self.token_path, &token);
-        self.token = token;
-        Ok(())
+        match &self.source {
+            Source::Gh { host } => {
+                logln!("re-authenticating after GitHub rejected the current token — re-asking gh");
+                let token = gh_cli::auth_token(host)
+                    .map_err(|e| AuthError::Github(gh_cli::Unavailable::from(e).message()))?;
+                self.token = token;
+                Ok(())
+            }
+            Source::DeviceFlow { token_path, client_id } => {
+                logln!("re-authenticating after GitHub rejected the current token");
+                let token = device_code_flow(&self.http, client_id)?;
+                save_token(token_path, &token);
+                self.token = token;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -331,20 +462,58 @@ fn prompt_for_client_id(client_id_path: &Path) -> Result<String, AuthError> {
 
 // ── Device code flow ──────────────────────────────────────────────────────────
 
+/// The shape GitHub's OAuth endpoints use for a rejected request, per RFC 8628 §3.2.
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    error: String,
+    error_description: Option<String>,
+}
+
+/// Turns a `/login/device/code` response that failed to parse as `DeviceCodeResponse` into a
+/// message that names the actual problem.
+fn describe_device_code_failure(status: reqwest::StatusCode, body: &str) -> String {
+    if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(body) {
+        // The single most common cause of this whole path: a freshly created OAuth App defaults
+        // to Device Flow turned off, and this is the one error code GitHub uses for that.
+        let hint = if err.error == "unauthorized_client" {
+            " — in the OAuth App's settings on GitHub, check \"Enable Device Flow\""
+        } else {
+            ""
+        };
+        return match err.error_description {
+            Some(desc) => format!("{desc}{hint} ({})", err.error),
+            None => format!("{}{hint}", err.error),
+        };
+    }
+
+    format!("GitHub answered {status} with an unexpected response: {body}")
+}
+
 /// Runs the GitHub Device Code flow and returns the access token.
 ///
 /// Only the notifications credential uses this. The review search never does: `gh` owns that
 /// credential's lifetime, so there is no refresh grant to handle here.
 fn device_code_flow(http: &Client, client_id: &str) -> Result<String, AuthError> {
     // ── Step 1: request a device code ─────────────────────────────────────────
-    let dc: DeviceCodeResponse = http
+    // Read the body as text first rather than deserializing the response directly into
+    // `DeviceCodeResponse`. GitHub answers a rejected request (most commonly a Client ID whose
+    // OAuth App has not had "Enable Device Flow" turned on, but also a bad Client ID, or a
+    // corporate proxy substituting its own page) with a *differently shaped* JSON body, and
+    // `DeviceCodeResponse`'s fields are all required — so deserializing straight into it turns
+    // GitHub's actual explanation into an opaque "missing field `device_code`" that names an
+    // implementation detail instead of the problem.
+    let response = http
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
         .header("User-Agent", AGENT)
         .form(&[("client_id", client_id), ("scope", NOTIFICATION_SCOPE)])
         .send()
-        .and_then(|r| r.json())
         .map_err(|e| AuthError::Network(e.to_string()))?;
+    let status = response.status();
+    let body = response.text().map_err(|e| AuthError::Network(e.to_string()))?;
+
+    let dc: DeviceCodeResponse = serde_json::from_str(&body)
+        .map_err(|_| AuthError::Github(describe_device_code_failure(status, &body)))?;
 
     // ── Step 2: prompt the user ───────────────────────────────────────────────
     if let Err(e) = open::that(&dc.verification_uri) {
@@ -453,5 +622,32 @@ mod tests {
         assert_eq!(first_meaningful_line(&template), Some(CLIENT_ID_PLACEHOLDER));
         // The caller compares against the placeholder before using it; this documents that pairing.
         assert_eq!(first_meaningful_line("# only comments\n\n"), None);
+    }
+
+    /// The exact symptom this function exists to prevent: a bug report quoting a serde field
+    /// name instead of a reason a human can act on.
+    #[test]
+    fn an_unauthorized_client_names_the_device_flow_checkbox() {
+        let body = r#"{"error":"unauthorized_client","error_description":"The application has not enabled Device Flow."}"#;
+        let msg = describe_device_code_failure(reqwest::StatusCode::BAD_REQUEST, body);
+        assert!(msg.contains("Enable Device Flow"), "got {msg:?}");
+        assert!(msg.contains("has not enabled Device Flow"), "the raw reason must survive too: {msg:?}");
+    }
+
+    #[test]
+    fn a_different_oauth_error_is_reported_without_the_device_flow_hint() {
+        let body = r#"{"error":"invalid_client"}"#;
+        let msg = describe_device_code_failure(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(msg, "invalid_client");
+        assert!(!msg.contains("Device Flow"), "the hint is specific to unauthorized_client: {msg:?}");
+    }
+
+    /// A body that is not the OAuth error shape at all — a proxy's own error page, say — must
+    /// still produce something readable rather than failing a second time.
+    #[test]
+    fn an_unrecognised_body_falls_back_to_status_and_raw_text() {
+        let msg = describe_device_code_failure(reqwest::StatusCode::BAD_GATEWAY, "<html>blocked</html>");
+        assert!(msg.contains("502"), "got {msg:?}");
+        assert!(msg.contains("<html>blocked</html>"), "got {msg:?}");
     }
 }

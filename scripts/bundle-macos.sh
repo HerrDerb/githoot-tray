@@ -8,7 +8,7 @@
 # — wrong for something whose whole UI is one status item.
 #
 # Usage: scripts/bundle-macos.sh <binary> <out-dir> <version>
-#   e.g. scripts/bundle-macos.sh target/release/git-system-tray dist 2.2.0
+#   e.g. scripts/bundle-macos.sh target/release/git-system-tray dist 2.3.0
 
 set -euo pipefail
 
@@ -115,11 +115,44 @@ fi
 codesign --force --sign - "$APP"
 codesign --verify --strict "$APP"
 
+# ── In-zip README ─────────────────────────────────────────────────────────────
+# Gatekeeper quarantines an ad-hoc-signed download and refuses to open it until the quarantine
+# attribute is stripped. README.md documents the fix, but a user who downloaded straight from the
+# Releases page may never see that file — this puts the same instructions where they'll actually
+# be found. Keep this in sync with README.md's "macOS" section if that changes.
+STAGE="$OUT/zip-stage"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+ditto "$APP" "$STAGE/$NAME.app"
+
+cat > "$STAGE/README.txt" <<TXT
+git-system-tray $VERSION (macOS, Apple Silicon)
+================================================
+
+This build is ad-hoc signed, not notarized -- that would need a paid Apple Developer
+account -- so Gatekeeper quarantines it after download and refuses to open it.
+
+Clear the quarantine flag once, then launch normally:
+
+    xattr -dr com.apple.quarantine git-system-tray.app
+    open git-system-tray.app
+
+Notes:
+- For the review indicator to work, gh must be findable. An app launched from Finder
+  inherits a minimal PATH, so it also checks /opt/homebrew/bin and /usr/local/bin.
+- Only Apple Silicon (aarch64) is built here. On Intel, "cargo build --release" from
+  source works fine.
+TXT
+
 # ── Zip ───────────────────────────────────────────────────────────────────────
 # `ditto`, not `zip`: it is the only one that reliably preserves the bundle's structure and the
 # executable bit through a round trip, which is the difference between an app that opens and one
 # that reports itself as damaged.
-ditto -c -k --keepParent "$APP" "$ZIP"
+#
+# No `--keepParent`: the source here is the staging directory, and we want its *contents*
+# (the .app and the README side by side) at the zip's top level, not the staging dir itself.
+ditto -c -k "$STAGE" "$ZIP"
+rm -rf "$STAGE"
 
 echo "bundle:  $APP"
 echo "zip:     $ZIP"

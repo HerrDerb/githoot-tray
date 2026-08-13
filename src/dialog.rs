@@ -63,6 +63,76 @@ pub fn message(title: &str, msg: &str) {
     }
 }
 
+/// Shows `msg` under `title` with two choices and blocks until the user picks one.
+///
+/// Returns `true` for the accepting choice (`accept_label`), `false` for the exiting one
+/// (`exit_label`). Best effort like `message`: if the dialog mechanism itself is unavailable, the
+/// caller gets `true` back, so a platform quirk degrades to "keep going" rather than silently
+/// exiting the app for a reason nobody saw. An explicit choice by the user is always honoured,
+/// even the exiting one.
+pub fn confirm(title: &str, msg: &str, accept_label: &str, exit_label: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ptr::null_mut;
+        use winapi::um::winuser::{IDCANCEL, MB_ICONQUESTION, MB_OKCANCEL, MessageBoxW};
+
+        // MessageBoxW cannot relabel its buttons without pulling in TaskDialog and a manifest for
+        // ComCtl32 v6, so the choice is spelled out in the body text instead and the native
+        // OK/Cancel pair carries it: OK is the accepting choice, Cancel the exiting one.
+        let full_msg = format!("{msg}\n\nClick OK to {accept_label}, or Cancel to {exit_label}.");
+        let title_w: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        let msg_w: Vec<u16> = full_msg.encode_utf16().chain(Some(0)).collect();
+        let result = unsafe {
+            MessageBoxW(null_mut(), msg_w.as_ptr(), title_w.as_ptr(), MB_OKCANCEL | MB_ICONQUESTION)
+        };
+        // A failed call returns 0, which must read as "keep going", not as Cancel — so this checks
+        // for the one button that means stop, rather than checking for the one that means go.
+        result != IDCANCEL
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // `cancel button` binds Escape and the dialog's close button to the exiting choice, so
+        // every way out of the dialog maps to one of the two outcomes this function promises.
+        let script = format!(
+            r#"display dialog "{}" with title "{}" buttons {{"{}", "{}"}} default button "{}" cancel button "{}" with icon caution"#,
+            escape(msg),
+            escape(title),
+            escape(exit_label),
+            escape(accept_label),
+            escape(accept_label),
+            escape(exit_label)
+        );
+        match std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).contains(accept_label)
+            }
+            // A non-zero exit here means the cancel-designated button (or Escape, or the close
+            // button) was used — a real choice, not a failure, so it is honoured as "exit".
+            Ok(_) => false,
+            // `osascript` itself could not run. Unlike a real choice, this says nothing about what
+            // the user wants, so it must not silently end the app.
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        println!("\n{title}: {msg}");
+        println!("Press Enter to {accept_label}, or type anything else then Enter to {exit_label}.");
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        input.trim().is_empty()
+    }
+}
+
 /// Escapes a string for embedding in an AppleScript string literal.
 ///
 /// Backslash first, or escaping the quotes would then have their own backslashes doubled.

@@ -15,11 +15,13 @@ A lightweight Rust system tray app that watches your GitHub notifications and ch
   later, so the icon clears as soon as you have read things
 - 🤔 **Honest about failures** — a network error, rate limit, or expired token holds the last
   known icon and explains itself in the tooltip, instead of silently claiming "all clear"
-- 🔐 **Device Code login** — no manual token setup; authenticate via browser in one step,
-  and re-authenticates by itself if the token is later revoked
+- 🔐 **No setup if you already use `gh`** — the notification token is borrowed from
+  [`gh`](https://cli.github.com) when it's logged in with the `notifications` scope; otherwise a
+  one-time Device Code login creates and stores one, and re-authenticates itself if it is later
+  revoked
 - 🔴 **Review dot** — a red dot when PRs await your review, with the exact count in the tooltip and
-  the tray menu, using the token [`gh`](https://cli.github.com) already holds, so there is no second
-  credential to create or store (see below)
+  the tray menu, using the token `gh` already holds, so there is no second credential to create or
+  store (see below)
 - 🖱️ **Tray menu** — open GitHub Notifications in the browser or quit, right from the tray
 - 🪟 **Windows** — native system tray via `tray-icon` + `winit`, no console window
 - 🍎 **macOS** — native menu bar via `tray-icon` + `winit`, shipped as an `LSUIElement` app bundle
@@ -40,13 +42,26 @@ A lightweight Rust system tray app that watches your GitHub notifications and ch
 
 ## Setup
 
-### 1. Register a GitHub OAuth App
+### 1. (Optional) Give `gh` the `notifications` scope
 
-1. Go to [github.com/settings/developers](https://github.com/settings/developers) → **New OAuth App**
-2. Set any **Homepage URL** (e.g. `http://localhost`)
-3. Leave **Callback URL** blank
-4. After creating, click **Enable Device Flow** in the app settings
-5. Copy the **Client ID**
+If [`gh`](https://cli.github.com) is installed and logged in with the `notifications` scope, the
+app borrows that token and skips the OAuth App step below entirely:
+
+```bash
+gh auth login
+gh auth status                            # check whether notifications is already listed
+gh auth refresh --scopes notifications    # only if it is not
+```
+
+Skip this if you would rather not widen `gh`'s scopes, or don't use `gh` at all — step 3 below
+covers what happens instead.
+
+If `gh` is not found on `PATH` at all, startup shows a dialog explaining the option above and
+asking whether to continue with the OAuth App flow (step 3) or exit so `gh` can be installed
+first. `gh` being installed but not logged in, or logged in without the `notifications` scope,
+skips this dialog and falls straight back to step 3 — at that point `gh` is already set up for
+something, so the review dot's own dialog (see [Red dot for pending PR
+reviews](#red-dot-for-pending-pr-reviews)) is the one that speaks up if it needs attention.
 
 ### 2. Build
 
@@ -60,7 +75,7 @@ On macOS the bare binary works from a terminal, but it takes a Dock icon and an 
 `LSUIElement` can only be set in an app bundle. To get the real thing:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 2.2.0
+scripts/bundle-macos.sh target/release/git-system-tray dist 2.3.0
 open dist/git-system-tray.app
 ```
 
@@ -69,7 +84,16 @@ identically.
 
 ### 3. First launch
 
-There is nothing to edit in the source. On first run the app writes
+If `gh` supplied a token in step 1, that's it — the app uses it and there is nothing further to
+set up. Otherwise it falls back to a one-time OAuth App device flow:
+
+1. Go to [github.com/settings/developers](https://github.com/settings/developers) → **New OAuth App**
+2. Set any **Homepage URL** (e.g. `http://localhost`)
+3. Leave **Callback URL** blank
+4. After creating, click **Enable Device Flow** in the app settings
+5. Copy the **Client ID**
+
+There is nothing to edit in the source for this. On first run the app writes
 `~/.github-trayicon/client_id.txt`, opens it in your editor and waits — paste your Client ID in,
 save, and confirm.
 
@@ -127,8 +151,9 @@ path.
 
 ### When it cannot work, it says so
 
-The notification half has its own credential and never depends on `gh`, so none of these stop the
-app. Each one produces a dialog at startup, a line in the log, and a line in the tooltip:
+The notification half falls back to its own OAuth App device flow when `gh` cannot supply a
+`notifications`-scoped token (see [Setup](#setup)), so none of these stop the app — only the
+review dot. Each one produces a dialog at startup, a line in the log, and a line in the tooltip:
 
 | What is wrong | Tooltip says |
 |---|---|
@@ -141,8 +166,9 @@ A dark dot with no message means you genuinely have nothing to review. That dist
 point: without the `repo` scope, GitHub's search answers `200` with `total_count: 0` rather than an
 error, so a confident zero would be indistinguishable from the truth. The app refuses to report one.
 
-Scopes are only ever read from the search credential's own responses, never from the notification
-token's, since that one is scoped to `notifications` on purpose and will never carry `repo`.
+Scopes for the review dot are only ever read from the search credential's own responses, never
+from whatever is backing the notification token — the two are checked independently even when
+`gh` happens to be supplying both.
 
 If you set this up with a PAT before, `~/.github-trayicon/review_token.txt` is no longer read. The
 app logs a reminder on startup, and you can delete the file: it holds a credential you no longer

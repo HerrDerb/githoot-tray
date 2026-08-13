@@ -1,11 +1,12 @@
-//! GitHub CLI as the credential source for the review-request search.
+//! GitHub CLI as a credential source.
 //!
-//! `GET /notifications` keeps its own OAuth token (see `access_token`). That credential is narrow,
-//! it works, and nothing here touches it. Only the review search needs more: counting pull requests
-//! awaiting review in private repositories requires the classic `repo` scope, and GitHub offers
-//! nothing narrower (`public_repo` covers public repos only). Rather than escalate our own token to
-//! a read-write key for every repository the user can reach, we borrow the one `gh` already holds in
-//! the OS keyring, and never write it to disk ourselves.
+//! Two independent things borrow a token from `gh` here, each gated on its own scope: the review
+//! search needs the classic `repo` scope (nothing narrower exists — `public_repo` covers public
+//! repos only), and `access_token` prefers a `gh` token with the `notifications` scope over running
+//! its own OAuth App device flow, falling back to that flow when `gh` cannot supply one. Rather than
+//! escalate a purpose-built token to a read-write key for every repository the user can reach, or
+//! make every user register their own OAuth App, both borrow the credential `gh` already holds in
+//! the OS keyring, and never write it to disk themselves.
 //!
 //! `gh` is invoked at startup and after a 401, never per poll. The decision logic is a pure
 //! function (`classify`) so every branch is testable without a `gh` on PATH, in the same spirit as
@@ -19,6 +20,10 @@ use std::time::{Duration, Instant};
 
 /// The one classic scope that grants read access to pull requests in private repositories.
 const REQUIRED_SCOPE: &str = "repo";
+
+/// The classic scope `GET /notifications` requires of an OAuth-app/PAT token. Used by
+/// `access_token` to decide whether `gh`'s token can stand in for its own device-flow token.
+pub const NOTIFICATIONS_SCOPE: &str = "notifications";
 
 /// Overridable so GitHub Enterprise users are not locked out. `gh` reads the same variable.
 const HOST_ENV: &str = "GH_HOST";
@@ -162,9 +167,22 @@ pub fn parse_scopes(raw: &str) -> Option<HashSet<String>> {
     (!set.is_empty()).then_some(set)
 }
 
+/// Whether a scope string is known to lack `scope`. `false` when the scopes are unknown — see
+/// `parse_scopes` for why unknown must never read as missing.
+pub fn lacks_scope(raw: &str, scope: &str) -> bool {
+    parse_scopes(raw).is_some_and(|scopes| !scopes.contains(scope))
+}
+
 /// Whether a scope string is known to lack `repo`. `false` when the scopes are unknown.
 pub fn lacks_required_scope(raw: &str) -> bool {
-    parse_scopes(raw).is_some_and(|scopes| !scopes.contains(REQUIRED_SCOPE))
+    lacks_scope(raw, REQUIRED_SCOPE)
+}
+
+/// Whether a scope string is known to include `scope`. Unlike `lacks_scope`, unknown scopes read
+/// as `false` here too: a caller reaching for this wants an affirmative "yes" before trusting the
+/// credential, not "not known to be missing".
+pub fn has_scope(raw: &str, scope: &str) -> bool {
+    parse_scopes(raw).is_some_and(|scopes| scopes.contains(scope))
 }
 
 /// Verdict on whether the review dot can run.
@@ -193,7 +211,10 @@ pub fn classify(host: &str, status: Result<Option<Account>, GhError>) -> Verdict
 }
 
 /// Asks `gh` which accounts it holds for `host`, returning the active one.
-fn auth_status(host: &str) -> Result<Option<Account>, GhError> {
+///
+/// Crate-visible: `access_token` calls this too, to decide whether `gh` can supply a
+/// notifications-scoped token before falling back to its own device flow.
+pub(crate) fn auth_status(host: &str) -> Result<Option<Account>, GhError> {
     // `--json` makes gh exit 0 even when nothing is logged in, answering `{"hosts":{}}` on stdout
     // and a human sentence on stderr. So the absence of an entry, not the exit code, is the signal.
     let stdout = run(&["auth", "status", "--hostname", host, "--json", "hosts"])?;
@@ -215,7 +236,9 @@ fn auth_status(host: &str) -> Result<Option<Account>, GhError> {
 }
 
 /// Fetches the active token for `host`. The value is never logged and never written to disk.
-fn auth_token(host: &str) -> Result<String, GhError> {
+///
+/// Crate-visible for the same reason as `auth_status`.
+pub(crate) fn auth_token(host: &str) -> Result<String, GhError> {
     let token = run(&["auth", "token", "--hostname", host])?.trim().to_string();
     if token.is_empty() {
         // Exit 0 with nothing to show would otherwise become an empty Bearer header and a 401.
