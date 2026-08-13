@@ -85,12 +85,6 @@ pub struct PollResponse {
     pub result: PollResult,
     /// From `x-poll-interval`. GitHub raises this under load and we must obey it.
     pub poll_interval: Option<Duration>,
-    /// From `x-oauth-scopes`: what the token that made *this* request is actually allowed to do.
-    ///
-    /// `None` means GitHub did not say, which happens on a transport failure and on every
-    /// fine-grained or GitHub App token. That is "unknown", not "no scopes", and the two must not be
-    /// confused: a missing header is never grounds for declaring a capability absent.
-    pub scopes: Option<String>,
 }
 
 /// Builds the shared HTTP client.
@@ -156,7 +150,6 @@ fn send(
             return PollResponse {
                 result: PollResult::Transient(format!("request failed: {e}")),
                 poll_interval: None,
-                scopes: None,
             }
         }
     };
@@ -172,14 +165,7 @@ fn send(
         response.text().unwrap_or_default()
     };
 
-    PollResponse {
-        result: classify_with(status, &headers, &body, unix_now(), parse_ok),
-        poll_interval,
-        // Sent on every response to a classic OAuth-app token, including error responses, so this
-        // is the authoritative answer to "can this credential do the job" once we have talked to
-        // GitHub even once.
-        scopes: header_string(&headers, "x-oauth-scopes"),
-    }
+    PollResponse { result: classify_with(status, &headers, &body, unix_now(), parse_ok), poll_interval }
 }
 
 /// Success-body parser for `/notifications`: presence only, no count.

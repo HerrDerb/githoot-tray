@@ -5,9 +5,10 @@
 //! Handles cross-platform initialization and tray icon setup.
 
 mod access_token;
+mod config;
 mod dialog;
-mod gh_cli;
 mod github;
+mod github_app;
 mod icons;
 mod log;
 mod scheduler;
@@ -15,29 +16,22 @@ mod state;
 
 const NOTIFICATIONS_URL: &str = "https://github.com/notifications";
 
-/// Loads the review-search credential from `gh`.
+/// Loads the shared PR-status credential (the `github_app` Device Flow) and confirms it can
+/// actually see something.
 ///
-/// Returns the credential and, when there is none, a short reason for the tooltip.
+/// Returns the credential and, when there is none (sign-in failed, or it signed in fine but the
+/// GitHub App is not installed anywhere yet), a short reason for the tooltip.
 ///
-/// Never fatal. The notification half has its own narrow credential and does not care whether `gh`
-/// exists, so a missing or under-scoped `gh` must cost the user the dot and nothing else. It does
-/// have to be *said*, though: a dark dot that means "nobody could ask" looks exactly like a dark dot
-/// that means "nothing to review", and that confusion is the bug this whole codebase is shaped
-/// around avoiding.
-fn load_review_credential(app_asset_path: &std::path::Path) -> (Option<gh_cli::ReviewToken>, Option<String>) {
-    // Say so once per launch, because a credential nobody reads is still a credential on disk, and
-    // the user cannot delete a file they do not know went stale.
-    for stale in ["review_token.txt", "review_client_id.txt", "review_refresh_token.txt"] {
-        if app_asset_path.join(stale).exists() {
-            logln!("note: {stale} is no longer used (gh supplies this credential) and can be deleted");
-        }
-    }
-
-    match gh_cli::ReviewToken::load() {
-        Ok(token) => (Some(token), None),
-        Err(why) => {
-            // One line in the log, because the message is deliberately multi-line for a dialog.
-            logln!("review dot disabled: {}", why.message().replace('\n', " "));
+/// Never fatal. Notifications are a separate, optional feature (see `config`) that does not care
+/// whether this succeeds. It does have to be *said*, though: a dark dot that means "nobody could
+/// ask" looks exactly like a dark dot that means "nothing to review", and that confusion is the
+/// bug this whole codebase is shaped around avoiding.
+fn load_pr_credential(app_asset_path: &std::path::Path) -> (Option<github_app::PrTokenStore>, Option<String>) {
+    let store = match github_app::PrTokenStore::load(app_asset_path) {
+        Ok(store) => store,
+        Err(e) => {
+            let msg = format!("Could not authenticate with GitHub for PR status: {e}");
+            logln!("PR status disabled: {msg}");
 
             // On Windows there is no console (`windows_subsystem = "windows"`) and on macOS the app
             // ships as an `LSUIElement` bundle whose stdout goes to unified logging, so on both a
@@ -46,11 +40,27 @@ fn load_review_credential(app_asset_path: &std::path::Path) -> (Option<gh_cli::R
             // Not `dialog::message` on Linux: this runs during startup and nobody is waiting to be
             // asked anything, so its stdin fallback would block the app before the tray appears.
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            dialog::message("git-system-tray: review dot", &why.message());
+            dialog::message("git-system-tray: PR status", &msg);
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            eprintln!("\ngit-system-tray: review dot disabled\n\n{}\n", why.message());
+            eprintln!("\ngit-system-tray: PR status disabled\n\n{msg}\n");
 
-            (None, Some(why.short()))
+            return (None, Some("PR status off: sign-in failed".to_string()));
+        }
+    };
+
+    match store.installation_count() {
+        Ok(0) => {
+            let reason = "PR status off: install the GitHub App to see your PRs".to_string();
+            logln!("{reason}");
+            (None, Some(reason))
+        }
+        Ok(_) => (Some(store), None),
+        // Could not confirm installations — start anyway rather than refuse over a question we
+        // could not even ask. Same "unreachable is not the same as invalid" reasoning
+        // `access_token`'s saved-token check already uses.
+        Err(e) => {
+            logln!("could not confirm GitHub App installations ({e}) — continuing anyway");
+            (Some(store), None)
         }
     }
 }
@@ -92,19 +102,25 @@ fn main() {
         }
     };
 
-    let tokens = match access_token::TokenStore::load(&app_asset_path) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            logln!("fatal: {e}");
-            std::process::exit(1);
+    let config = config::Config::load(&app_asset_path);
+    let tokens = if config.notifications {
+        match access_token::TokenStore::load(&app_asset_path) {
+            Ok(tokens) => Some(tokens),
+            Err(e) => {
+                logln!("fatal: {e}");
+                std::process::exit(1);
+            }
         }
+    } else {
+        logln!("notifications disabled (enable with \"notifications=on\" in config.txt)");
+        None
     };
 
-    let (reviews, reviews_off) = load_review_credential(&app_asset_path);
+    let (pr, pr_off) = load_pr_credential(&app_asset_path);
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
-    indicator.set_icon(icons.get(false, false).as_str());
+    indicator.set_icon(icons.get(false, false, false, false).as_str());
 
     // The poll loop waits on this channel, so a menu click can pull the next poll forward.
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
@@ -124,7 +140,7 @@ fn main() {
     let reviews_item = MenuItem::with_label(state::REVIEWS_MENU_LABEL);
     let reviews_wake_tx = wake_tx.clone();
     reviews_item.connect_activate(move |_| {
-        if let Err(e) = open::that(scheduler::review_list_url()) {
+        if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReviewRequested)) {
             logln!("failed to open browser: {e}");
         }
         // Reviewing is what clears the dot, so pull the next poll forward the same way the
@@ -132,10 +148,30 @@ fn main() {
         let _ = reviews_wake_tx.send(scheduler::Wake::Refresh);
     });
 
+    let ready_to_merge_item = MenuItem::with_label(state::PrAxis::ReadyToMerge.menu_label());
+    let ready_to_merge_wake_tx = wake_tx.clone();
+    ready_to_merge_item.connect_activate(move |_| {
+        if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReadyToMerge)) {
+            logln!("failed to open browser: {e}");
+        }
+        let _ = ready_to_merge_wake_tx.send(scheduler::Wake::Refresh);
+    });
+
+    let changes_requested_item = MenuItem::with_label(state::PrAxis::ChangesRequested.menu_label());
+    let changes_requested_wake_tx = wake_tx.clone();
+    changes_requested_item.connect_activate(move |_| {
+        if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ChangesRequested)) {
+            logln!("failed to open browser: {e}");
+        }
+        let _ = changes_requested_wake_tx.send(scheduler::Wake::Refresh);
+    });
+
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
     menu.append(&item);
     menu.append(&reviews_item);
+    menu.append(&ready_to_merge_item);
+    menu.append(&changes_requested_item);
     menu.append(&quit_item);
     menu.show_all();
 
@@ -158,10 +194,15 @@ fn main() {
         // Cloned rather than moved: the menu keeps the originals, and these handles are what the
         // poll loop relabels and shows or hides. GTK widgets are reference-counted, so both refer
         // to the same items.
-        scheduler::MenuItems { notifications: item.clone(), reviews: reviews_item.clone() },
+        scheduler::MenuItems {
+            notifications: item.clone(),
+            reviews: reviews_item.clone(),
+            ready_to_merge: ready_to_merge_item.clone(),
+            changes_requested: changes_requested_item.clone(),
+        },
         tokens,
-        reviews,
-        reviews_off,
+        pr,
+        pr_off,
         wake_rx,
     );
 
@@ -235,12 +276,18 @@ fn main() {
     };
     log::init(&app_asset_path);
 
-    let tokens = match access_token::TokenStore::load(&app_asset_path) {
-        Ok(tokens) => tokens,
-        Err(e) => fatal(&format!("Could not authenticate with GitHub: {e}")),
+    let config = config::Config::load(&app_asset_path);
+    let tokens = if config.notifications {
+        match access_token::TokenStore::load(&app_asset_path) {
+            Ok(tokens) => Some(tokens),
+            Err(e) => fatal(&format!("Could not authenticate with GitHub: {e}")),
+        }
+    } else {
+        logln!("notifications disabled (enable with \"notifications=on\" in config.txt)");
+        None
     };
 
-    let (reviews, reviews_off) = load_review_credential(&app_asset_path);
+    let (pr, pr_off) = load_pr_credential(&app_asset_path);
 
     // ── Tray ─────────────────────────────────────────────────────────────────
 
@@ -261,17 +308,22 @@ fn main() {
         open_item_id: tray_icon::menu::MenuId,
         reviews_item: tray_icon::menu::MenuItem,
         reviews_item_id: tray_icon::menu::MenuId,
+        ready_to_merge_item: tray_icon::menu::MenuItem,
+        ready_to_merge_item_id: tray_icon::menu::MenuId,
+        changes_requested_item: tray_icon::menu::MenuItem,
+        changes_requested_item_id: tray_icon::menu::MenuId,
         quit_item: tray_icon::menu::MenuItem,
         quit_item_id: tray_icon::menu::MenuId,
-        /// Which image the tray is actually showing, as `(unread, review_pending)`, as far as we
-        /// know. `None` means "unproven", which forces the next update to re-apply rather than
-        /// assume.
-        applied: Option<(bool, bool)>,
-        /// Likewise for the menu text, so an unchanged count does not rewrite the item.
-        applied_label: Option<String>,
+        /// Which image the tray is actually showing, as `[notifications, review_requested,
+        /// ready_to_merge, changes_requested]`, as far as we know. `None` means "unproven", which
+        /// forces the next update to re-apply rather than assume.
+        applied: Option<[bool; 4]>,
+        /// Likewise for the three PR menu items' text, indexed by `PrAxis::index`, so an
+        /// unchanged count does not rewrite the item.
+        applied_labels: [Option<String>; 3],
         /// And for which entries the menu currently holds. Tracked separately from `applied`
         /// because a failed `set_icon` must not also suppress the menu update.
-        applied_menu: Option<(bool, bool)>,
+        applied_menu: Option<[bool; 4]>,
     }
 
     /// Decodes the icons, builds the menu, and creates the tray icon.
@@ -293,19 +345,29 @@ fn main() {
         let open_item_id = open_item.id().clone();
         let reviews_item = MenuItem::new(state::REVIEWS_MENU_LABEL, true, None);
         let reviews_item_id = reviews_item.id().clone();
+        let ready_to_merge_item =
+            MenuItem::new(state::PrAxis::ReadyToMerge.menu_label(), true, None);
+        let ready_to_merge_item_id = ready_to_merge_item.id().clone();
+        let changes_requested_item =
+            MenuItem::new(state::PrAxis::ChangesRequested.menu_label(), true, None);
+        let changes_requested_item_id = changes_requested_item.id().clone();
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_item_id = quit_item.id().clone();
         let menu = Menu::new();
-        for (item, what) in
-            [(&open_item, "open"), (&reviews_item, "reviews"), (&quit_item, "quit")]
-        {
+        for (item, what) in [
+            (&open_item, "open"),
+            (&reviews_item, "reviews"),
+            (&ready_to_merge_item, "ready to merge"),
+            (&changes_requested_item, "changes requested"),
+            (&quit_item, "quit"),
+        ] {
             menu.append(item)
                 .map_err(|e| format!("Failed to append {what} menu item: {e}"))?;
         }
 
         let tray_icon = TrayIconBuilder::new()
             .with_tooltip("GitHub Notifications")
-            .with_icon(icons.get(false, false).clone())
+            .with_icon(icons.get(false, false, false, false).clone())
             // Cloned rather than moved: `Menu` is a reference-counted handle, and the app keeps one
             // so it can take entries out later. The tray gets the same underlying menu.
             .with_menu(Box::new(menu.clone()))
@@ -320,15 +382,19 @@ fn main() {
             open_item_id,
             reviews_item,
             reviews_item_id,
+            ready_to_merge_item,
+            ready_to_merge_item_id,
+            changes_requested_item,
+            changes_requested_item_id,
             quit_item,
             quit_item_id,
             // The builder set the plain icon above, but treat that as unproven so the first
             // confirmed poll always writes the image it wants.
             applied: None,
-            applied_label: None,
+            applied_labels: [None, None, None],
             // The menu was built with every entry present, and that much we did do, so it is
             // recorded as such. Only a confirmed empty answer will take one out.
-            applied_menu: Some((true, true)),
+            applied_menu: Some([true; 4]),
         })
     }
 
@@ -402,7 +468,7 @@ fn main() {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
 
     // Launch the polling thread; it communicates back via the proxy.
-    scheduler::start_notification_scheduler(tokens, reviews, reviews_off, wake_rx, proxy);
+    scheduler::start_notification_scheduler(tokens, pr, pr_off, wake_rx, proxy);
 
     // ── Application handler ──────────────────────────────────────────────────
 
@@ -436,10 +502,20 @@ fn main() {
                 // than leaving a stale "unread" icon up for a whole interval.
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.reviews_item_id {
-                if let Err(e) = open::that(scheduler::review_list_url()) {
+                if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReviewRequested)) {
                     logln!("failed to open browser: {e}");
                 }
                 // Reviewing is what clears the dot, so pull the next poll forward.
+                let _ = self.wake_tx.send(scheduler::Wake::Refresh);
+            } else if *id == tray.ready_to_merge_item_id {
+                if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReadyToMerge)) {
+                    logln!("failed to open browser: {e}");
+                }
+                let _ = self.wake_tx.send(scheduler::Wake::Refresh);
+            } else if *id == tray.changes_requested_item_id {
+                if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ChangesRequested)) {
+                    logln!("failed to open browser: {e}");
+                }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.quit_item_id {
                 event_loop.exit();
@@ -464,12 +540,14 @@ fn main() {
         ///
         /// Only called when the set actually changes, which is rare. It can still land while the
         /// user has the menu open, since nothing tells us whether it is showing.
-        fn rebuild_menu(&self, notifications: bool, reviews: bool) {
+        fn rebuild_menu(&self, wanted: [bool; 4]) {
             while self.menu.remove_at(0).is_some() {}
 
             for (item, wanted, what) in [
-                (&self.open_item, notifications, "notifications"),
-                (&self.reviews_item, reviews, "reviews"),
+                (&self.open_item, wanted[0], "notifications"),
+                (&self.reviews_item, wanted[1], "review-requested"),
+                (&self.ready_to_merge_item, wanted[2], "ready-to-merge"),
+                (&self.changes_requested_item, wanted[3], "changes-requested"),
                 // Quit is unconditional: a tray icon with no way out is a bug, not a tidy menu.
                 (&self.quit_item, true, "quit"),
             ] {
@@ -483,17 +561,19 @@ fn main() {
         }
 
         fn apply(&mut self, update: Update) {
-            // `Unknown` on either axis deliberately leaves that part of the picture alone — a
-            // brief failure should change the words, not make the icon flap. So an unknown axis
-            // falls back to whatever is currently on screen.
-            let current = self.applied.unwrap_or((false, false));
-            let wanted = (
-                update.icon.notifications.as_confirmed().unwrap_or(current.0),
-                update.icon.reviews.as_confirmed().unwrap_or(current.1),
-            );
+            // `Unknown` on any axis deliberately leaves that part of the picture alone — a brief
+            // failure should change the words, not make the icon flap. So an unknown axis falls
+            // back to whatever is currently on screen.
+            let current = self.applied.unwrap_or([false; 4]);
+            let wanted = [
+                update.icon.notifications.as_confirmed().unwrap_or(current[0]),
+                update.icon.review_requested.as_confirmed().unwrap_or(current[1]),
+                update.icon.ready_to_merge.as_confirmed().unwrap_or(current[2]),
+                update.icon.changes_requested.as_confirmed().unwrap_or(current[3]),
+            ];
 
             if self.applied != Some(wanted) {
-                let icon = self.icons.get(wanted.0, wanted.1).clone();
+                let icon = self.icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).clone();
                 match self.tray_icon.set_icon(Some(icon)) {
                     // Only record success. A failed update leaves this `None` so the next
                     // poll retries instead of believing the icon is already correct.
@@ -509,21 +589,30 @@ fn main() {
             // The icon can only say "something is waiting". The number goes here, where there is
             // room for it, and in the tooltip. Only written on change, so an open menu is not
             // rebuilt underneath the user on every poll.
-            if self.applied_label.as_deref() != Some(update.reviews_label.as_str()) {
-                self.reviews_item.set_text(&update.reviews_label);
-                self.applied_label = Some(update.reviews_label);
+            //
+            // Bound to a local first, not called as a method: a `&self` method here would borrow
+            // all of `self` for the loop below, which conflicts with the `&mut self.applied_labels`
+            // borrow the same loop needs. Direct field projections keep the two borrows disjoint.
+            let pr_items = [&self.reviews_item, &self.ready_to_merge_item, &self.changes_requested_item];
+            for (item, (label, applied_label)) in
+                pr_items.into_iter().zip(update.pr_labels.iter().zip(&mut self.applied_labels))
+            {
+                if applied_label.as_deref() != Some(label.as_str()) {
+                    item.set_text(label);
+                    *applied_label = Some(label.clone());
+                }
             }
 
             // An entry that opens an empty list is just a dead end, so it is taken out. `wanted`
             // serves double duty here: the icon shows a blue glyph exactly when there are unread
             // notifications, which is exactly when that menu entry has somewhere to go, and the
-            // same holds for the dot and the reviews entry.
+            // same holds for each dot and its matching entry.
             //
             // Note this inherits `wanted`'s treatment of `Unknown`: an axis we have lost track of
             // keeps whatever it last had. A failed poll must not remove an entry, because "I could
             // not ask" is not the same as "there is nothing there".
             if self.applied_menu != Some(wanted) {
-                self.rebuild_menu(wanted.0, wanted.1);
+                self.rebuild_menu(wanted);
                 self.applied_menu = Some(wanted);
             }
         }

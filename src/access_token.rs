@@ -1,13 +1,9 @@
-//! Notifications credential: `gh`, falling back to GitHub Device Code authentication.
+//! Notifications credential: GitHub Device Code authentication against a user-registered OAuth
+//! App.
 //!
-//! `gh`'s token is tried first, exactly as it is for the review search in `gh_cli` — one fewer
-//! credential for a user who already has `gh` set up to create and store. It is only usable here
-//! when its scopes are *known* to include `notifications`; unlike the review search, there is no
-//! live check afterwards that can catch a wrong guess and turn the feature off (see
-//! `gh_backed_token`), so an unknown scope set falls back rather than being optimistically
-//! accepted. Falling back means the OAuth App device flow below, which is the only path that
-//! existed before `gh` support was added: it prompts for a Client ID once, then authenticates via
-//! browser and stores the resulting token on disk.
+//! `GET /notifications` only accepts classic OAuth-app/PAT tokens with the `notifications`
+//! scope. This prompts for a Client ID once, then authenticates via browser and stores the
+//! resulting token on disk.
 //!
 //! Every failure path here used to call `std::process::exit(1)`. That was survivable while the
 //! token was only ever fetched once from `main`, but the poll thread now re-authenticates when
@@ -15,7 +11,6 @@
 //! tray icon down instead of reporting a problem. So the flow returns `Result` and lets the
 //! caller decide whether the failure is fatal.
 
-use crate::gh_cli;
 use crate::logln;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -25,13 +20,6 @@ use std::time::{Duration, Instant};
 const ACCESS_TOKEN_FILE: &str = "access_token.txt";
 const CLIENT_ID_FILE: &str = "client_id.txt";
 const CLIENT_ID_PLACEHOLDER: &str = "YOUR_CLIENT_ID_HERE";
-
-// ── Review credential ─────────────────────────────────────────────────────────
-// `GET /notifications` only accepts classic OAuth-app/PAT tokens with the `notifications` scope, so
-// the credential below cannot be narrowed or migrated, and it stays exactly as it was. Searching for
-// review requests in private repos needs different access entirely: the only classic scope that
-// grants it (`repo`) also grants write to every repository. Rather than escalate this token that
-// far, the review search borrows the credential `gh` already holds. See `gh_cli`.
 
 const NOTIFICATION_SCOPE: &str = "notifications";
 const AGENT: &str = "git-system-tray";
@@ -104,162 +92,9 @@ fn wait_for_user_confirmation(title: &str, msg: &str) {
     crate::dialog::message(title, msg);
 }
 
-/// Displays the device-code prompt. Where dialogs are used this opens a non-blocking one in a
-/// background thread so polling can proceed immediately.
-///
-/// The details also go to the log, because this is reachable from the poll thread long after
-/// startup — and on Linux launched from a desktop entry there is no terminal to print to.
-fn show_auth_prompt(user_code: &str, verification_uri: &str) {
-    logln!("authorization required: open {verification_uri} and enter code {user_code}");
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        let user_code = user_code.to_string();
-        let verification_uri = verification_uri.to_string();
-        std::thread::spawn(move || {
-            crate::dialog::message(
-                "GitHub Authorization Required",
-                &format!(
-                    "Open: {}\n\nEnter code: {}\n\nThis dialog can be closed once you have entered the code.",
-                    verification_uri, user_code
-                ),
-            );
-        });
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        println!();
-        println!("━━━  GitHub Authorization Required  ━━━");
-        println!("  1. Open:  {}", verification_uri);
-        println!("  2. Enter: {}", user_code);
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!();
-    }
-}
-
-/// Notifies the user that authorization succeeded.
-fn show_auth_success() {
-    logln!("authorization successful");
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    crate::dialog::message("GitHub Authorization", "Authorization successful!");
-}
-
-// ── Credential source ─────────────────────────────────────────────────────────
-
-/// Where the current token comes from, and what renewing it takes.
-///
-/// `Gh` persists nothing of its own — `gh` owns that credential's lifetime, storage and renewal,
-/// exactly as it does for the review credential in `gh_cli`. `DeviceFlow` is the pre-`gh` path:
-/// a user-registered OAuth App, a token saved to disk, and a browser round trip to replace it.
-enum Source {
-    Gh { host: String },
-    DeviceFlow { token_path: PathBuf, client_id: String },
-}
-
-/// Why `gh` did not supply the notifications token, as far as `load` needs to know.
-///
-/// `NotInstalled` and `MissingScope` are each worth interrupting startup for, in different ways —
-/// see `offer_gh_install_hint` and `tell_user_gh_needs_notifications_scope`. Everything else means
-/// `gh` is present but otherwise not ready (not logged in, a slow keyring, scopes it did not
-/// report), which is logged and left there rather than surfaced.
-enum GhFallback {
-    NotInstalled,
-    /// `gh` is logged in and its scopes are *known* — just missing `notifications`.
-    MissingScope,
-    Other,
-}
-
-/// Tries to source the notifications token from `gh`, the same way `gh_cli::ReviewToken` borrows
-/// one for the review search. `Err` on anything short of a token confirmed to carry the
-/// `notifications` scope — never treated as an application error in itself, though `load` turns
-/// some of these variants into a dialog before deciding what to do next.
-///
-/// The scope check has three outcomes, not two, because `gh_cli::has_scope` and
-/// `gh_cli::lacks_scope` agree only when scopes are actually known: unknown scopes (offline, or a
-/// fine-grained token) answer `false` to both, and only *that* case gambles on the OAuth App
-/// instead of gh — same reasoning as the module doc. A definite "missing" is not a gamble, so it
-/// gets its own outcome rather than being folded into "unknown".
-fn gh_backed_token() -> Result<(String, String), GhFallback> {
-    let host = gh_cli::host();
-
-    let account = match gh_cli::auth_status(&host) {
-        Ok(Some(account)) => account,
-        Ok(None) => {
-            logln!("gh has no active account for {host} — using the notifications OAuth App instead");
-            return Err(GhFallback::Other);
-        }
-        Err(gh_cli::GhError::NotInstalled) => {
-            logln!("gh not found on PATH — using the notifications OAuth App instead");
-            return Err(GhFallback::NotInstalled);
-        }
-        Err(e) => {
-            logln!(
-                "gh unavailable ({}) — using the notifications OAuth App instead",
-                gh_cli::Unavailable::from(e).short()
-            );
-            return Err(GhFallback::Other);
-        }
-    };
-
-    if gh_cli::lacks_scope(&account.scopes, gh_cli::NOTIFICATIONS_SCOPE) {
-        logln!("gh's token is missing the notifications scope — run: gh auth refresh --scopes notifications");
-        return Err(GhFallback::MissingScope);
-    }
-    if !gh_cli::has_scope(&account.scopes, gh_cli::NOTIFICATIONS_SCOPE) {
-        logln!(
-            "gh's token scopes are unknown — using the notifications OAuth App instead. To use \
-             gh instead, run: gh auth refresh --scopes notifications"
-        );
-        return Err(GhFallback::Other);
-    }
-
-    match gh_cli::auth_token(&host) {
-        Ok(token) => {
-            logln!("notifications credential: gh cli, host {host}, login {}", account.login);
-            Ok((host, token))
-        }
-        Err(e) => {
-            logln!(
-                "gh auth token failed ({}) — using the notifications OAuth App instead",
-                gh_cli::Unavailable::from(e).short()
-            );
-            Err(GhFallback::Other)
-        }
-    }
-}
-
-/// Tells the user `gh` was not found and lets them choose whether to keep going with the OAuth App
-/// flow now, or exit so they can install `gh` first.
-///
-/// Startup only — this is `load`'s decision to make. `reauthenticate` never calls this: `gh` going
-/// missing mid-run is not a reason to interrupt a tray app the user is not looking at.
-fn offer_gh_install_hint() -> bool {
-    let title = "git-system-tray: GitHub CLI not found";
-    let msg = "This app can use the GitHub CLI (gh) for notifications if it is installed and \
-               logged in with the `notifications` scope — one less sign-in to manage.\n\n\
-               gh was not found on PATH. You can continue with a separate one-time sign-in \
-               instead, or exit now to install gh (https://cli.github.com) and run:\n\n    \
-               gh auth login\n    gh auth refresh --scopes notifications";
-    crate::dialog::confirm(title, msg, "Continue", "Exit")
-}
-
-/// Tells the user `gh` is logged in but missing the scope this app needs, and that fixing it
-/// needs a restart.
-///
-/// Unlike `offer_gh_install_hint`, there is no "continue anyway" choice: `gh` already holds a
-/// working account for this host, so quietly falling back to a second, separately-registered
-/// credential would trade one broken setup for two half-finished ones. The single button just
-/// acknowledges the message; closing it ends the process either way, since there is nothing this
-/// run of the app can still do about it.
-fn tell_user_gh_needs_notifications_scope() {
-    let title = "git-system-tray: gh is missing the notifications scope";
-    let msg = "The GitHub CLI (gh) is logged in, but its token does not include the \
-               `notifications` scope this app needs.\n\n\
-               Run:\n\n    gh auth refresh --scopes notifications\n\n\
-               Then reopen git-system-tray.";
-    crate::dialog::message(title, msg);
-}
+/// This credential's tag for `dialog::show_device_code_prompt`/`show_auth_success`, so a user
+/// running both this device flow and `github_app`'s at once can tell the two dialogs apart.
+const AUTH_SUBJECT: &str = "GitHub Notifications";
 
 // ── Token storage ─────────────────────────────────────────────────────────────
 
@@ -267,33 +102,16 @@ fn tell_user_gh_needs_notifications_scope() {
 ///
 /// Lives on the poll thread so a mid-run 401 can be recovered from without restarting the app.
 pub struct TokenStore {
-    source: Source,
+    token_path: PathBuf,
+    client_id: String,
     token: String,
     http: Client,
 }
 
 impl TokenStore {
-    /// Startup path: prefer a `gh`-supplied token; otherwise reuse a saved device-flow token if it
-    /// still works, or run the device flow.
+    /// Startup path: reuse a saved token if it still works, otherwise run the device flow.
     pub fn load(app_asset_path: &Path) -> Result<Self, AuthError> {
         let http = build_client()?;
-
-        match gh_backed_token() {
-            Ok((host, token)) => return Ok(Self { source: Source::Gh { host }, token, http }),
-            Err(GhFallback::NotInstalled) => {
-                if !offer_gh_install_hint() {
-                    logln!("exiting at the user's request to install gh");
-                    std::process::exit(0);
-                }
-            }
-            Err(GhFallback::MissingScope) => {
-                tell_user_gh_needs_notifications_scope();
-                logln!("exiting so gh can be re-authorized with the notifications scope");
-                std::process::exit(0);
-            }
-            Err(GhFallback::Other) => {}
-        }
-
         let client_id = get_client_id(app_asset_path)?;
         let token_path = app_asset_path.join(ACCESS_TOKEN_FILE);
 
@@ -307,7 +125,7 @@ impl TokenStore {
             if !token.is_empty() {
                 match check_access_token(&http, &token) {
                     TokenCheck::Valid => {
-                        return Ok(Self { source: Source::DeviceFlow { token_path, client_id }, token, http });
+                        return Ok(Self { token_path, client_id, token, http });
                     }
                     // Could not reach GitHub, so this says nothing about the token. Starting
                     // with a saved token beats refusing to start: a tray app is typically
@@ -315,7 +133,7 @@ impl TokenStore {
                     // already re-authenticates if the token turns out to be genuinely dead.
                     TokenCheck::Unreachable => {
                         logln!("could not reach GitHub to check the saved token — using it anyway");
-                        return Ok(Self { source: Source::DeviceFlow { token_path, client_id }, token, http });
+                        return Ok(Self { token_path, client_id, token, http });
                     }
                     TokenCheck::Rejected => {
                         logln!("saved token was rejected by GitHub — re-authenticating");
@@ -326,7 +144,7 @@ impl TokenStore {
 
         let token = device_code_flow(&http, &client_id)?;
         save_token(&token_path, &token);
-        Ok(Self { source: Source::DeviceFlow { token_path, client_id }, token, http })
+        Ok(Self { token_path, client_id, token, http })
     }
 
     pub fn token(&self) -> &str {
@@ -335,34 +153,14 @@ impl TokenStore {
 
     /// Mid-run recovery after GitHub rejects the token. Returns `Err` rather than exiting so
     /// the caller can back off and keep the tray icon alive.
-    ///
-    /// The `Gh` branch never falls back to the device flow: it mirrors
-    /// `gh_cli::ReviewToken::refresh`, simply re-asking `gh` for its current token, which is
-    /// correct for the common case (`gh` rotated the token underneath us) and otherwise degrades
-    /// the same way a rejected review token does — logged and retried no sooner than
-    /// `MIN_REAUTH_INTERVAL`, rather than switching credential sources mid-run.
     pub fn reauthenticate(&mut self) -> Result<(), AuthError> {
-        match &self.source {
-            Source::Gh { host } => {
-                logln!("re-authenticating after GitHub rejected the current token — re-asking gh");
-                let token = gh_cli::auth_token(host)
-                    .map_err(|e| AuthError::Github(gh_cli::Unavailable::from(e).message()))?;
-                self.token = token;
-                Ok(())
-            }
-            Source::DeviceFlow { token_path, client_id } => {
-                logln!("re-authenticating after GitHub rejected the current token");
-                let token = device_code_flow(&self.http, client_id)?;
-                save_token(token_path, &token);
-                self.token = token;
-                Ok(())
-            }
-        }
+        logln!("re-authenticating after GitHub rejected the current token");
+        let token = device_code_flow(&self.http, &self.client_id)?;
+        save_token(&self.token_path, &token);
+        self.token = token;
+        Ok(())
     }
 }
-
-// ── Review credential ─────────────────────────────────────────────────────────
-// Nothing here. The review search borrows `gh`'s credential; see `gh_cli::ReviewToken`.
 
 /// First line that is neither blank nor a `#` comment.
 ///
@@ -520,8 +318,8 @@ fn describe_device_code_failure(status: reqwest::StatusCode, body: &str) -> Stri
 
 /// Runs the GitHub Device Code flow and returns the access token.
 ///
-/// Only the notifications credential uses this. The review search never does: `gh` owns that
-/// credential's lifetime, so there is no refresh grant to handle here.
+/// Only the notifications credential uses this — the classic OAuth-app scope `GET /notifications`
+/// needs is not something PR status's GitHub App token can carry (see `github_app`).
 fn device_code_flow(http: &Client, client_id: &str) -> Result<String, AuthError> {
     // ── Step 1: request a device code ─────────────────────────────────────────
     // Read the body as text first rather than deserializing the response directly into
@@ -548,7 +346,7 @@ fn device_code_flow(http: &Client, client_id: &str) -> Result<String, AuthError>
     if let Err(e) = open::that(&dc.verification_uri) {
         logln!("could not open browser automatically: {e}");
     }
-    show_auth_prompt(&dc.user_code, &dc.verification_uri);
+    crate::dialog::show_device_code_prompt(AUTH_SUBJECT, &dc.user_code, &dc.verification_uri);
 
     // ── Step 3: poll until authorized or expired ──────────────────────────────
     let mut poll_interval = Duration::from_secs(dc.interval.max(MIN_DEVICE_POLL_INTERVAL));
@@ -575,7 +373,7 @@ fn device_code_flow(http: &Client, client_id: &str) -> Result<String, AuthError>
             .map_err(|e| AuthError::Network(e.to_string()))?;
 
         if let Some(access_token) = resp.access_token {
-            show_auth_success();
+            crate::dialog::show_auth_success(AUTH_SUBJECT);
             return Ok(access_token);
         }
 

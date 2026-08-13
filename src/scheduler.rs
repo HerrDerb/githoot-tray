@@ -9,10 +9,10 @@
 //! refresh when the user opens their notifications, and a clean exit when the UI goes away.
 
 use crate::access_token::TokenStore;
-use crate::gh_cli::{self, ReviewToken};
 use crate::github;
+use crate::github_app::PrTokenStore;
 use crate::logln;
-use crate::state::{IconState, PollState, MENU_BURST, REFRESH_BURST};
+use crate::state::{IconState, PollState, PrAxis, MENU_BURST, REFRESH_BURST};
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -33,19 +33,40 @@ const MIN_REAUTH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open archived:false \
                             -label:dependencies -author:app/dependabot -author:app/renovate";
 
+/// Search query for the user's own pull requests that are approved and passing checks.
+///
+/// GitHub's search API has no single "mergeable" qualifier, so this is an accepted approximation:
+/// it can read wrong for branch-protection setups needing more than one approval, required
+/// reviewers by name, or required status checks not reflected in the combined commit status.
+const MERGE_QUERY: &str = "is:pr author:@me review:approved status:success state:open \
+                           draft:false archived:false";
+
+/// Search query for the user's own pull requests where a reviewer requested changes.
+const CHANGES_QUERY: &str = "is:pr author:@me review:changes_requested state:open archived:false";
+
 /// Sort order for the browser view only. Meaningless to the API (which reads `total_count`), but
 /// it is what makes the web page useful to look at.
 const REVIEW_UI_SORT: &str = "sort:updated-desc";
 
-/// The GitHub page listing the very PRs the dot is counting.
+/// The search query behind `axis`'s dot. `PrAxis` itself doesn't know about queries — issuing
+/// HTTP requests is this module's job, not `state`'s — so the mapping lives here.
+fn pr_query(axis: PrAxis) -> &'static str {
+    match axis {
+        PrAxis::ReviewRequested => REVIEW_QUERY,
+        PrAxis::ReadyToMerge => MERGE_QUERY,
+        PrAxis::ChangesRequested => CHANGES_QUERY,
+    }
+}
+
+/// The GitHub page listing exactly what `axis`'s dot is counting.
 ///
-/// Built from `REVIEW_QUERY` rather than hardcoded, so the page can never disagree with the icon.
-/// A hand-written URL drifts the moment the query changes — and a dot claiming 3 next to a page
-/// showing 5 is worse than no dot at all.
-pub fn review_list_url() -> String {
+/// Built from the same query the search itself uses, so the page can never disagree with the
+/// icon. A hand-written URL drifts the moment a query changes — and a dot claiming 3 next to a
+/// page showing 5 is worse than no dot at all.
+pub fn pr_list_url(axis: PrAxis) -> String {
     format!(
         "https://github.com/pulls?q={}",
-        percent_encode(&format!("{REVIEW_QUERY} {REVIEW_UI_SORT}"))
+        percent_encode(&format!("{} {REVIEW_UI_SORT}", pr_query(axis)))
     )
 }
 
@@ -85,9 +106,10 @@ pub enum Wake {
 pub struct Update {
     pub icon: IconState,
     pub tooltip: String,
-    /// Text for the reviews menu item, carrying the exact count. Worded in `state` rather than in
-    /// each platform's UI code so the two cannot say it differently.
-    pub reviews_label: String,
+    /// Text for each PR axis's menu item, carrying the exact count, indexed by `PrAxis::index`.
+    /// Worded in `state` rather than in each platform's UI code so the two cannot say it
+    /// differently.
+    pub pr_labels: [String; 3],
 }
 
 // ─── Shared polling core ──────────────────────────────────────────────────────
@@ -97,15 +119,15 @@ pub struct Update {
 /// `emit` returns `false` once the UI is gone, which ends the loop. A panic in here used to
 /// freeze the icon at its last value with no trace; now it at least says so in the log.
 fn spawn_poll_thread(
-    tokens: TokenStore,
-    reviews: Option<ReviewToken>,
-    reviews_off: Option<String>,
+    tokens: Option<TokenStore>,
+    pr: Option<PrTokenStore>,
+    pr_off: Option<String>,
     wake_rx: Receiver<Wake>,
     emit: impl FnMut(Update) -> bool + Send + 'static,
 ) {
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            run_poll_loop(tokens, reviews, reviews_off, wake_rx, emit)
+            run_poll_loop(tokens, pr, pr_off, wake_rx, emit)
         }));
         if outcome.is_err() {
             logln!("poll thread panicked — notification updates have stopped");
@@ -114,9 +136,9 @@ fn spawn_poll_thread(
 }
 
 fn run_poll_loop(
-    mut tokens: TokenStore,
-    mut reviews: Option<ReviewToken>,
-    reviews_off: Option<String>,
+    mut tokens: Option<TokenStore>,
+    mut pr: Option<PrTokenStore>,
+    pr_off: Option<String>,
     wake_rx: Receiver<Wake>,
     mut emit: impl FnMut(Update) -> bool,
 ) {
@@ -128,14 +150,17 @@ fn run_poll_loop(
         }
     };
 
-    let mut state = PollState::new(reviews.is_some());
-    // Carry the startup verdict into the tooltip, so "no dot" always has a stated reason.
-    if let Some(reason) = reviews_off {
-        state.disable_reviews(reason);
+    let mut state = PollState::new(tokens.is_some(), [pr.is_some(); 3]);
+    // Carry the startup verdict into the tooltip, so "no dot" always has a stated reason. All
+    // three PR axes share one credential, so one reason applies to all three.
+    if let Some(reason) = pr_off {
+        for axis in PrAxis::ALL {
+            state.disable_pr(axis, reason.clone());
+        }
     }
     let mut burst: VecDeque<Duration> = VecDeque::new();
     let mut last_reauth: Option<Instant> = None;
-    let mut last_review_reauth: Option<Instant> = None;
+    let mut last_pr_reauth: Option<Instant> = None;
 
     // While a refresh burst is draining we send no `If-None-Match`. A conditional request can
     // legitimately answer 304 from a cached view, which would leave a just-read icon stuck on
@@ -145,50 +170,46 @@ fn run_poll_loop(
     loop {
         state.begin_cycle();
 
-        // ── Notifications ────────────────────────────────────────────────────
+        // ── Notifications (skipped entirely when the feature is off) ──────────
         let etag = if skip_etag {
             None
         } else {
             state.notifications_etag().map(str::to_string)
         };
-        let response = github::poll_notifications(&client, tokens.token(), etag.as_deref());
-        let notif_kind = response.result.kind();
-        state.apply_notifications(response);
-
-        // ── Reviews (serial, not concurrent: GitHub asks for serial requests) ─
-        // Search has its own 30-per-minute budget and returns no ETag, so this is always an
-        // unconditional request.
-        let review_kind = match reviews.as_ref() {
+        let notif_kind = match tokens.as_ref() {
             Some(store) => {
-                let response = github::poll_reviews(&client, store.token(), REVIEW_QUERY);
+                let response = github::poll_notifications(&client, store.token(), etag.as_deref());
                 let kind = response.result.kind();
-                state.apply_reviews(response);
+                state.apply_notifications(response);
                 Some(kind)
             }
             None => None,
         };
 
-        // ── Scope check, once GitHub has actually told us ─────────────────────
-        // A token without `repo` cannot see private repositories, and search does not complain: it
-        // answers 200 with `total_count: 0`. That is the one unacceptable answer, a confident zero
-        // that is wrong, so the axis is turned off with an actionable reason instead. Only ever
-        // reached with a credential in hand, and it disables that credential, so it fires once.
-        if reviews.is_some()
-            && state.review_scopes().is_some_and(gh_cli::lacks_required_scope)
-        {
-            let scopes = state.review_scopes().unwrap_or_default().to_string();
-            let why = gh_cli::Unavailable::MissingScope { scopes };
-            logln!("review dot disabled: {}", why.message().replace('\n', " "));
-            state.disable_reviews(why.short());
-            reviews = None;
+        // ── PR axes (serial, not concurrent: GitHub asks for serial requests) ─
+        // Search has its own 30-per-minute budget and returns no ETag, so this is always an
+        // unconditional request. All three axes share one credential (see `PrTokenStore`), whose
+        // access is granted by installing the GitHub App rather than by a scope, so there is no
+        // per-poll scope check here: whether it can see anything at all is checked once, at
+        // startup, in `main.rs`.
+        let mut pr_kinds: Vec<(PrAxis, &'static str)> = Vec::new();
+        if let Some(store) = pr.as_ref() {
+            for axis in PrAxis::ALL {
+                let response = github::poll_reviews(&client, store.token(), pr_query(axis));
+                pr_kinds.push((axis, response.result.kind()));
+                state.apply_pr(axis, response);
+            }
         }
 
         let icon = state.icon();
         let tooltip = state.tooltip();
-        let reviews_label = state.reviews_menu_label();
+        let pr_labels = std::array::from_fn(|i| {
+            let axis = PrAxis::ALL[i];
+            state.pr_menu_label(axis)
+        });
 
         // Update the UI before anything else here can block.
-        if !emit(Update { icon, tooltip: tooltip.clone(), reviews_label }) {
+        if !emit(Update { icon, tooltip: tooltip.clone(), pr_labels }) {
             return; // UI has gone away
         }
 
@@ -200,32 +221,44 @@ fn run_poll_loop(
         if state.take_notifications_reauth()
             && may_retry(&mut last_reauth)
         {
-            match tokens.reauthenticate() {
-                Ok(()) => {
+            match tokens.as_mut().map(TokenStore::reauthenticate) {
+                Some(Ok(())) => {
                     state.clear_notifications_etag();
                     retry_now = true;
                 }
-                Err(e) => logln!("re-authentication failed: {e}"),
+                Some(Err(e)) => logln!("re-authentication failed: {e}"),
+                None => {}
             }
         }
 
-        if state.take_reviews_reauth()
-            && may_retry(&mut last_review_reauth)
-        {
-            match reviews.as_mut().map(ReviewToken::refresh) {
-                // gh had rotated the token underneath us, so the new one is worth trying at once.
-                Some(Ok(true)) => retry_now = true,
-                // Same value back, so retrying now would only earn the same 401. Wait for the
-                // user to fix gh, and say so where they will see it.
-                Some(Ok(false)) => {
-                    logln!("gh returned the same token GitHub just rejected — run gh auth login");
-                    state.disable_reviews("Review dot off: run gh auth login".to_string());
-                    reviews = None;
-                }
-                Some(Err(why)) => {
-                    logln!("review credential renewal failed: {}", why.message().replace('\n', " "));
-                    state.disable_reviews(why.short());
-                    reviews = None;
+        // All three PR axes share one credential, so a rejection on any of them — or the
+        // credential simply approaching its known expiry, for a GitHub App that has token expiry
+        // turned on (see `PrTokenStore::needs_refresh`) — triggers one shared renewal rather than
+        // three independent ones. `take_pr_reauth` is called for every axis unconditionally
+        // (not through a short-circuiting `.any()`) so each axis's flag is actually consumed.
+        let mut pr_needs_reauth = false;
+        for axis in PrAxis::ALL {
+            if state.take_pr_reauth(axis) {
+                pr_needs_reauth = true;
+            }
+        }
+        if pr.as_ref().is_some_and(PrTokenStore::needs_refresh) {
+            pr_needs_reauth = true;
+        }
+
+        if pr_needs_reauth && may_retry(&mut last_pr_reauth) {
+            match pr.as_mut().map(PrTokenStore::reauthenticate) {
+                // Covers both a proactive refresh and a full fresh sign-in: `reauthenticate`
+                // tries the cheap refresh-token grant first and only falls back to a browser
+                // round trip if that fails, so either way the credential is worth retrying with
+                // at once.
+                Some(Ok(())) => retry_now = true,
+                Some(Err(e)) => {
+                    logln!("PR credential re-authentication failed: {e}");
+                    for axis in PrAxis::ALL {
+                        state.disable_pr(axis, "PR status off: re-authentication failed".to_string());
+                    }
+                    pr = None;
                 }
                 None => {}
             }
@@ -247,12 +280,25 @@ fn run_poll_loop(
             }
         };
 
-        let conditional = if etag.is_some() { "conditional" } else { "unconditional" };
-        let reviews_part = review_kind.map_or_else(String::new, |k| format!(" reviews→{k}"));
+        // Each axis contributes its own segment, or none at all when it is unconfigured — unlike
+        // the old always-on notifications axis, an empty poll (every feature off) is now possible
+        // and must not render as a mangled arrow-to-nowhere.
+        let mut polled = Vec::new();
+        if let Some(k) = notif_kind {
+            let conditional = if etag.is_some() { "conditional" } else { "unconditional" };
+            polled.push(format!("{conditional} notifications→{k}"));
+        }
+        for (axis, kind) in &pr_kinds {
+            polled.push(format!("{axis:?}→{kind}"));
+        }
+        let polled = if polled.is_empty() { "nothing configured".to_string() } else { polled.join(", ") };
+
         logln!(
-            "{conditional} poll → notifications→{notif_kind}{reviews_part} → {:?}/{:?} (next in {}s) [{}]",
+            "poll → {polled} → {:?}/{:?}/{:?}/{:?} (next in {}s) [{}]",
             icon.notifications,
-            icon.reviews,
+            icon.review_requested,
+            icon.ready_to_merge,
+            icon.changes_requested,
             delay.as_secs(),
             // The tooltip is deliberately multi-line for the UI; keep the log one line per poll.
             tooltip.replace('\n', " · ")
@@ -346,6 +392,17 @@ const UI_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 pub struct MenuItems {
     pub notifications: gtk::MenuItem,
     pub reviews: gtk::MenuItem,
+    pub ready_to_merge: gtk::MenuItem,
+    pub changes_requested: gtk::MenuItem,
+}
+
+#[cfg(target_os = "linux")]
+impl MenuItems {
+    /// The three PR-axis items, in `PrAxis::ALL` order — so per-axis code can loop instead of
+    /// hand-repeating itself three times.
+    fn pr_items(&self) -> [&gtk::MenuItem; 3] {
+        [&self.reviews, &self.ready_to_merge, &self.changes_requested]
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -353,9 +410,9 @@ pub fn start_notification_scheduler(
     indicator: libappindicator::AppIndicator,
     icons: crate::icons::IconSet<String>,
     menu_items: MenuItems,
-    tokens: TokenStore,
-    reviews: Option<ReviewToken>,
-    reviews_off: Option<String>,
+    tokens: Option<TokenStore>,
+    pr: Option<PrTokenStore>,
+    pr_off: Option<String>,
     wake_rx: Receiver<Wake>,
 ) {
     // Use the glib that `gtk` itself was built against, so this timer is attached by the same
@@ -365,7 +422,7 @@ pub fn start_notification_scheduler(
     use gtk::prelude::*;
 
     let (update_tx, update_rx) = std::sync::mpsc::channel::<Update>();
-    spawn_poll_thread(tokens, reviews, reviews_off, wake_rx, move |update| {
+    spawn_poll_thread(tokens, pr, pr_off, wake_rx, move |update| {
         update_tx.send(update).is_ok()
     });
 
@@ -373,22 +430,26 @@ pub fn start_notification_scheduler(
     // closure runs on the GTK main thread, so the indicator can simply be owned by it.
     // (`glib::idle_add_once` would look tidier but demands `Send`, which `AppIndicator` is not.)
     let mut indicator = indicator;
-    let mut applied: Option<(bool, bool)> = None;
-    let mut applied_label: Option<String> = None;
+    // Index 0 is notifications; indices 1..4 are the PR axes at `PrAxis::index() + 1` — one array
+    // instead of four separate bools so the loop below does not have to hand-repeat itself.
+    let mut applied: Option<[bool; 4]> = None;
+    let mut applied_labels: [Option<String>; 3] = [None, None, None];
 
     glib::timeout_add_local(UI_DRAIN_INTERVAL, move || {
         while let Ok(update) = update_rx.try_recv() {
-            // `Unknown` on either axis deliberately leaves that part of the picture alone — a
-            // brief failure should change the words, not make the icon flap. Only a confirmed
-            // answer moves the image, so an unknown axis falls back to whatever is on screen.
-            let current = applied.unwrap_or((false, false));
-            let wanted = (
-                update.icon.notifications.as_confirmed().unwrap_or(current.0),
-                update.icon.reviews.as_confirmed().unwrap_or(current.1),
-            );
+            // `Unknown` on any axis deliberately leaves that part of the picture alone — a brief
+            // failure should change the words, not make the icon flap. Only a confirmed answer
+            // moves the image, so an unknown axis falls back to whatever is on screen.
+            let current = applied.unwrap_or([false; 4]);
+            let wanted = [
+                update.icon.notifications.as_confirmed().unwrap_or(current[0]),
+                update.icon.review_requested.as_confirmed().unwrap_or(current[1]),
+                update.icon.ready_to_merge.as_confirmed().unwrap_or(current[2]),
+                update.icon.changes_requested.as_confirmed().unwrap_or(current[3]),
+            ];
 
             if applied != Some(wanted) {
-                indicator.set_icon(icons.get(wanted.0, wanted.1).as_str());
+                indicator.set_icon(icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).as_str());
 
                 // An entry that opens an empty list is a dead end, so it is hidden. `wanted` says
                 // it directly: the icon carries a signal exactly when that entry has somewhere to
@@ -398,24 +459,32 @@ pub fn start_notification_scheduler(
                 // GTK has per-item visibility, so this is a flag rather than the remove-and-append
                 // dance the Windows side needs. `show_all` is called once during setup and never
                 // again, so nothing undoes these.
-                menu_items.notifications.set_visible(wanted.0);
-                menu_items.reviews.set_visible(wanted.1);
+                menu_items.notifications.set_visible(wanted[0]);
+                for (item, &visible) in menu_items.pr_items().into_iter().zip(&wanted[1..]) {
+                    item.set_visible(visible);
+                }
 
                 applied = Some(wanted);
             }
 
             // Only on change: relabelling a menu item is cheap, but some panels rebuild the whole
             // menu when an item changes, which would fight a user who has it open.
-            if applied_label.as_deref() != Some(update.reviews_label.as_str()) {
-                menu_items.reviews.set_label(&update.reviews_label);
-                applied_label = Some(update.reviews_label.clone());
+            for (item, (label, applied_label)) in
+                menu_items.pr_items().into_iter().zip(update.pr_labels.iter().zip(&mut applied_labels))
+            {
+                if applied_label.as_deref() != Some(label.as_str()) {
+                    item.set_label(label);
+                    *applied_label = Some(label.clone());
+                }
             }
 
             indicator.set_title(&update.tooltip);
-            // A label is the only part of an indicator visible without hovering, so an
-            // unknown state gets a marker the user can actually notice.
+            // A label is the only part of an indicator visible without hovering, so an unknown
+            // state gets a marker the user can actually notice.
             let unsure = update.icon.notifications == crate::state::Presence::Unknown
-                || update.icon.reviews == crate::state::Presence::Unknown;
+                || update.icon.review_requested == crate::state::Presence::Unknown
+                || update.icon.ready_to_merge == crate::state::Presence::Unknown
+                || update.icon.changes_requested == crate::state::Presence::Unknown;
             indicator.set_label(if unsure { "!" } else { "" }, "");
         }
         glib::ControlFlow::Continue
@@ -443,13 +512,13 @@ pub enum TrayEvent {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn start_notification_scheduler(
-    tokens: TokenStore,
-    reviews: Option<ReviewToken>,
-    reviews_off: Option<String>,
+    tokens: Option<TokenStore>,
+    pr: Option<PrTokenStore>,
+    pr_off: Option<String>,
     wake_rx: Receiver<Wake>,
     proxy: winit::event_loop::EventLoopProxy<TrayEvent>,
 ) {
-    spawn_poll_thread(tokens, reviews, reviews_off, wake_rx, move |update| {
+    spawn_poll_thread(tokens, pr, pr_off, wake_rx, move |update| {
         proxy.send_event(TrayEvent::Update(update)).is_ok()
     });
 }
@@ -551,7 +620,7 @@ mod tests {
     /// qualifier from the API query — including the bot exclusions.
     #[test]
     fn review_url_carries_the_same_filters_as_the_api_query() {
-        let url = review_list_url();
+        let url = pr_list_url(PrAxis::ReviewRequested);
         assert!(url.starts_with("https://github.com/pulls?q="), "got {url}");
         for qualifier in [
             "review-requested%3A%40me",
@@ -565,5 +634,40 @@ mod tests {
             assert!(url.contains(qualifier), "{qualifier} missing from {url}");
         }
         assert!(!url.contains(' '), "spaces must be encoded");
+    }
+
+    /// The two new PR axes get the same "URL matches the API query" guarantee the review axis
+    /// already had — a dot claiming a count that the linked page doesn't show is the one thing
+    /// this pairing exists to prevent.
+    #[test]
+    fn merge_url_carries_the_same_filters_as_the_api_query() {
+        let url = pr_list_url(PrAxis::ReadyToMerge);
+        assert!(url.starts_with("https://github.com/pulls?q="), "got {url}");
+        for qualifier in [
+            "author%3A%40me",
+            "review%3Aapproved",
+            "status%3Asuccess",
+            "state%3Aopen",
+            "draft%3Afalse",
+            "archived%3Afalse",
+            "sort%3Aupdated-desc",
+        ] {
+            assert!(url.contains(qualifier), "{qualifier} missing from {url}");
+        }
+    }
+
+    #[test]
+    fn changes_url_carries_the_same_filters_as_the_api_query() {
+        let url = pr_list_url(PrAxis::ChangesRequested);
+        assert!(url.starts_with("https://github.com/pulls?q="), "got {url}");
+        for qualifier in [
+            "author%3A%40me",
+            "review%3Achanges_requested",
+            "state%3Aopen",
+            "archived%3Afalse",
+            "sort%3Aupdated-desc",
+        ] {
+            assert!(url.contains(qualifier), "{qualifier} missing from {url}");
+        }
     }
 }

@@ -5,10 +5,12 @@
 //! With no way to say the third, every failure was reported as the second. `Presence` makes the
 //! third case representable.
 //!
-//! There are now two *independent* signals: unread notifications (blue glyph) and pending PR
-//! reviews (red dot). They come from different endpoints with different rate-limit budgets and
-//! different credentials, so they fail independently — which is why each gets its own `Track`
-//! rather than sharing one failure counter. A search outage must never disturb the blue icon.
+//! There are now four *independent* signals: unread notifications (blue glyph, optional — see
+//! `crate::config`) and three PR-search axes (`PrAxis`): review-requested (red dot), ready-to-merge
+//! (green dot), changes-requested (orange dot). They come from different endpoints/queries with
+//! different rate-limit budgets and (for notifications vs. the PR axes) different credentials, so
+//! they fail independently — which is why each gets its own `Track` rather than sharing one
+//! failure counter. A search outage must never disturb the blue icon, and vice versa.
 //!
 //! Nothing here does I/O, so all of it is testable.
 
@@ -76,17 +78,92 @@ impl Presence {
     }
 }
 
-/// What the UI should draw.
+/// What the UI should draw: one presence per dot/tint, matching `icons::IconSet`'s four
+/// independent signals.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IconState {
     pub notifications: Presence,
-    pub reviews: Presence,
+    pub review_requested: Presence,
+    pub ready_to_merge: Presence,
+    pub changes_requested: Presence,
 }
 
 /// Base text of the tray menu item that opens the review list.
 ///
 /// Lives here, next to the code that appends the count to it, so the two cannot drift apart.
 pub const REVIEWS_MENU_LABEL: &str = "Open Requested Reviews";
+
+/// One of the three independent PR-search signals.
+///
+/// All three are searched with the same mechanism (`github::poll_reviews`, despite its name — see
+/// its own doc comment) against one shared credential, differing only in the query and in how each
+/// is displayed. `ALL` fixes the order used both for tooltip-detail priority and, by convention, for
+/// which corner/color `icons::IconSet` assigns each dot: review-requested (red, top-right),
+/// ready-to-merge (green, bottom-right), changes-requested (orange, bottom-left).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrAxis {
+    ReviewRequested,
+    ReadyToMerge,
+    ChangesRequested,
+}
+
+impl PrAxis {
+    pub const ALL: [PrAxis; 3] =
+        [PrAxis::ReviewRequested, PrAxis::ReadyToMerge, PrAxis::ChangesRequested];
+
+    /// Position within `ALL`, and the index this axis uses in any `[T; 3]` array associated with
+    /// the three PR axes (`Update::pr_labels` in `scheduler`, the platform UI's per-axis
+    /// "applied" bookkeeping in `main`) — public so those call sites don't need their own copy of
+    /// this mapping.
+    pub fn index(self) -> usize {
+        match self {
+            PrAxis::ReviewRequested => 0,
+            PrAxis::ReadyToMerge => 1,
+            PrAxis::ChangesRequested => 2,
+        }
+    }
+
+    /// Base text for this axis's tray menu item, before any count is appended.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            // Reuses the existing constant rather than duplicating the string, so the two can
+            // never drift apart.
+            PrAxis::ReviewRequested => REVIEWS_MENU_LABEL,
+            PrAxis::ReadyToMerge => "Open Ready to Merge",
+            PrAxis::ChangesRequested => "Open Changes Requested",
+        }
+    }
+
+    /// Tooltip phrase when this axis is confirmed present.
+    fn tooltip_yes(self, count: Option<u32>) -> String {
+        match (self, count) {
+            (PrAxis::ReviewRequested, Some(n)) => format!("{n} PR(s) awaiting your review"),
+            (PrAxis::ReviewRequested, None) => "PRs awaiting your review".to_string(),
+            (PrAxis::ReadyToMerge, Some(n)) => format!("{n} PR(s) ready to merge"),
+            (PrAxis::ReadyToMerge, None) => "PRs ready to merge".to_string(),
+            (PrAxis::ChangesRequested, Some(n)) => format!("{n} PR(s) with changes requested"),
+            (PrAxis::ChangesRequested, None) => "PRs with changes requested".to_string(),
+        }
+    }
+
+    /// Tooltip phrase when this axis is confirmed absent.
+    fn tooltip_no(self) -> &'static str {
+        match self {
+            PrAxis::ReviewRequested => "No reviews requested",
+            PrAxis::ReadyToMerge => "Nothing ready to merge",
+            PrAxis::ChangesRequested => "No changes requested",
+        }
+    }
+
+    /// Tooltip phrase when this axis's state is unknown.
+    fn tooltip_unknown(self) -> &'static str {
+        match self {
+            PrAxis::ReviewRequested => "Review state unknown",
+            PrAxis::ReadyToMerge => "Ready-to-merge state unknown",
+            PrAxis::ChangesRequested => "Changes-requested state unknown",
+        }
+    }
+}
 
 /// Per-signal state: last known value, conditional-request tag, and failure streak.
 struct Track {
@@ -162,19 +239,16 @@ impl Track {
 }
 
 pub struct PollState {
-    notifications: Track,
-    /// `None` means no review credential is available — the feature is off and no search is issued.
-    reviews: Option<Track>,
-    /// Why the review axis is off, when we know. Without this the dot being dark for a broken
-    /// credential looks exactly like the dot being dark because nothing needs reviewing, which is
-    /// the one confusion this module exists to prevent.
-    reviews_off: Option<String>,
-    /// Scopes last seen on the *review* credential's own responses.
-    ///
-    /// Deliberately not fed from the notifications response: that token is scoped to
-    /// `notifications` on purpose and will never carry `repo`, so learning from it would disable a
-    /// perfectly healthy dot.
-    review_scopes: Option<String>,
+    /// `None` means notifications are off — either the user never opted in via `config.txt`, or
+    /// no credential could be obtained for it.
+    notifications: Option<Track>,
+    /// `None` in a slot means that PR axis is off — no credential, or GitHub reported the
+    /// credential lacks the scope/permission the search needs, and no search is issued for it.
+    pr: [Option<Track>; 3],
+    /// Why the corresponding `pr` slot is off, when we know. Without this a dark dot for a broken
+    /// credential looks exactly like a dark dot because nothing needs attention, which is the one
+    /// confusion this module exists to prevent.
+    pr_off: [Option<String>; 3],
     /// Most recent `x-poll-interval`, once GitHub has told us one.
     server_interval: Option<Duration>,
     /// A wait GitHub explicitly demanded; overrides normal pacing for one cycle.
@@ -182,36 +256,36 @@ pub struct PollState {
 }
 
 impl PollState {
-    pub fn new(reviews_configured: bool) -> Self {
+    pub fn new(notifications_configured: bool, pr_configured: [bool; 3]) -> Self {
         Self {
-            notifications: Track::new(),
-            reviews: reviews_configured.then(Track::new),
-            reviews_off: None,
-            review_scopes: None,
+            notifications: notifications_configured.then(Track::new),
+            pr: pr_configured.map(|configured| configured.then(Track::new)),
+            pr_off: [None, None, None],
             server_interval: None,
             forced_delay: None,
         }
     }
 
-    /// Whether the review credential is available. The loop knows this from its own
-    /// `Option<ReviewToken>`, so this exists for the tests to assert against.
+    /// Whether notifications are configured. Exists for the tests to assert against, the same way
+    /// the loop itself already knows this from its own `Option<TokenStore>`.
     #[cfg(test)]
-    pub fn reviews_configured(&self) -> bool {
-        self.reviews.is_some()
+    pub fn notifications_configured(&self) -> bool {
+        self.notifications.is_some()
     }
 
-    /// Turns the review axis off and records why, so the tooltip can say so.
+    /// Whether a given PR axis is configured. Mirrors `notifications_configured`.
+    #[cfg(test)]
+    pub fn pr_configured(&self, axis: PrAxis) -> bool {
+        self.pr[axis.index()].is_some()
+    }
+
+    /// Turns a PR axis off and records why, so the tooltip can say so.
     ///
-    /// Called at startup when `gh` cannot supply a credential, and mid-run if GitHub reports that
-    /// the credential lacks the scope the search needs.
-    pub fn disable_reviews(&mut self, reason: String) {
-        self.reviews = None;
-        self.reviews_off = Some(reason);
-    }
-
-    /// Scopes GitHub last reported for the review credential, if it has ever answered.
-    pub fn review_scopes(&self) -> Option<&str> {
-        self.review_scopes.as_deref()
+    /// Called at startup when the PR credential cannot be obtained, and mid-run if GitHub reports
+    /// that the credential lacks what the search needs.
+    pub fn disable_pr(&mut self, axis: PrAxis, reason: String) {
+        self.pr[axis.index()] = None;
+        self.pr_off[axis.index()] = Some(reason);
     }
 
     /// Call once per cycle, before applying that cycle's responses.
@@ -220,20 +294,19 @@ impl PollState {
         self.forced_delay = None;
     }
 
+    /// No-op when notifications are unconfigured, so callers do not have to special-case it —
+    /// same contract as `apply_pr`.
     pub fn apply_notifications(&mut self, response: PollResponse) {
         self.learn_pacing(&response);
-        let forced = self.notifications.apply(response.result);
+        let Some(track) = self.notifications.as_mut() else { return };
+        let forced = track.apply(response.result);
         self.record_forced(forced);
     }
 
-    /// No-op when reviews are unconfigured, so callers do not have to special-case it.
-    pub fn apply_reviews(&mut self, response: PollResponse) {
+    /// No-op when `axis` is unconfigured, so callers do not have to special-case it.
+    pub fn apply_pr(&mut self, axis: PrAxis, response: PollResponse) {
         self.learn_pacing(&response);
-        // Only ever learned here, from the credential that actually does the searching.
-        if let Some(scopes) = response.scopes.as_deref() {
-            self.review_scopes = Some(scopes.to_string());
-        }
-        let Some(track) = self.reviews.as_mut() else { return };
+        let Some(track) = self.pr[axis.index()].as_mut() else { return };
         let forced = track.apply(response.result);
         self.record_forced(forced);
     }
@@ -245,7 +318,7 @@ impl PollState {
         }
     }
 
-    /// Both axes share one sleep, so the stricter demand wins.
+    /// All axes share one sleep, so the stricter demand wins.
     fn record_forced(&mut self, forced: Option<Duration>) {
         if let Some(wait) = forced {
             self.forced_delay = Some(match self.forced_delay {
@@ -256,49 +329,61 @@ impl PollState {
     }
 
     pub fn icon(&self) -> IconState {
+        // Unavailable reads as a confirmed "no dot"/"no tint" on every axis: we are not failing
+        // to find out, there is simply nothing configured to ask with.
         IconState {
-            notifications: self.notifications.value,
-            // Unavailable reads as a confirmed "no dot", not as Unknown: we are not failing to
-            // find out, there is simply no credential to ask with.
-            reviews: self.reviews.as_ref().map_or(Presence::No, |t| t.value),
+            notifications: self.notifications.as_ref().map_or(Presence::No, |t| t.value),
+            review_requested: self.pr_value(PrAxis::ReviewRequested),
+            ready_to_merge: self.pr_value(PrAxis::ReadyToMerge),
+            changes_requested: self.pr_value(PrAxis::ChangesRequested),
         }
     }
 
-    /// Text for the tray menu item that opens the review list, carrying the exact count.
+    fn pr_value(&self, axis: PrAxis) -> Presence {
+        self.pr[axis.index()].as_ref().map_or(Presence::No, |t| t.value)
+    }
+
+    /// Text for the tray menu item that opens `axis`'s list, carrying the exact count.
     ///
     /// The icon itself can only carry a dot. A digit is not legible at the 16px the shell asks for,
     /// so the number goes where there is room for it: the tooltip and this menu item. Unlike the
     /// icon, neither has a limit, so the real figure is shown however large it gets.
-    pub fn reviews_menu_label(&self) -> String {
-        match self.reviews.as_ref() {
+    pub fn pr_menu_label(&self, axis: PrAxis) -> String {
+        let base = axis.menu_label();
+        match self.pr[axis.index()].as_ref() {
             // Only a *confirmed* count is shown. An `Unknown` axis is still holding the last number
             // it saw, and putting a stale figure in a menu label would assert something we no longer
             // know, which is the one thing this module refuses to do.
             Some(track) if track.value == Presence::Yes => match track.count {
-                Some(n) if n > 0 => format!("{REVIEWS_MENU_LABEL} ({n})"),
-                _ => REVIEWS_MENU_LABEL.to_string(),
+                Some(n) if n > 0 => format!("{base} ({n})"),
+                _ => base.to_string(),
             },
-            _ => REVIEWS_MENU_LABEL.to_string(),
+            _ => base.to_string(),
         }
     }
 
     /// ETag for the notifications conditional request, if we hold one.
     pub fn notifications_etag(&self) -> Option<&str> {
-        self.notifications.etag.as_deref()
+        self.notifications.as_ref().and_then(|t| t.etag.as_deref())
     }
 
     pub fn clear_notifications_etag(&mut self) {
-        self.notifications.etag = None;
+        if let Some(track) = self.notifications.as_mut() {
+            track.etag = None;
+        }
     }
 
     /// True once GitHub has rejected that credential. Clears on read so re-auth is attempted
     /// once per rejection rather than on a loop.
     pub fn take_notifications_reauth(&mut self) -> bool {
-        std::mem::take(&mut self.notifications.needs_reauth)
+        self.notifications
+            .as_mut()
+            .map(|t| std::mem::take(&mut t.needs_reauth))
+            .unwrap_or(false)
     }
 
-    pub fn take_reviews_reauth(&mut self) -> bool {
-        self.reviews
+    pub fn take_pr_reauth(&mut self, axis: PrAxis) -> bool {
+        self.pr[axis.index()]
             .as_mut()
             .map(|t| std::mem::take(&mut t.needs_reauth))
             .unwrap_or(false)
@@ -329,10 +414,15 @@ impl PollState {
         // last known value. While inside the grace period, keep the normal cadence — the common
         // cause of early failures is a tray app launched at login before the network is up, and
         // backing off immediately would mean not noticing WiFi for many minutes.
-        let failures = self
-            .reviews
-            .as_ref()
-            .map_or(self.notifications.failures, |r| r.failures.max(self.notifications.failures));
+        //
+        // Written as a fold over whichever axes are actually configured, rather than named
+        // fields, so it does not need hand-editing every time an axis is added or removed.
+        let failures = std::iter::once(self.notifications.as_ref())
+            .chain(self.pr.iter().map(Option::as_ref))
+            .flatten()
+            .map(|t| t.failures)
+            .max()
+            .unwrap_or(0);
 
         let exponent = failures.saturating_sub(FAILURES_BEFORE_UNKNOWN - 1);
         if exponent == 0 {
@@ -349,31 +439,40 @@ impl PollState {
     /// Hover text. This is the only place `Unknown` becomes visible on Windows, so the reason
     /// belongs here rather than only in the log.
     pub fn tooltip(&self) -> String {
-        let mut lines = vec![match self.notifications.value {
-            Presence::Yes => "GitHub: unread notifications".to_string(),
-            Presence::No => "GitHub: no unread notifications".to_string(),
-            Presence::Unknown => "GitHub: notification state unknown".to_string(),
-        }];
+        let mut lines = Vec::new();
 
-        match (self.reviews.as_ref(), self.reviews_off.as_deref()) {
-            (Some(reviews), _) => lines.push(match (reviews.value, reviews.count) {
-                (Presence::Yes, Some(n)) => format!("{n} PR(s) awaiting your review"),
-                (Presence::Yes, None) => "PRs awaiting your review".to_string(),
-                (Presence::No, _) => "No reviews requested".to_string(),
-                (Presence::Unknown, _) => "Review state unknown".to_string(),
-            }),
-            // The dot is off for a reason the user can fix, so hovering has to say which one.
-            (None, Some(reason)) => lines.push(reason.to_string()),
-            (None, None) => {}
+        // Unlike a disabled PR axis, notifications being off is never a failure worth explaining
+        // — it is either a deliberate config choice or there is nothing configured yet, so the
+        // line is simply omitted rather than replaced with a reason.
+        if let Some(notifications) = self.notifications.as_ref() {
+            lines.push(match notifications.value {
+                Presence::Yes => "GitHub: unread notifications".to_string(),
+                Presence::No => "GitHub: no unread notifications".to_string(),
+                Presence::Unknown => "GitHub: notification state unknown".to_string(),
+            });
         }
 
-        // Surface at most one reason, preferring the notification axis — the tooltip is 128
-        // UTF-16 units on Windows, so two error strings would not survive truncation anyway.
+        for axis in PrAxis::ALL {
+            match (self.pr[axis.index()].as_ref(), self.pr_off[axis.index()].as_deref()) {
+                (Some(track), _) => lines.push(match track.value {
+                    Presence::Yes => axis.tooltip_yes(track.count),
+                    Presence::No => axis.tooltip_no().to_string(),
+                    Presence::Unknown => axis.tooltip_unknown().to_string(),
+                }),
+                // The dot is off for a reason the user can fix, so hovering has to say which one.
+                (None, Some(reason)) => lines.push(reason.to_string()),
+                (None, None) => {}
+            }
+        }
+
+        // Surface at most one reason, preferring notifications and then PR axes in `PrAxis::ALL`
+        // order — the tooltip is 128 UTF-16 units on Windows, so more than one error string would
+        // not survive truncation anyway.
         let detail = self
             .notifications
-            .detail
-            .as_deref()
-            .or_else(|| self.reviews.as_ref().and_then(|r| r.detail.as_deref()));
+            .as_ref()
+            .and_then(|t| t.detail.as_deref())
+            .or_else(|| self.pr.iter().filter_map(Option::as_ref).find_map(|t| t.detail.as_deref()));
         if let Some(detail) = detail {
             lines.push(detail.to_string());
         }
@@ -391,11 +490,7 @@ mod tests {
     use super::*;
 
     fn respond(result: PollResult) -> PollResponse {
-        PollResponse { result, poll_interval: None, scopes: None }
-    }
-
-    fn respond_with_scopes(result: PollResult, scopes: &str) -> PollResponse {
-        PollResponse { result, poll_interval: None, scopes: Some(scopes.to_string()) }
+        PollResponse { result, poll_interval: None }
     }
 
     fn fresh(present: bool) -> PollResponse {
@@ -414,58 +509,78 @@ mod tests {
         respond(PollResult::Transient("network down".to_string()))
     }
 
+    /// Only the review-requested axis is configured/driven in most tests below — the two newer PR
+    /// axes get their own dedicated tests further down, since most of this suite predates them and
+    /// is about the state machine's general behavior, not about having three PR axes specifically.
+    fn new_state(notifications: bool, review_requested: bool) -> PollState {
+        PollState::new(notifications, [review_requested, false, false])
+    }
+
     /// Drives one full cycle so `begin_cycle` bookkeeping is exercised the way the loop does it.
     fn cycle(state: &mut PollState, notifications: PollResponse, reviews: Option<PollResponse>) {
         state.begin_cycle();
         state.apply_notifications(notifications);
         if let Some(r) = reviews {
-            state.apply_reviews(r);
+            state.apply_pr(PrAxis::ReviewRequested, r);
         }
     }
 
     #[test]
     fn starts_unknown_rather_than_claiming_clear() {
         // The old code booted straight to the "no notifications" icon before ever asking.
-        assert_eq!(PollState::new(false).icon().notifications, Presence::Unknown);
+        assert_eq!(new_state(true, false).icon().notifications, Presence::Unknown);
     }
 
     #[test]
     fn unconfigured_reviews_read_as_a_confirmed_no_dot() {
-        let state = PollState::new(false);
-        assert!(!state.reviews_configured());
+        let state = new_state(true, false);
+        assert!(!state.pr_configured(PrAxis::ReviewRequested));
         // Not Unknown: we are not failing to find out, the feature is simply off.
-        assert_eq!(state.icon().reviews, Presence::No);
-        assert_eq!(state.icon().reviews.as_confirmed(), Some(false));
+        assert_eq!(state.icon().review_requested, Presence::No);
+        assert_eq!(state.icon().review_requested.as_confirmed(), Some(false));
     }
 
     #[test]
     fn unconfigured_reviews_ignore_applied_responses() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(false), Some(fresh_count(9)));
-        assert_eq!(state.icon().reviews, Presence::No, "must stay off when unconfigured");
+        assert_eq!(state.icon().review_requested, Presence::No, "must stay off when unconfigured");
+    }
+
+    /// Mirrors the review-axis test above: notifications are optional now too (off by default,
+    /// opt-in via `config.txt`), and must behave identically when unconfigured.
+    #[test]
+    fn unconfigured_notifications_read_as_a_confirmed_no_dot() {
+        let state = new_state(false, true);
+        assert!(!state.notifications_configured());
+        assert_eq!(state.icon().notifications, Presence::No);
+        assert_eq!(state.icon().notifications.as_confirmed(), Some(false));
+    }
+
+    #[test]
+    fn unconfigured_notifications_ignore_applied_responses() {
+        let mut state = new_state(false, true);
+        cycle(&mut state, fresh(true), Some(fresh_count(1)));
+        assert_eq!(state.icon().notifications, Presence::No, "must stay off when unconfigured");
     }
 
     #[test]
     fn both_axes_track_independently() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(fresh_count(3)));
-        assert_eq!(
-            state.icon(),
-            IconState { notifications: Presence::Yes, reviews: Presence::Yes }
-        );
+        assert_eq!(state.icon().notifications, Presence::Yes);
+        assert_eq!(state.icon().review_requested, Presence::Yes);
 
         cycle(&mut state, fresh(false), Some(fresh_count(0)));
-        assert_eq!(
-            state.icon(),
-            IconState { notifications: Presence::No, reviews: Presence::No }
-        );
+        assert_eq!(state.icon().notifications, Presence::No);
+        assert_eq!(state.icon().review_requested, Presence::No);
     }
 
     /// The property that matters most for this feature: the two signals come from different
     /// endpoints and credentials, so one failing must not disturb the other.
     #[test]
     fn a_search_outage_leaves_the_notification_axis_alone() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(fresh_count(2)));
 
         for _ in 0..6 {
@@ -473,33 +588,43 @@ mod tests {
         }
 
         assert_eq!(state.icon().notifications, Presence::Yes, "blue icon must keep working");
-        assert_eq!(state.icon().reviews, Presence::Unknown, "review axis alone gives up");
+        assert_eq!(state.icon().review_requested, Presence::Unknown, "review axis alone gives up");
     }
 
     #[test]
     fn a_rejected_notifications_token_leaves_the_review_axis_alone() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(fresh_count(4)));
 
         cycle(&mut state, respond(PollResult::Unauthorized), Some(fresh_count(4)));
 
         assert_eq!(state.icon().notifications, Presence::Unknown);
-        assert_eq!(state.icon().reviews, Presence::Yes, "dot must survive the other credential dying");
+        assert_eq!(
+            state.icon().review_requested,
+            Presence::Yes,
+            "dot must survive the other credential dying"
+        );
         assert!(state.take_notifications_reauth());
-        assert!(!state.take_reviews_reauth(), "only the failing axis asks for re-auth");
+        assert!(
+            !state.take_pr_reauth(PrAxis::ReviewRequested),
+            "only the failing axis asks for re-auth"
+        );
     }
 
     #[test]
     fn reauth_flags_clear_on_read() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(respond(PollResult::Unauthorized)));
-        assert!(state.take_reviews_reauth());
-        assert!(!state.take_reviews_reauth(), "the flag must clear on read");
+        assert!(state.take_pr_reauth(PrAxis::ReviewRequested));
+        assert!(
+            !state.take_pr_reauth(PrAxis::ReviewRequested),
+            "the flag must clear on read"
+        );
     }
 
     #[test]
     fn holds_last_known_state_for_two_failures_then_admits_ignorance() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(true), None);
 
         cycle(&mut state, transient(), None);
@@ -516,7 +641,7 @@ mod tests {
 
     #[test]
     fn not_modified_preserves_state_and_counts_as_success() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(true), None);
         cycle(&mut state, transient(), None);
         cycle(&mut state, transient(), None);
@@ -528,7 +653,7 @@ mod tests {
 
     #[test]
     fn recovery_resets_the_failure_streak() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(true), None);
         for _ in 0..5 {
             cycle(&mut state, transient(), None);
@@ -542,36 +667,34 @@ mod tests {
 
     #[test]
     fn server_interval_overrides_our_floor_when_longer() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         state.begin_cycle();
         state.apply_notifications(PollResponse {
             result: PollResult::Fresh { present: false, etag: None, count: None },
             poll_interval: Some(Duration::from_secs(120)),
-            scopes: None,
         });
         assert_eq!(state.next_delay(), Duration::from_secs(120));
     }
 
     #[test]
     fn server_interval_below_our_floor_does_not_speed_us_up() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         state.begin_cycle();
         state.apply_notifications(PollResponse {
             result: PollResult::Fresh { present: false, etag: None, count: None },
             poll_interval: Some(Duration::from_secs(5)),
-            scopes: None,
         });
         assert_eq!(state.next_delay(), MIN_POLL_INTERVAL);
     }
 
     #[test]
     fn retry_after_is_obeyed_but_never_below_the_floor() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, respond(PollResult::RateLimited { retry_after: Duration::from_secs(600) }), None);
         assert_eq!(state.next_delay(), Duration::from_secs(600));
 
         // 30s is shorter than our floor; obeying it literally would poll too fast.
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, respond(PollResult::RateLimited { retry_after: Duration::from_secs(30) }), None);
         assert_eq!(state.next_delay(), MIN_POLL_INTERVAL);
     }
@@ -584,32 +707,30 @@ mod tests {
 
     #[test]
     fn the_stricter_of_the_two_forced_delays_wins() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, rate_limited(90), Some(rate_limited(600)));
         assert_eq!(state.next_delay(), Duration::from_secs(600), "search limit must govern");
 
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, rate_limited(600), Some(rate_limited(90)));
         assert_eq!(state.next_delay(), Duration::from_secs(600));
     }
 
     #[test]
     fn rate_limiting_holds_the_icon_rather_than_clearing_it() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(fresh_count(1)));
         // The old code turned a 403 into Ok(0) and cleared the icon here.
         cycle(&mut state, rate_limited(60), Some(rate_limited(60)));
-        assert_eq!(
-            state.icon(),
-            IconState { notifications: Presence::Yes, reviews: Presence::Yes }
-        );
+        assert_eq!(state.icon().notifications, Presence::Yes);
+        assert_eq!(state.icon().review_requested, Presence::Yes);
     }
 
     /// Paired with `forced_delay_applies_to_one_cycle_only`: the scheduler reads this to decide
     /// whether a burst may run, so it has to be true for exactly as long as the delay itself is.
     #[test]
     fn rate_limited_reports_only_while_the_demand_is_live() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         assert!(!state.rate_limited(), "nothing has been demanded yet");
 
         cycle(&mut state, rate_limited(600), None);
@@ -622,14 +743,14 @@ mod tests {
     /// A limit on either axis has to hold the whole cycle back, since both share one sleep.
     #[test]
     fn rate_limited_reports_a_demand_from_the_review_axis_too() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(rate_limited(120)));
         assert!(state.rate_limited(), "search has its own, much tighter budget");
     }
 
     #[test]
     fn forced_delay_applies_to_one_cycle_only() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, rate_limited(600), None);
         assert_eq!(state.next_delay(), Duration::from_secs(600));
 
@@ -639,7 +760,7 @@ mod tests {
 
     #[test]
     fn stays_responsive_while_still_within_the_grace_period() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(false), None);
 
         cycle(&mut state, transient(), None);
@@ -650,7 +771,7 @@ mod tests {
 
     #[test]
     fn backoff_starts_when_we_give_up_then_stops_at_the_cap() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(false), None);
 
         cycle(&mut state, transient(), None);
@@ -669,14 +790,13 @@ mod tests {
 
     #[test]
     fn a_long_server_interval_survives_the_backoff_cap() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         let long = Duration::from_secs(30 * 60);
         for _ in 0..4 {
             state.begin_cycle();
             state.apply_notifications(PollResponse {
                 result: PollResult::Transient("nope".to_string()),
                 poll_interval: Some(long),
-                scopes: None,
             });
         }
         // MAX_BACKOFF is 15 min; clamping to it would poll faster than GitHub just asked.
@@ -685,7 +805,7 @@ mod tests {
 
     #[test]
     fn tooltip_quotes_the_review_count() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(false), Some(fresh_count(3)));
         let tip = state.tooltip();
         assert!(tip.contains("no unread notifications"), "got {tip:?}");
@@ -696,101 +816,79 @@ mod tests {
     /// disabled axis has to say why on hover.
     #[test]
     fn a_disabled_review_axis_explains_itself_in_the_tooltip() {
-        let mut state = PollState::new(false);
-        state.disable_reviews("Review dot off: run gh auth login".to_string());
+        let mut state = new_state(true, false);
+        state.disable_pr(PrAxis::ReviewRequested, "PR status off: sign-in failed".to_string());
         cycle(&mut state, fresh(false), None);
 
         let tip = state.tooltip();
-        assert!(tip.contains("gh auth login"), "got {tip:?}");
-        assert_eq!(state.icon().reviews, Presence::No, "off means no dot, not an unknown dot");
+        assert!(tip.contains("sign-in failed"), "got {tip:?}");
+        assert_eq!(
+            state.icon().review_requested,
+            Presence::No,
+            "off means no dot, not an unknown dot"
+        );
     }
 
     #[test]
     fn disabling_reviews_stops_the_axis_asserting_anything() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(false), Some(fresh_count(5)));
-        assert_eq!(state.icon().reviews, Presence::Yes);
+        assert_eq!(state.icon().review_requested, Presence::Yes);
 
-        state.disable_reviews("Review dot off: gh not installed".to_string());
+        state.disable_pr(PrAxis::ReviewRequested, "PR status off: sign-in failed".to_string());
         cycle(&mut state, fresh(false), Some(fresh_count(5)));
-        assert_eq!(state.icon().reviews, Presence::No, "a disabled axis must ignore late answers");
-    }
-
-    /// Scopes describe the credential that made the request. The notifications token is scoped to
-    /// `notifications` on purpose, so letting it teach us about scopes would disable a healthy dot.
-    #[test]
-    fn scopes_are_learned_from_the_review_response_only() {
-        let mut state = PollState::new(true);
-        state.begin_cycle();
-        state.apply_notifications(respond_with_scopes(
-            PollResult::Fresh { present: true, etag: None, count: None },
-            "notifications",
-        ));
-        assert_eq!(state.review_scopes(), None, "the notifications token must not be consulted");
-
-        state.apply_reviews(respond_with_scopes(
-            PollResult::Fresh { present: true, etag: None, count: Some(2) },
-            "gist, notifications, read:org, repo, workflow",
-        ));
-        assert_eq!(state.review_scopes(), Some("gist, notifications, read:org, repo, workflow"));
-    }
-
-    /// A response with no scopes header must not erase what we already learned, or an offline blip
-    /// would look like a credential losing its permissions.
-    #[test]
-    fn a_missing_scopes_header_does_not_overwrite_known_scopes() {
-        let mut state = PollState::new(true);
-        cycle(
-            &mut state,
-            fresh(false),
-            Some(respond_with_scopes(
-                PollResult::Fresh { present: false, etag: None, count: Some(0) },
-                "repo",
-            )),
+        assert_eq!(
+            state.icon().review_requested,
+            Presence::No,
+            "a disabled axis must ignore late answers"
         );
-        assert_eq!(state.review_scopes(), Some("repo"));
-
-        cycle(&mut state, fresh(false), Some(transient()));
-        assert_eq!(state.review_scopes(), Some("repo"), "unknown must not overwrite known");
     }
 
     /// The menu is where the exact number lives, since the icon can only carry a dot.
     #[test]
     fn the_menu_label_carries_the_exact_count() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(false), Some(fresh_count(3)));
-        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (3)");
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), "Open Requested Reviews (3)");
 
         // No 9+ ceiling here: unlike a 16px icon, a menu item has room for any figure.
         cycle(&mut state, fresh(false), Some(fresh_count(147)));
-        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (147)");
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), "Open Requested Reviews (147)");
     }
 
     #[test]
     fn the_menu_label_drops_the_count_when_there_is_nothing_to_count() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(false), Some(fresh_count(0)));
-        assert_eq!(state.reviews_menu_label(), REVIEWS_MENU_LABEL, "zero is not worth parentheses");
+        assert_eq!(
+            state.pr_menu_label(PrAxis::ReviewRequested),
+            REVIEWS_MENU_LABEL,
+            "zero is not worth parentheses"
+        );
 
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(false), None);
-        assert_eq!(state.reviews_menu_label(), REVIEWS_MENU_LABEL, "no credential, no count");
+        assert_eq!(
+            state.pr_menu_label(PrAxis::ReviewRequested),
+            REVIEWS_MENU_LABEL,
+            "no credential, no count"
+        );
     }
 
     /// A stale number in a menu label would assert something we no longer know.
     #[test]
     fn the_menu_label_drops_a_count_it_can_no_longer_vouch_for() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(false), Some(fresh_count(4)));
-        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (4)");
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), "Open Requested Reviews (4)");
 
         // Enough failures that the axis stops claiming to know.
         for _ in 0..FAILURES_BEFORE_UNKNOWN {
             cycle(&mut state, fresh(false), Some(transient()));
         }
-        assert_eq!(state.icon().reviews, Presence::Unknown);
+        assert_eq!(state.icon().review_requested, Presence::Unknown);
         assert_eq!(
-            state.reviews_menu_label(),
+            state.pr_menu_label(PrAxis::ReviewRequested),
             REVIEWS_MENU_LABEL,
             "an unknown axis must not quote its last known figure"
         );
@@ -799,24 +897,35 @@ mod tests {
     /// Within the grace period the value is still asserted, so the count stands with it.
     #[test]
     fn the_menu_label_survives_a_single_blip() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(false), Some(fresh_count(2)));
         cycle(&mut state, fresh(false), Some(transient()));
-        assert_eq!(state.icon().reviews, Presence::Yes, "one blip must not flap");
-        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (2)");
+        assert_eq!(state.icon().review_requested, Presence::Yes, "one blip must not flap");
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), "Open Requested Reviews (2)");
     }
 
     #[test]
     fn tooltip_omits_reviews_entirely_when_unconfigured() {
-        let mut state = PollState::new(false);
+        let mut state = new_state(true, false);
         cycle(&mut state, fresh(true), None);
         let tip = state.tooltip();
         assert!(!tip.to_lowercase().contains("review"), "got {tip:?}");
     }
 
+    /// Unlike a disabled review axis, an unconfigured notifications axis gets no explanatory line
+    /// at all — being off is a deliberate config choice, not a failure to explain.
+    #[test]
+    fn tooltip_omits_notifications_entirely_when_unconfigured() {
+        let mut state = new_state(false, true);
+        cycle(&mut state, fresh(true), Some(fresh_count(2)));
+        let tip = state.tooltip();
+        assert!(!tip.to_lowercase().contains("notification"), "got {tip:?}");
+        assert!(tip.contains("2 PR(s)"), "the review line must still be present: {tip:?}");
+    }
+
     #[test]
     fn tooltip_reports_the_reason_and_stays_short() {
-        let mut state = PollState::new(true);
+        let mut state = new_state(true, true);
         cycle(&mut state, fresh(true), Some(fresh_count(1)));
         cycle(&mut state, respond(PollResult::Transient("x".repeat(500))), Some(fresh_count(1)));
 
@@ -825,6 +934,87 @@ mod tests {
             tip.chars().count() <= MAX_TOOLTIP_CHARS + 1,
             "got {} chars",
             tip.chars().count()
+        );
+    }
+
+    // ── The three PR axes together ─────────────────────────────────────────────
+    // Everything above exercises the state machine generally through the review-requested axis,
+    // which predates the other two. These tests are specifically about `PrAxis` generalizing
+    // cleanly to three axes rather than two named fields.
+
+    #[test]
+    fn all_three_pr_axes_are_independently_configurable() {
+        let state = PollState::new(false, [true, false, true]);
+        assert!(state.pr_configured(PrAxis::ReviewRequested));
+        assert!(!state.pr_configured(PrAxis::ReadyToMerge));
+        assert!(state.pr_configured(PrAxis::ChangesRequested));
+    }
+
+    #[test]
+    fn all_three_pr_axes_track_independently() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(1));
+        state.apply_pr(PrAxis::ReadyToMerge, fresh_count(0));
+        state.apply_pr(PrAxis::ChangesRequested, fresh_count(2));
+
+        let icon = state.icon();
+        assert_eq!(icon.review_requested, Presence::Yes);
+        assert_eq!(icon.ready_to_merge, Presence::No);
+        assert_eq!(icon.changes_requested, Presence::Yes);
+
+        // A sustained failure on one axis must not disturb the other two.
+        for _ in 0..FAILURES_BEFORE_UNKNOWN {
+            state.begin_cycle();
+            state.apply_pr(PrAxis::ReadyToMerge, transient());
+        }
+        let icon = state.icon();
+        assert_eq!(icon.review_requested, Presence::Yes, "unrelated axis must be unaffected");
+        assert_eq!(icon.ready_to_merge, Presence::Unknown, "the failing axis alone gives up");
+        assert_eq!(icon.changes_requested, Presence::Yes, "unrelated axis must be unaffected");
+    }
+
+    #[test]
+    fn each_pr_axis_has_its_own_menu_label_and_count() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(3));
+        state.apply_pr(PrAxis::ReadyToMerge, fresh_count(1));
+        state.apply_pr(PrAxis::ChangesRequested, fresh_count(5));
+
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), "Open Requested Reviews (3)");
+        assert_eq!(state.pr_menu_label(PrAxis::ReadyToMerge), "Open Ready to Merge (1)");
+        assert_eq!(state.pr_menu_label(PrAxis::ChangesRequested), "Open Changes Requested (5)");
+    }
+
+    #[test]
+    fn each_pr_axis_can_be_disabled_independently() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.disable_pr(PrAxis::ReadyToMerge, "merge dot off: test reason".to_string());
+
+        assert!(state.pr_configured(PrAxis::ReviewRequested));
+        assert!(!state.pr_configured(PrAxis::ReadyToMerge));
+        assert!(state.pr_configured(PrAxis::ChangesRequested));
+
+        let tip = state.tooltip();
+        assert!(tip.contains("merge dot off: test reason"), "got {tip:?}");
+    }
+
+    #[test]
+    fn next_delay_backs_off_on_the_worst_of_all_configured_axes() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(0));
+        state.apply_pr(PrAxis::ChangesRequested, fresh_count(0));
+
+        for _ in 0..4 {
+            state.begin_cycle();
+            state.apply_pr(PrAxis::ReadyToMerge, transient());
+        }
+        assert_eq!(
+            state.next_delay(),
+            Duration::from_secs(240),
+            "backoff must key off the worst axis even when it is not review-requested"
         );
     }
 }

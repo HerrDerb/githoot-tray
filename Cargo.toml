@@ -13,6 +13,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.145"
 open = "5.3.2"
 dirs = "6.0.0"
+# Copies the device code to the clipboard when a Device Flow dialog appears, so entering it on
+# GitHub's page is a paste instead of a manual retype. Cross-platform itself (Windows/macOS/X11/
+# Wayland), so unlike the tray/GTK split above this is a single, unconditional dependency.
+arboard = "3.4"
 # Shared, not Windows-only: Linux needs it to *encode* the composited review-dot icons, because
 # libappindicator takes a filesystem path rather than pixel data.
 image = { version = "0.24", default-features = false, features = ["png"] }
