@@ -12,7 +12,7 @@ use crate::access_token::TokenStore;
 use crate::gh_cli::{self, ReviewToken};
 use crate::github;
 use crate::logln;
-use crate::state::{IconState, PollState, REFRESH_BURST};
+use crate::state::{IconState, PollState, MENU_BURST, REFRESH_BURST};
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -238,11 +238,12 @@ fn run_poll_loop(
         // A queued burst entry wins over normal pacing, so resolve the real delay before
         // logging it — otherwise the log would claim the steady-state interval during a burst,
         // which is exactly when someone is watching it.
-        let delay = match burst.pop_front() {
-            Some(delay) => delay,
-            None => {
+        let delay = match next_pace(&mut burst, state.rate_limited(), state.next_delay()) {
+            Pace::Burst(delay) => delay,
+            // Leaving the burst also ends the unconditional streak it was running.
+            Pace::Steady(delay) => {
                 skip_etag = false;
-                state.next_delay()
+                delay
             }
         };
 
@@ -268,14 +269,56 @@ fn run_poll_loop(
                         logln!("refresh requested — polling {} more times", REFRESH_BURST.len());
                         burst = REFRESH_BURST.iter().copied().collect();
                     }
-                    // No burst: the answer is not about to change, the user simply wants it now.
-                    Wake::PollNow => logln!("update requested from the tray icon — polling now"),
+                    // A short even burst rather than the widening one: one sample taken within a
+                    // second of the click is thin, and anything that changes a moment later would
+                    // otherwise stay invisible for the rest of the minute.
+                    Wake::PollNow => {
+                        logln!(
+                            "menu opened — polling now and {} more times, 5s apart",
+                            MENU_BURST.len()
+                        );
+                        burst = MENU_BURST.iter().copied().collect();
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             // The sender lives in the UI, so a closed channel means the app is shutting down.
             Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Which pace the next cycle runs at.
+#[derive(Debug, PartialEq, Eq)]
+enum Pace {
+    /// A queued burst entry, deliberately faster than the floor.
+    Burst(Duration),
+    /// Normal pacing, whatever `PollState` worked out.
+    Steady(Duration),
+}
+
+/// Picks the wait before the next cycle.
+///
+/// A burst beats normal pacing, but never a wait GitHub explicitly demanded. Retrying inside a
+/// `retry-after` window is how a short secondary limit becomes a long one, and a burst is never
+/// worth that.
+///
+/// The remaining burst entries are dropped rather than deferred. A burst exists to catch a change
+/// the user just caused; once a rate-limit window has elapsed, that moment has passed and the normal
+/// cadence is the right thing to return to.
+///
+/// Pure so this can be tested without a network, which is the point: the previous version read
+/// GitHub's instruction, stored it, and then silently discarded it whenever a burst was in flight,
+/// and nothing in the suite could see that happen.
+fn next_pace(burst: &mut VecDeque<Duration>, rate_limited: bool, steady: Duration) -> Pace {
+    if rate_limited {
+        burst.clear();
+        return Pace::Steady(steady);
+    }
+
+    match burst.pop_front() {
+        Some(delay) => Pace::Burst(delay),
+        None => Pace::Steady(steady),
     }
 }
 
@@ -403,6 +446,88 @@ pub fn start_notification_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STEADY: Duration = Duration::from_secs(60);
+
+    fn burst_of(secs: &[u64]) -> VecDeque<Duration> {
+        secs.iter().map(|s| Duration::from_secs(*s)).collect()
+    }
+
+    #[test]
+    fn a_queued_burst_drains_in_order_then_returns_to_normal_pacing() {
+        let mut burst = burst_of(&[5, 5, 5]);
+
+        for _ in 0..3 {
+            assert_eq!(next_pace(&mut burst, false, STEADY), Pace::Burst(Duration::from_secs(5)));
+        }
+        assert_eq!(next_pace(&mut burst, false, STEADY), Pace::Steady(STEADY));
+    }
+
+    #[test]
+    fn the_widening_burst_keeps_its_order() {
+        // Order matters for REFRESH_BURST specifically, since its whole point is widening gaps.
+        let mut burst: VecDeque<Duration> = REFRESH_BURST.iter().copied().collect();
+        for expected in REFRESH_BURST {
+            assert_eq!(next_pace(&mut burst, false, STEADY), Pace::Burst(expected));
+        }
+        assert_eq!(next_pace(&mut burst, false, STEADY), Pace::Steady(STEADY));
+    }
+
+    #[test]
+    fn an_empty_burst_is_normal_pacing() {
+        let mut burst = VecDeque::new();
+        assert_eq!(next_pace(&mut burst, false, STEADY), Pace::Steady(STEADY));
+    }
+
+    /// The regression this exists for. A burst used to win unconditionally, so a `retry-after` was
+    /// read, stored, and then thrown away: we would poll again in 5s having just been told to wait
+    /// a minute, which is how a short secondary limit turns into a long one.
+    #[test]
+    fn a_demanded_wait_beats_a_burst() {
+        let mut burst = burst_of(&[5, 5, 5]);
+        let demanded = Duration::from_secs(600);
+
+        assert_eq!(next_pace(&mut burst, true, demanded), Pace::Steady(demanded));
+    }
+
+    /// Abandoned, not merely deferred by one cycle. A burst is chasing a change the user just
+    /// caused; ten minutes later that moment is gone and the burst would be pure traffic.
+    #[test]
+    fn a_demanded_wait_discards_the_rest_of_the_burst() {
+        let mut burst = burst_of(&[5, 5, 5]);
+
+        next_pace(&mut burst, true, Duration::from_secs(600));
+        assert!(burst.is_empty(), "the burst must not resume after the limit lifts");
+
+        // …and the cycle after really is back to normal pacing.
+        assert_eq!(next_pace(&mut burst, false, STEADY), Pace::Steady(STEADY));
+    }
+
+    #[test]
+    fn a_demanded_wait_with_no_burst_changes_nothing() {
+        let mut burst = VecDeque::new();
+        let demanded = Duration::from_secs(90);
+        assert_eq!(next_pace(&mut burst, true, demanded), Pace::Steady(demanded));
+    }
+
+    /// The two bursts are deliberately different shapes, and a copy-paste that merged them would
+    /// silently undo the reasoning in both.
+    #[test]
+    fn the_two_bursts_stay_distinct() {
+        assert!(
+            MENU_BURST.iter().all(|d| *d == MENU_BURST[0]),
+            "the menu burst is evenly spaced: there is no server-side lag to wait out"
+        );
+        assert!(
+            REFRESH_BURST.windows(2).all(|w| w[1] > w[0]),
+            "the page-open burst widens: it is waiting out GitHub registering a read"
+        );
+        assert_eq!(
+            MENU_BURST.iter().sum::<Duration>(),
+            Duration::from_secs(15),
+            "the menu burst covers 15s, as documented"
+        );
+    }
 
     #[test]
     fn percent_encoding_escapes_query_syntax() {

@@ -38,6 +38,17 @@ pub const REFRESH_BURST: [Duration; 3] = [
     Duration::from_secs(25),
 ];
 
+/// Successive waits after the user opens the tray menu: every 5s, for 15s.
+///
+/// Evenly spaced and shorter than `REFRESH_BURST` because the two are waiting for different things.
+/// That one widens to wait out GitHub's lag in registering a read; this one is answering someone who
+/// is looking at the menu right now, so there is nothing to wait out and no reason to keep going.
+pub const MENU_BURST: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+];
+
 /// Shell_NotifyIcon's `szTip` holds 128 UTF-16 units including the terminator, so tooltips are
 /// clamped well below that.
 const MAX_TOOLTIP_CHARS: usize = 110;
@@ -291,6 +302,14 @@ impl PollState {
             .as_mut()
             .map(|t| std::mem::take(&mut t.needs_reauth))
             .unwrap_or(false)
+    }
+
+    /// Whether GitHub has explicitly demanded a wait this cycle.
+    ///
+    /// `next_delay` already folds this in, but a caller running a user-triggered burst bypasses
+    /// normal pacing entirely, so it needs to be able to ask the question directly.
+    pub fn rate_limited(&self) -> bool {
+        self.forced_delay.is_some()
     }
 
     /// How long to wait before the next scheduled poll.
@@ -584,6 +603,28 @@ mod tests {
             state.icon(),
             IconState { notifications: Presence::Yes, reviews: Presence::Yes }
         );
+    }
+
+    /// Paired with `forced_delay_applies_to_one_cycle_only`: the scheduler reads this to decide
+    /// whether a burst may run, so it has to be true for exactly as long as the delay itself is.
+    #[test]
+    fn rate_limited_reports_only_while_the_demand_is_live() {
+        let mut state = PollState::new(false);
+        assert!(!state.rate_limited(), "nothing has been demanded yet");
+
+        cycle(&mut state, rate_limited(600), None);
+        assert!(state.rate_limited());
+
+        cycle(&mut state, fresh(false), None);
+        assert!(!state.rate_limited(), "a healthy answer clears the demand");
+    }
+
+    /// A limit on either axis has to hold the whole cycle back, since both share one sleep.
+    #[test]
+    fn rate_limited_reports_a_demand_from_the_review_axis_too() {
+        let mut state = PollState::new(true);
+        cycle(&mut state, fresh(true), Some(rate_limited(120)));
+        assert!(state.rate_limited(), "search has its own, much tighter budget");
     }
 
     #[test]
