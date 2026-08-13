@@ -72,6 +72,11 @@ pub struct IconState {
     pub reviews: Presence,
 }
 
+/// Base text of the tray menu item that opens the review list.
+///
+/// Lives here, next to the code that appends the count to it, so the two cannot drift apart.
+pub const REVIEWS_MENU_LABEL: &str = "Open Requested Reviews";
+
 /// Per-signal state: last known value, conditional-request tag, and failure streak.
 struct Track {
     value: Presence,
@@ -147,9 +152,18 @@ impl Track {
 
 pub struct PollState {
     notifications: Track,
-    /// `None` means no review credential is configured — the feature is off, no search is issued,
-    /// and the app behaves exactly as it did before the dot existed.
+    /// `None` means no review credential is available — the feature is off and no search is issued.
     reviews: Option<Track>,
+    /// Why the review axis is off, when we know. Without this the dot being dark for a broken
+    /// credential looks exactly like the dot being dark because nothing needs reviewing, which is
+    /// the one confusion this module exists to prevent.
+    reviews_off: Option<String>,
+    /// Scopes last seen on the *review* credential's own responses.
+    ///
+    /// Deliberately not fed from the notifications response: that token is scoped to
+    /// `notifications` on purpose and will never carry `repo`, so learning from it would disable a
+    /// perfectly healthy dot.
+    review_scopes: Option<String>,
     /// Most recent `x-poll-interval`, once GitHub has told us one.
     server_interval: Option<Duration>,
     /// A wait GitHub explicitly demanded; overrides normal pacing for one cycle.
@@ -161,25 +175,32 @@ impl PollState {
         Self {
             notifications: Track::new(),
             reviews: reviews_configured.then(Track::new),
+            reviews_off: None,
+            review_scopes: None,
             server_interval: None,
             forced_delay: None,
         }
     }
 
-    /// Whether the review credential is configured. The loop knows this from its own
-    /// `Option<ReviewTokenStore>`, so this exists for the tests to assert against.
+    /// Whether the review credential is available. The loop knows this from its own
+    /// `Option<ReviewToken>`, so this exists for the tests to assert against.
     #[cfg(test)]
     pub fn reviews_configured(&self) -> bool {
         self.reviews.is_some()
     }
 
-    /// Turns the review axis on after the user configures a credential mid-run, so the tray
-    /// menu's setup flow needs no restart. Idempotent: an already-enabled axis keeps its state
-    /// rather than being reset back to `Unknown`.
-    pub fn enable_reviews(&mut self) {
-        if self.reviews.is_none() {
-            self.reviews = Some(Track::new());
-        }
+    /// Turns the review axis off and records why, so the tooltip can say so.
+    ///
+    /// Called at startup when `gh` cannot supply a credential, and mid-run if GitHub reports that
+    /// the credential lacks the scope the search needs.
+    pub fn disable_reviews(&mut self, reason: String) {
+        self.reviews = None;
+        self.reviews_off = Some(reason);
+    }
+
+    /// Scopes GitHub last reported for the review credential, if it has ever answered.
+    pub fn review_scopes(&self) -> Option<&str> {
+        self.review_scopes.as_deref()
     }
 
     /// Call once per cycle, before applying that cycle's responses.
@@ -197,6 +218,10 @@ impl PollState {
     /// No-op when reviews are unconfigured, so callers do not have to special-case it.
     pub fn apply_reviews(&mut self, response: PollResponse) {
         self.learn_pacing(&response);
+        // Only ever learned here, from the credential that actually does the searching.
+        if let Some(scopes) = response.scopes.as_deref() {
+            self.review_scopes = Some(scopes.to_string());
+        }
         let Some(track) = self.reviews.as_mut() else { return };
         let forced = track.apply(response.result);
         self.record_forced(forced);
@@ -222,9 +247,27 @@ impl PollState {
     pub fn icon(&self) -> IconState {
         IconState {
             notifications: self.notifications.value,
-            // Unconfigured reads as a confirmed "no dot", not as Unknown: we are not failing to
-            // find out, the user has simply not asked for the feature.
+            // Unavailable reads as a confirmed "no dot", not as Unknown: we are not failing to
+            // find out, there is simply no credential to ask with.
             reviews: self.reviews.as_ref().map_or(Presence::No, |t| t.value),
+        }
+    }
+
+    /// Text for the tray menu item that opens the review list, carrying the exact count.
+    ///
+    /// The icon itself can only carry a dot. A digit is not legible at the 16px the shell asks for,
+    /// so the number goes where there is room for it: the tooltip and this menu item. Unlike the
+    /// icon, neither has a limit, so the real figure is shown however large it gets.
+    pub fn reviews_menu_label(&self) -> String {
+        match self.reviews.as_ref() {
+            // Only a *confirmed* count is shown. An `Unknown` axis is still holding the last number
+            // it saw, and putting a stale figure in a menu label would assert something we no longer
+            // know, which is the one thing this module refuses to do.
+            Some(track) if track.value == Presence::Yes => match track.count {
+                Some(n) if n > 0 => format!("{REVIEWS_MENU_LABEL} ({n})"),
+                _ => REVIEWS_MENU_LABEL.to_string(),
+            },
+            _ => REVIEWS_MENU_LABEL.to_string(),
         }
     }
 
@@ -293,13 +336,16 @@ impl PollState {
             Presence::Unknown => "GitHub: notification state unknown".to_string(),
         }];
 
-        if let Some(reviews) = self.reviews.as_ref() {
-            lines.push(match (reviews.value, reviews.count) {
+        match (self.reviews.as_ref(), self.reviews_off.as_deref()) {
+            (Some(reviews), _) => lines.push(match (reviews.value, reviews.count) {
                 (Presence::Yes, Some(n)) => format!("{n} PR(s) awaiting your review"),
                 (Presence::Yes, None) => "PRs awaiting your review".to_string(),
                 (Presence::No, _) => "No reviews requested".to_string(),
                 (Presence::Unknown, _) => "Review state unknown".to_string(),
-            });
+            }),
+            // The dot is off for a reason the user can fix, so hovering has to say which one.
+            (None, Some(reason)) => lines.push(reason.to_string()),
+            (None, None) => {}
         }
 
         // Surface at most one reason, preferring the notification axis — the tooltip is 128
@@ -326,7 +372,11 @@ mod tests {
     use super::*;
 
     fn respond(result: PollResult) -> PollResponse {
-        PollResponse { result, poll_interval: None }
+        PollResponse { result, poll_interval: None, scopes: None }
+    }
+
+    fn respond_with_scopes(result: PollResult, scopes: &str) -> PollResponse {
+        PollResponse { result, poll_interval: None, scopes: Some(scopes.to_string()) }
     }
 
     fn fresh(present: bool) -> PollResponse {
@@ -478,6 +528,7 @@ mod tests {
         state.apply_notifications(PollResponse {
             result: PollResult::Fresh { present: false, etag: None, count: None },
             poll_interval: Some(Duration::from_secs(120)),
+            scopes: None,
         });
         assert_eq!(state.next_delay(), Duration::from_secs(120));
     }
@@ -489,6 +540,7 @@ mod tests {
         state.apply_notifications(PollResponse {
             result: PollResult::Fresh { present: false, etag: None, count: None },
             poll_interval: Some(Duration::from_secs(5)),
+            scopes: None,
         });
         assert_eq!(state.next_delay(), MIN_POLL_INTERVAL);
     }
@@ -583,6 +635,7 @@ mod tests {
             state.apply_notifications(PollResponse {
                 result: PollResult::Transient("nope".to_string()),
                 poll_interval: Some(long),
+                scopes: None,
             });
         }
         // MAX_BACKOFF is 15 min; clamping to it would poll faster than GitHub just asked.
@@ -596,6 +649,120 @@ mod tests {
         let tip = state.tooltip();
         assert!(tip.contains("no unread notifications"), "got {tip:?}");
         assert!(tip.contains("3 PR(s) awaiting your review"), "got {tip:?}");
+    }
+
+    /// A dark dot with no explanation is indistinguishable from "nothing to review", so a
+    /// disabled axis has to say why on hover.
+    #[test]
+    fn a_disabled_review_axis_explains_itself_in_the_tooltip() {
+        let mut state = PollState::new(false);
+        state.disable_reviews("Review dot off: run gh auth login".to_string());
+        cycle(&mut state, fresh(false), None);
+
+        let tip = state.tooltip();
+        assert!(tip.contains("gh auth login"), "got {tip:?}");
+        assert_eq!(state.icon().reviews, Presence::No, "off means no dot, not an unknown dot");
+    }
+
+    #[test]
+    fn disabling_reviews_stops_the_axis_asserting_anything() {
+        let mut state = PollState::new(true);
+        cycle(&mut state, fresh(false), Some(fresh_count(5)));
+        assert_eq!(state.icon().reviews, Presence::Yes);
+
+        state.disable_reviews("Review dot off: gh not installed".to_string());
+        cycle(&mut state, fresh(false), Some(fresh_count(5)));
+        assert_eq!(state.icon().reviews, Presence::No, "a disabled axis must ignore late answers");
+    }
+
+    /// Scopes describe the credential that made the request. The notifications token is scoped to
+    /// `notifications` on purpose, so letting it teach us about scopes would disable a healthy dot.
+    #[test]
+    fn scopes_are_learned_from_the_review_response_only() {
+        let mut state = PollState::new(true);
+        state.begin_cycle();
+        state.apply_notifications(respond_with_scopes(
+            PollResult::Fresh { present: true, etag: None, count: None },
+            "notifications",
+        ));
+        assert_eq!(state.review_scopes(), None, "the notifications token must not be consulted");
+
+        state.apply_reviews(respond_with_scopes(
+            PollResult::Fresh { present: true, etag: None, count: Some(2) },
+            "gist, notifications, read:org, repo, workflow",
+        ));
+        assert_eq!(state.review_scopes(), Some("gist, notifications, read:org, repo, workflow"));
+    }
+
+    /// A response with no scopes header must not erase what we already learned, or an offline blip
+    /// would look like a credential losing its permissions.
+    #[test]
+    fn a_missing_scopes_header_does_not_overwrite_known_scopes() {
+        let mut state = PollState::new(true);
+        cycle(
+            &mut state,
+            fresh(false),
+            Some(respond_with_scopes(
+                PollResult::Fresh { present: false, etag: None, count: Some(0) },
+                "repo",
+            )),
+        );
+        assert_eq!(state.review_scopes(), Some("repo"));
+
+        cycle(&mut state, fresh(false), Some(transient()));
+        assert_eq!(state.review_scopes(), Some("repo"), "unknown must not overwrite known");
+    }
+
+    /// The menu is where the exact number lives, since the icon can only carry a dot.
+    #[test]
+    fn the_menu_label_carries_the_exact_count() {
+        let mut state = PollState::new(true);
+        cycle(&mut state, fresh(false), Some(fresh_count(3)));
+        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (3)");
+
+        // No 9+ ceiling here: unlike a 16px icon, a menu item has room for any figure.
+        cycle(&mut state, fresh(false), Some(fresh_count(147)));
+        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (147)");
+    }
+
+    #[test]
+    fn the_menu_label_drops_the_count_when_there_is_nothing_to_count() {
+        let mut state = PollState::new(true);
+        cycle(&mut state, fresh(false), Some(fresh_count(0)));
+        assert_eq!(state.reviews_menu_label(), REVIEWS_MENU_LABEL, "zero is not worth parentheses");
+
+        let mut state = PollState::new(false);
+        cycle(&mut state, fresh(false), None);
+        assert_eq!(state.reviews_menu_label(), REVIEWS_MENU_LABEL, "no credential, no count");
+    }
+
+    /// A stale number in a menu label would assert something we no longer know.
+    #[test]
+    fn the_menu_label_drops_a_count_it_can_no_longer_vouch_for() {
+        let mut state = PollState::new(true);
+        cycle(&mut state, fresh(false), Some(fresh_count(4)));
+        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (4)");
+
+        // Enough failures that the axis stops claiming to know.
+        for _ in 0..FAILURES_BEFORE_UNKNOWN {
+            cycle(&mut state, fresh(false), Some(transient()));
+        }
+        assert_eq!(state.icon().reviews, Presence::Unknown);
+        assert_eq!(
+            state.reviews_menu_label(),
+            REVIEWS_MENU_LABEL,
+            "an unknown axis must not quote its last known figure"
+        );
+    }
+
+    /// Within the grace period the value is still asserted, so the count stands with it.
+    #[test]
+    fn the_menu_label_survives_a_single_blip() {
+        let mut state = PollState::new(true);
+        cycle(&mut state, fresh(false), Some(fresh_count(2)));
+        cycle(&mut state, fresh(false), Some(transient()));
+        assert_eq!(state.icon().reviews, Presence::Yes, "one blip must not flap");
+        assert_eq!(state.reviews_menu_label(), "Open Requested Reviews (2)");
     }
 
     #[test]

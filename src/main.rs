@@ -5,6 +5,7 @@
 //! Handles cross-platform initialization and tray icon setup.
 
 mod access_token;
+mod gh_cli;
 mod github;
 mod icons;
 mod log;
@@ -13,31 +14,40 @@ mod state;
 
 const NOTIFICATIONS_URL: &str = "https://github.com/notifications";
 
-/// Handles the "Set up review dot…" menu item.
+/// Loads the review-search credential from `gh`.
 ///
-/// Creates `review_token.txt` at `0600` with the instructions inside it and opens it in the
-/// user's editor, then nudges the poll loop. The loop re-reads that file every cycle, so saving
-/// the token is the whole setup — no restart, no terminal, no `chmod`.
-fn setup_review_dot(
-    app_asset_path: &std::path::Path,
-    wake_tx: &std::sync::mpsc::Sender<scheduler::Wake>,
-) {
-    let path = access_token::ensure_review_token_file(app_asset_path);
-    logln!("review dot setup: opening {}", path.display());
-
-    if let Err(e) = open::that(&path) {
-        logln!("could not open {} automatically: {e}", path.display());
-        // Nothing else to fall back on: with no console on Windows, the log is the only channel.
-        #[cfg(target_os = "windows")]
-        access_token::win_msgbox(
-            "git-system-tray",
-            &format!("Could not open an editor. Paste your token into:\n{}", path.display()),
-        );
+/// Returns the credential and, when there is none, a short reason for the tooltip.
+///
+/// Never fatal. The notification half has its own narrow credential and does not care whether `gh`
+/// exists, so a missing or under-scoped `gh` must cost the user the dot and nothing else. It does
+/// have to be *said*, though: a dark dot that means "nobody could ask" looks exactly like a dark dot
+/// that means "nothing to review", and that confusion is the bug this whole codebase is shaped
+/// around avoiding.
+fn load_review_credential(app_asset_path: &std::path::Path) -> (Option<gh_cli::ReviewToken>, Option<String>) {
+    // Say so once per launch, because a credential nobody reads is still a credential on disk, and
+    // the user cannot delete a file they do not know went stale.
+    for stale in ["review_token.txt", "review_client_id.txt", "review_refresh_token.txt"] {
+        if app_asset_path.join(stale).exists() {
+            logln!("note: {stale} is no longer used (gh supplies this credential) and can be deleted");
+        }
     }
 
-    // Shorten the wait for the token they are about to paste: the burst re-checks after a few
-    // seconds instead of leaving them staring at an unchanged icon for a whole interval.
-    let _ = wake_tx.send(scheduler::Wake::Refresh);
+    match gh_cli::ReviewToken::load() {
+        Ok(token) => (Some(token), None),
+        Err(why) => {
+            // One line in the log, because the message is deliberately multi-line for a dialog.
+            logln!("review dot disabled: {}", why.message().replace('\n', " "));
+
+            // With `windows_subsystem = "windows"` there is no console, so a dialog is the only way
+            // this reaches someone who is not reading the log file.
+            #[cfg(target_os = "windows")]
+            access_token::win_msgbox("git-system-tray: review dot", &why.message());
+            #[cfg(not(target_os = "windows"))]
+            eprintln!("\ngit-system-tray: review dot disabled\n\n{}\n", why.message());
+
+            (None, Some(why.short()))
+        }
+    }
 }
 
 /// Returns the path to the application's asset directory in the user's home.
@@ -85,15 +95,7 @@ fn main() {
         }
     };
 
-    // Optional second credential for the review dot. A failure here must not stop the app: the
-    // notifications half is the primary feature and works without it.
-    let reviews = match access_token::ReviewTokenStore::load(&app_asset_path) {
-        Ok(reviews) => reviews,
-        Err(e) => {
-            logln!("review dot disabled: {e}");
-            None
-        }
-    };
+    let (reviews, reviews_off) = load_review_credential(&app_asset_path);
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
@@ -114,7 +116,7 @@ fn main() {
         let _ = open_wake_tx.send(scheduler::Wake::Refresh);
     });
 
-    let reviews_item = MenuItem::with_label("Open Requested Reviews");
+    let reviews_item = MenuItem::with_label(state::REVIEWS_MENU_LABEL);
     let reviews_wake_tx = wake_tx.clone();
     reviews_item.connect_activate(move |_| {
         if let Err(e) = open::that(scheduler::review_list_url()) {
@@ -125,27 +127,36 @@ fn main() {
         let _ = reviews_wake_tx.send(scheduler::Wake::Refresh);
     });
 
-    let setup_item = MenuItem::with_label("Set up review dot…");
-    let setup_path = app_asset_path.clone();
-    setup_item.connect_activate(move |_| {
-        setup_review_dot(&setup_path, &wake_tx);
-    });
-
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
     menu.append(&item);
     menu.append(&reviews_item);
-    menu.append(&setup_item);
     menu.append(&quit_item);
     menu.show_all();
+
+    // The closest Linux equivalent of clicking the icon: the menu being popped up. Connected after
+    // `show_all` so the initial layout pass is not mistaken for a click.
+    //
+    // Best effort, and unverified: under a StatusNotifierItem host the menu is exported over DBus
+    // and drawn by the panel, so this signal may never fire in this process. Costs nothing if it
+    // does not, since the tooltip and menu label are refreshed on the normal cadence regardless.
+    let menu_wake_tx = wake_tx.clone();
+    menu.connect_show(move |_| {
+        let _ = menu_wake_tx.send(scheduler::Wake::PollNow);
+    });
+
     indicator.set_menu(&mut menu);
 
     scheduler::start_notification_scheduler(
-        app_asset_path,
         indicator,
         icons,
+        // Cloned rather than moved: the menu keeps the original, and this handle is what the poll
+        // loop relabels with the count. GTK widgets are reference-counted, so both refer to the
+        // same item.
+        reviews_item.clone(),
         tokens,
         reviews,
+        reviews_off,
         wake_rx,
     );
 
@@ -170,7 +181,7 @@ fn fatal(message: &str) -> ! {
 fn main() {
     use scheduler::{TrayEvent, Update};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-    use tray_icon::TrayIconBuilder;
+    use tray_icon::{MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -215,15 +226,7 @@ fn main() {
         Err(e) => fatal(&format!("Could not authenticate with GitHub: {e}")),
     };
 
-    // Optional second credential for the review dot. A failure here must not be fatal: the
-    // notifications half is the primary feature and works without it.
-    let reviews = match access_token::ReviewTokenStore::load(&app_asset_path) {
-        Ok(reviews) => reviews,
-        Err(e) => {
-            logln!("review dot disabled: {e}");
-            None
-        }
-    };
+    let (reviews, reviews_off) = load_review_credential(&app_asset_path);
 
     // Decode and composite the embedded PNG assets on the main thread.
     let tray_icons = match icons::load_tray_icons() {
@@ -234,17 +237,14 @@ fn main() {
     // Build the tray menu.
     let open_item = MenuItem::new("Open GitHub Notifications", true, None);
     let open_item_id = open_item.id().clone();
-    let reviews_item = MenuItem::new("Open Requested Reviews", true, None);
+    let reviews_item = MenuItem::new(state::REVIEWS_MENU_LABEL, true, None);
     let reviews_item_id = reviews_item.id().clone();
-    let setup_item = MenuItem::new("Set up review dot\u{2026}", true, None);
-    let setup_item_id = setup_item.id().clone();
     let quit_item = MenuItem::new("Quit", true, None);
     let quit_item_id = quit_item.id().clone();
     let menu = Menu::new();
     for (item, what) in [
         (&open_item, "open"),
         (&reviews_item, "reviews"),
-        (&setup_item, "setup"),
         (&quit_item, "quit"),
     ] {
         if let Err(e) = menu.append(item) {
@@ -275,13 +275,7 @@ fn main() {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
 
     // Launch the polling thread; it communicates back via the proxy.
-    scheduler::start_notification_scheduler(
-        app_asset_path.clone(),
-        tokens,
-        reviews,
-        wake_rx,
-        proxy,
-    );
+    scheduler::start_notification_scheduler(tokens, reviews, reviews_off, wake_rx, proxy);
 
     // ── Application handler ──────────────────────────────────────────────────
 
@@ -289,15 +283,17 @@ fn main() {
         tray_icon: tray_icon::TrayIcon,
         icons: icons::IconSet<tray_icon::Icon>,
         open_item_id: tray_icon::menu::MenuId,
+        /// Held, not just its id: the count is written into this item's text on every change.
+        reviews_item: tray_icon::menu::MenuItem,
         reviews_item_id: tray_icon::menu::MenuId,
-        setup_item_id: tray_icon::menu::MenuId,
         quit_item_id: tray_icon::menu::MenuId,
         wake_tx: std::sync::mpsc::Sender<scheduler::Wake>,
-        app_asset_path: std::path::PathBuf,
         /// Which image the tray is actually showing, as `(unread, review_pending)`, as far as we
         /// know. `None` means "unproven", which forces the next update to re-apply rather than
         /// assume.
         applied: Option<(bool, bool)>,
+        /// Likewise for the menu text, so an unchanged count does not rewrite the item.
+        applied_label: Option<String>,
     }
 
     impl App {
@@ -323,6 +319,14 @@ fn main() {
 
             if let Err(e) = self.tray_icon.set_tooltip(Some(&update.tooltip)) {
                 logln!("failed to update tray tooltip: {e}");
+            }
+
+            // The icon can only say "something is waiting". The number goes here, where there is
+            // room for it, and in the tooltip. Only written on change, so an open menu is not
+            // rebuilt underneath the user on every poll.
+            if self.applied_label.as_deref() != Some(update.reviews_label.as_str()) {
+                self.reviews_item.set_text(&update.reviews_label);
+                self.applied_label = Some(update.reviews_label);
             }
         }
     }
@@ -366,11 +370,28 @@ fn main() {
                     }
                     // Reviewing is what clears the dot, so pull the next poll forward.
                     let _ = self.wake_tx.send(scheduler::Wake::Refresh);
-                } else if event.id == self.setup_item_id {
-                    setup_review_dot(&self.app_asset_path, &self.wake_tx);
                 } else if event.id == self.quit_item_id {
                     event_loop.exit();
                 }
+            }
+
+            // ── Clicks on the icon itself ────────────────────────────────────
+            // A click means the user is looking at the icon right now, so fetch fresh data instead
+            // of showing them whatever the last poll happened to find up to a minute ago.
+            //
+            // Only the button-down edge is counted. `Up` would double every click, `DoubleClick`
+            // would add a third on top, and `Enter`/`Move`/`Leave` fire continuously as the pointer
+            // crosses the tray — hooking those would turn a mouse drifting past the clock into a
+            // stream of GitHub requests.
+            let mut clicked = false;
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                if let TrayIconEvent::Click { button_state: MouseButtonState::Down, .. } = event {
+                    clicked = true;
+                }
+            }
+            // At most one per pass, so a double-click asks once.
+            if clicked {
+                let _ = self.wake_tx.send(scheduler::Wake::PollNow);
             }
         }
     }
@@ -379,11 +400,11 @@ fn main() {
         tray_icon,
         icons: tray_icons,
         open_item_id,
+        reviews_item,
         reviews_item_id,
-        setup_item_id,
         quit_item_id,
         wake_tx,
-        app_asset_path,
+        applied_label: None,
         // The builder set the plain icon above, but treat that as unproven so the first
         // confirmed poll always writes the image it wants.
         applied: None,

@@ -8,12 +8,12 @@
 //! buys three things at once: pacing that adapts to GitHub's `x-poll-interval`, an on-demand
 //! refresh when the user opens their notifications, and a clean exit when the UI goes away.
 
-use crate::access_token::{ReviewTokenStore, TokenStore};
+use crate::access_token::TokenStore;
+use crate::gh_cli::{self, ReviewToken};
 use crate::github;
 use crate::logln;
 use crate::state::{IconState, PollState, REFRESH_BURST};
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -67,9 +67,17 @@ fn percent_encode(input: &str) -> String {
 }
 
 /// Reason the poll loop was woken early.
+///
+/// Both cause an immediate unconditional poll. They differ in what happens *after* it, because they
+/// mean different things: one says the answer is about to change on GitHub's side, the other says
+/// the user wants to see the current answer now.
 pub enum Wake {
-    /// The user opened a GitHub page, so what they have read is about to change.
+    /// The user opened a GitHub page, so what they have read is about to change. Needs follow-up
+    /// polls, since GitHub takes a moment to register that things were read.
     Refresh,
+    /// The user asked for an update directly, by clicking the icon. Nothing on GitHub's side is
+    /// changing, so one poll answers it and a burst would just be traffic.
+    PollNow,
 }
 
 /// One rendering instruction for the UI thread.
@@ -77,6 +85,9 @@ pub enum Wake {
 pub struct Update {
     pub icon: IconState,
     pub tooltip: String,
+    /// Text for the reviews menu item, carrying the exact count. Worded in `state` rather than in
+    /// each platform's UI code so the two cannot say it differently.
+    pub reviews_label: String,
 }
 
 // ─── Shared polling core ──────────────────────────────────────────────────────
@@ -86,15 +97,15 @@ pub struct Update {
 /// `emit` returns `false` once the UI is gone, which ends the loop. A panic in here used to
 /// freeze the icon at its last value with no trace; now it at least says so in the log.
 fn spawn_poll_thread(
-    app_asset_path: PathBuf,
     tokens: TokenStore,
-    reviews: Option<ReviewTokenStore>,
+    reviews: Option<ReviewToken>,
+    reviews_off: Option<String>,
     wake_rx: Receiver<Wake>,
     emit: impl FnMut(Update) -> bool + Send + 'static,
 ) {
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            run_poll_loop(app_asset_path, tokens, reviews, wake_rx, emit)
+            run_poll_loop(tokens, reviews, reviews_off, wake_rx, emit)
         }));
         if outcome.is_err() {
             logln!("poll thread panicked — notification updates have stopped");
@@ -103,9 +114,9 @@ fn spawn_poll_thread(
 }
 
 fn run_poll_loop(
-    app_asset_path: PathBuf,
     mut tokens: TokenStore,
-    mut reviews: Option<ReviewTokenStore>,
+    mut reviews: Option<ReviewToken>,
+    reviews_off: Option<String>,
     wake_rx: Receiver<Wake>,
     mut emit: impl FnMut(Update) -> bool,
 ) {
@@ -118,6 +129,10 @@ fn run_poll_loop(
     };
 
     let mut state = PollState::new(reviews.is_some());
+    // Carry the startup verdict into the tooltip, so "no dot" always has a stated reason.
+    if let Some(reason) = reviews_off {
+        state.disable_reviews(reason);
+    }
     let mut burst: VecDeque<Duration> = VecDeque::new();
     let mut last_reauth: Option<Instant> = None;
     let mut last_review_reauth: Option<Instant> = None;
@@ -129,15 +144,6 @@ fn run_poll_loop(
 
     loop {
         state.begin_cycle();
-
-        // ── Pick up a credential configured while we were running ────────────
-        // This is what lets the tray menu's "Set up review dot…" item work with no restart: the
-        // user saves the file, and the next cycle adopts it. One small file read per cycle.
-        if let Some(store) = ReviewTokenStore::reload_static_token(&app_asset_path, reviews.as_ref())
-        {
-            reviews = Some(store);
-            state.enable_reviews();
-        }
 
         // ── Notifications ────────────────────────────────────────────────────
         let etag = if skip_etag {
@@ -162,11 +168,27 @@ fn run_poll_loop(
             None => None,
         };
 
+        // ── Scope check, once GitHub has actually told us ─────────────────────
+        // A token without `repo` cannot see private repositories, and search does not complain: it
+        // answers 200 with `total_count: 0`. That is the one unacceptable answer, a confident zero
+        // that is wrong, so the axis is turned off with an actionable reason instead. Only ever
+        // reached with a credential in hand, and it disables that credential, so it fires once.
+        if reviews.is_some()
+            && state.review_scopes().is_some_and(gh_cli::lacks_required_scope)
+        {
+            let scopes = state.review_scopes().unwrap_or_default().to_string();
+            let why = gh_cli::Unavailable::MissingScope { scopes };
+            logln!("review dot disabled: {}", why.message().replace('\n', " "));
+            state.disable_reviews(why.short());
+            reviews = None;
+        }
+
         let icon = state.icon();
         let tooltip = state.tooltip();
+        let reviews_label = state.reviews_menu_label();
 
         // Update the UI before anything else here can block.
-        if !emit(Update { icon, tooltip: tooltip.clone() }) {
+        if !emit(Update { icon, tooltip: tooltip.clone(), reviews_label }) {
             return; // UI has gone away
         }
 
@@ -190,9 +212,21 @@ fn run_poll_loop(
         if state.take_reviews_reauth()
             && may_retry(&mut last_review_reauth)
         {
-            match reviews.as_mut().map(ReviewTokenStore::reauthenticate) {
-                Some(Ok(())) => retry_now = true,
-                Some(Err(e)) => logln!("review credential renewal failed: {e}"),
+            match reviews.as_mut().map(ReviewToken::refresh) {
+                // gh had rotated the token underneath us, so the new one is worth trying at once.
+                Some(Ok(true)) => retry_now = true,
+                // Same value back, so retrying now would only earn the same 401. Wait for the
+                // user to fix gh, and say so where they will see it.
+                Some(Ok(false)) => {
+                    logln!("gh returned the same token GitHub just rejected — run gh auth login");
+                    state.disable_reviews("Review dot off: run gh auth login".to_string());
+                    reviews = None;
+                }
+                Some(Err(why)) => {
+                    logln!("review credential renewal failed: {}", why.message().replace('\n', " "));
+                    state.disable_reviews(why.short());
+                    reviews = None;
+                }
                 None => {}
             }
         }
@@ -224,10 +258,19 @@ fn run_poll_loop(
         );
 
         match wake_rx.recv_timeout(delay) {
-            Ok(Wake::Refresh) => {
-                logln!("refresh requested — polling {} more times", REFRESH_BURST.len());
-                burst = REFRESH_BURST.iter().copied().collect();
+            // Either way the next cycle starts at once, and without an `If-None-Match`: a
+            // conditional request may legitimately answer 304 from a cached view, which would leave
+            // a user who just asked for an update staring at the icon they were trying to change.
+            Ok(wake) => {
                 skip_etag = true;
+                match wake {
+                    Wake::Refresh => {
+                        logln!("refresh requested — polling {} more times", REFRESH_BURST.len());
+                        burst = REFRESH_BURST.iter().copied().collect();
+                    }
+                    // No burst: the answer is not about to change, the user simply wants it now.
+                    Wake::PollNow => logln!("update requested from the tray icon — polling now"),
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             // The sender lives in the UI, so a closed channel means the app is shutting down.
@@ -255,19 +298,22 @@ const UI_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
 pub fn start_notification_scheduler(
-    app_asset_path: PathBuf,
     indicator: libappindicator::AppIndicator,
     icons: crate::icons::IconSet<String>,
+    reviews_item: gtk::MenuItem,
     tokens: TokenStore,
-    reviews: Option<ReviewTokenStore>,
+    reviews: Option<ReviewToken>,
+    reviews_off: Option<String>,
     wake_rx: Receiver<Wake>,
 ) {
     // Use the glib that `gtk` itself was built against, so this timer is attached by the same
     // bindings that run the main loop.
     use gtk::glib;
+    // `set_label` lives on an extension trait, and the prelude is the documented way in.
+    use gtk::prelude::*;
 
     let (update_tx, update_rx) = std::sync::mpsc::channel::<Update>();
-    spawn_poll_thread(app_asset_path, tokens, reviews, wake_rx, move |update| {
+    spawn_poll_thread(tokens, reviews, reviews_off, wake_rx, move |update| {
         update_tx.send(update).is_ok()
     });
 
@@ -276,6 +322,7 @@ pub fn start_notification_scheduler(
     // (`glib::idle_add_once` would look tidier but demands `Send`, which `AppIndicator` is not.)
     let mut indicator = indicator;
     let mut applied: Option<(bool, bool)> = None;
+    let mut applied_label: Option<String> = None;
 
     glib::timeout_add_local(UI_DRAIN_INTERVAL, move || {
         while let Ok(update) = update_rx.try_recv() {
@@ -291,6 +338,13 @@ pub fn start_notification_scheduler(
             if applied != Some(wanted) {
                 indicator.set_icon(icons.get(wanted.0, wanted.1).as_str());
                 applied = Some(wanted);
+            }
+
+            // Only on change: relabelling a menu item is cheap, but some panels rebuild the whole
+            // menu when an item changes, which would fight a user who has it open.
+            if applied_label.as_deref() != Some(update.reviews_label.as_str()) {
+                reviews_item.set_label(&update.reviews_label);
+                applied_label = Some(update.reviews_label.clone());
             }
 
             indicator.set_title(&update.tooltip);
@@ -314,13 +368,13 @@ pub enum TrayEvent {
 
 #[cfg(target_os = "windows")]
 pub fn start_notification_scheduler(
-    app_asset_path: PathBuf,
     tokens: TokenStore,
-    reviews: Option<ReviewTokenStore>,
+    reviews: Option<ReviewToken>,
+    reviews_off: Option<String>,
     wake_rx: Receiver<Wake>,
     proxy: winit::event_loop::EventLoopProxy<TrayEvent>,
 ) {
-    spawn_poll_thread(app_asset_path, tokens, reviews, wake_rx, move |update| {
+    spawn_poll_thread(tokens, reviews, reviews_off, wake_rx, move |update| {
         proxy.send_event(TrayEvent::Update(update)).is_ok()
     });
 }

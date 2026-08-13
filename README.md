@@ -17,6 +17,9 @@ A lightweight Rust system tray app that watches your GitHub notifications and ch
   known icon and explains itself in the tooltip, instead of silently claiming "all clear"
 - 🔐 **Device Code login** — no manual token setup; authenticate via browser in one step,
   and re-authenticates by itself if the token is later revoked
+- 🔴 **Review dot** — a red dot when PRs await your review, with the exact count in the tooltip and
+  the tray menu, using the token [`gh`](https://cli.github.com) already holds, so there is no second
+  credential to create or store (see below)
 - 🖱️ **Tray menu** — open GitHub Notifications in the browser or quit, right from the tray
 - 🪟 **Windows** — native system tray via `tray-icon` + `winit`, no console window
 - 🐧 **Linux** — native system tray via `libappindicator` + GTK 3
@@ -67,8 +70,7 @@ asked again unless the token is revoked.
 | Item | Does |
 |---|---|
 | **Open GitHub Notifications** | Opens your notifications, then re-checks a few seconds later |
-| **Open Requested Reviews** | Opens exactly the PRs the red dot is counting, newest first |
-| **Set up review dot…** | One-click setup for the red dot (see below) |
+| **Open Requested Reviews (N)** | Opens exactly the PRs the red dot is counting, newest first. The label carries the current count, with no upper limit |
 | **Quit** | Exits |
 
 The review list URL is generated from the same query the dot counts, so the page can never
@@ -76,49 +78,61 @@ disagree with the icon.
 
 ---
 
-## Optional: red dot for pending PR reviews
+## Red dot for pending PR reviews
 
 A red dot appears in the upper-right of the tray icon when at least one open PR is awaiting your
-review (Dependabot and Renovate PRs excluded). **This is off until you configure a credential**,
-and the app works exactly as normal without it.
+review (Dependabot and Renovate PRs excluded).
 
-### Quickest path: use the menu
+The dot itself stays a dot on purpose. At 100% scaling the shell asks for a 16x16 icon, which leaves
+about ten pixels for a digit even if the badge swallows the octocat; rendering the count there was
+tried, and it was both unreadable at small sizes and ugly at large ones. The number goes where there
+is room for it instead: the tooltip, and the **Open Requested Reviews (N)** menu item. Neither has an
+upper limit, so 147 shows as 147.
 
-Click **Set up review dot…** in the tray menu. It creates `~/.github-trayicon/review_token.txt`
-(readable only by you), fills it with step-by-step instructions, and opens it in your editor.
-Paste a token over the placeholder line, save, and the dot starts working within a minute —
-**no restart needed**. To turn the dot back off, delete the file's contents.
+### Why it uses the GitHub CLI
 
-The rest of this section is the same thing done by hand.
+`GET /notifications` only accepts classic OAuth-app tokens with the `notifications` scope, so that
+token cannot search pull requests. The only classic scope that can search private repos is `repo`,
+which also grants **write** access to every repository you can reach. Rather than escalate the
+notification token that far, or make you create and store a second one, the search borrows the token
+[`gh`](https://cli.github.com) already holds in your OS keyring. This app never writes it to disk.
 
-It needs a *second* credential, deliberately. `GET /notifications` only accepts classic
-OAuth-app tokens with the `notifications` scope, so that token cannot be narrowed — and the only
-classic scope that would let it search private repos is `repo`, which also grants **write** access
-to every repository you can reach. Rather than escalate the existing token that far, the review
-search gets its own narrow, read-only credential.
+Install `gh`, log in, and make sure the login carries the `repo` scope:
 
-Pick whichever you can actually obtain:
+```bash
+gh auth login
+gh auth status                    # check whether `repo` is already listed
+gh auth refresh --scopes repo     # only if it is not
+```
 
-### Option A — GitHub App (no manual rotation, ever)
+Restart the tray icon after changing your `gh` login. Set `GH_HOST` for GitHub Enterprise; `gh`
+reads the same variable.
 
-1. [Create a GitHub App](https://github.com/settings/apps/new). Set **Permissions → Repository →
-   Pull requests: Read-only**, enable **Device flow**, and leave the webhook off.
-2. Install it on the repos or org whose reviews should count.
-3. Put its **Client ID** in `~/.github-trayicon/review_client_id.txt`.
+`gh` is called exactly twice, at startup and after GitHub rejects the token, never on the polling
+path.
 
-On next start the app opens a browser prompt once. After that it renews itself with a refresh
-token — you never touch it again.
+### When it cannot work, it says so
 
-### Option B — fine-grained personal access token
+The notification half has its own credential and never depends on `gh`, so none of these stop the
+app. Each one produces a dialog at startup, a line in the log, and a line in the tooltip:
 
-1. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with
-   **Pull requests: Read-only** on the relevant repos.
-2. Put it in `~/.github-trayicon/review_token.txt`.
+| What is wrong | Tooltip says |
+|---|---|
+| `gh` is not on `PATH` | *Review dot off: gh not installed* |
+| `gh` is not logged in | *Review dot off: run gh auth login* |
+| the token has no `repo` scope | *Review dot off: run gh auth refresh --scopes repo* |
+| `gh` failed or took over 5s | *Review dot off: gh call failed* |
 
-Simpler, but you must replace it whenever it expires. Note that an organisation can enforce a
-maximum token lifetime, which may prevent you choosing "no expiration".
+A dark dot with no message means you genuinely have nothing to review. That distinction is the
+point: without the `repo` scope, GitHub's search answers `200` with `total_count: 0` rather than an
+error, so a confident zero would be indistinguishable from the truth. The app refuses to report one.
 
-If both files exist, the token in `review_token.txt` wins.
+Scopes are only ever read from the search credential's own responses, never from the notification
+token's, since that one is scoped to `notifications` on purpose and will never carry `repo`.
+
+If you set this up with a PAT before, `~/.github-trayicon/review_token.txt` is no longer read. The
+app logs a reminder on startup, and you can delete the file: it holds a credential you no longer
+need.
 
 ---
 
@@ -132,8 +146,8 @@ Windows, where the app runs without a console. The log never contains your token
 |---|---|
 | `no unread notifications` / `unread notifications` | Confirmed by a successful poll |
 | `N PR(s) awaiting your review` | The red dot is on; N comes straight from the search result |
-| `No reviews requested` | Review credential is configured and reports nothing pending |
-| *(no review line at all)* | Review credential is not configured — the dot is disabled |
+| `No reviews requested` | The search ran and reports nothing pending |
+| `Review dot off: ...` | `gh` could not supply a usable credential; the line names the fix |
 | `notification state unknown` / `Review state unknown` | Several polls in a row failed for that signal — that half of the icon is no longer trustworthy |
 | `rate limited, waiting Ns` | GitHub asked us to slow down; the last known icon is held |
 | `GitHub rejected the credential` | Renewal has been triggered automatically |
