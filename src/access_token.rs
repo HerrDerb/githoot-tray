@@ -159,24 +159,27 @@ enum Source {
 
 /// Why `gh` did not supply the notifications token, as far as `load` needs to know.
 ///
-/// Only "not on `PATH` at all" is worth interrupting startup for with a hint — everything else
-/// means `gh` is present and already known to the user (not logged in, wrong scope, a slow
-/// keyring), so it is logged and left there, the same way the other fallback reasons are.
+/// `NotInstalled` and `MissingScope` are each worth interrupting startup for, in different ways —
+/// see `offer_gh_install_hint` and `tell_user_gh_needs_notifications_scope`. Everything else means
+/// `gh` is present but otherwise not ready (not logged in, a slow keyring, scopes it did not
+/// report), which is logged and left there rather than surfaced.
 enum GhFallback {
     NotInstalled,
+    /// `gh` is logged in and its scopes are *known* — just missing `notifications`.
+    MissingScope,
     Other,
 }
 
 /// Tries to source the notifications token from `gh`, the same way `gh_cli::ReviewToken` borrows
 /// one for the review search. `Err` on anything short of a token confirmed to carry the
-/// `notifications` scope — never treated as an application error, since not having `gh` (or not
-/// having refreshed its scopes) is a normal reason to fall back to the device flow.
+/// `notifications` scope — never treated as an application error in itself, though `load` turns
+/// some of these variants into a dialog before deciding what to do next.
 ///
-/// Deliberately stricter than the review search's scope check: that one treats *unknown* scopes as
-/// good enough to proceed, because a wrong guess there is caught by a live check against GitHub's
-/// answer a moment later and the feature turns itself off (see `gh_cli::lacks_required_scope`'s use
-/// in `scheduler`). Nothing here re-checks after the fact — notifications are core to the app, not
-/// an optional dot — so an unknown scope set falls back instead of gambling on it.
+/// The scope check has three outcomes, not two, because `gh_cli::has_scope` and
+/// `gh_cli::lacks_scope` agree only when scopes are actually known: unknown scopes (offline, or a
+/// fine-grained token) answer `false` to both, and only *that* case gambles on the OAuth App
+/// instead of gh — same reasoning as the module doc. A definite "missing" is not a gamble, so it
+/// gets its own outcome rather than being folded into "unknown".
 fn gh_backed_token() -> Result<(String, String), GhFallback> {
     let host = gh_cli::host();
 
@@ -199,10 +202,14 @@ fn gh_backed_token() -> Result<(String, String), GhFallback> {
         }
     };
 
+    if gh_cli::lacks_scope(&account.scopes, gh_cli::NOTIFICATIONS_SCOPE) {
+        logln!("gh's token is missing the notifications scope — run: gh auth refresh --scopes notifications");
+        return Err(GhFallback::MissingScope);
+    }
     if !gh_cli::has_scope(&account.scopes, gh_cli::NOTIFICATIONS_SCOPE) {
         logln!(
-            "gh's token is not known to carry the notifications scope — using the notifications \
-             OAuth App instead. To use gh instead, run: gh auth refresh --scopes notifications"
+            "gh's token scopes are unknown — using the notifications OAuth App instead. To use \
+             gh instead, run: gh auth refresh --scopes notifications"
         );
         return Err(GhFallback::Other);
     }
@@ -237,6 +244,23 @@ fn offer_gh_install_hint() -> bool {
     crate::dialog::confirm(title, msg, "Continue", "Exit")
 }
 
+/// Tells the user `gh` is logged in but missing the scope this app needs, and that fixing it
+/// needs a restart.
+///
+/// Unlike `offer_gh_install_hint`, there is no "continue anyway" choice: `gh` already holds a
+/// working account for this host, so quietly falling back to a second, separately-registered
+/// credential would trade one broken setup for two half-finished ones. The single button just
+/// acknowledges the message; closing it ends the process either way, since there is nothing this
+/// run of the app can still do about it.
+fn tell_user_gh_needs_notifications_scope() {
+    let title = "git-system-tray: gh is missing the notifications scope";
+    let msg = "The GitHub CLI (gh) is logged in, but its token does not include the \
+               `notifications` scope this app needs.\n\n\
+               Run:\n\n    gh auth refresh --scopes notifications\n\n\
+               Then reopen git-system-tray.";
+    crate::dialog::message(title, msg);
+}
+
 // ── Token storage ─────────────────────────────────────────────────────────────
 
 /// Owns the access token and knows how to replace it.
@@ -261,6 +285,11 @@ impl TokenStore {
                     logln!("exiting at the user's request to install gh");
                     std::process::exit(0);
                 }
+            }
+            Err(GhFallback::MissingScope) => {
+                tell_user_gh_needs_notifications_scope();
+                logln!("exiting so gh can be re-authorized with the notifications scope");
+                std::process::exit(0);
             }
             Err(GhFallback::Other) => {}
         }

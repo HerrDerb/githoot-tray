@@ -56,12 +56,16 @@ gh auth refresh --scopes notifications    # only if it is not
 Skip this if you would rather not widen `gh`'s scopes, or don't use `gh` at all — step 3 below
 covers what happens instead.
 
-If `gh` is not found on `PATH` at all, startup shows a dialog explaining the option above and
-asking whether to continue with the OAuth App flow (step 3) or exit so `gh` can be installed
-first. `gh` being installed but not logged in, or logged in without the `notifications` scope,
-skips this dialog and falls straight back to step 3 — at that point `gh` is already set up for
-something, so the review dot's own dialog (see [Red dot for pending PR
-reviews](#red-dot-for-pending-pr-reviews)) is the one that speaks up if it needs attention.
+Startup checks `gh` and reacts differently depending on what it finds:
+
+| What `gh` reports | What happens |
+|---|---|
+| Not found on `PATH` | A dialog explains the option above and offers a choice: continue with the OAuth App flow (step 3) now, or exit so `gh` can be installed first |
+| Installed, logged in, confirmed missing `notifications` | A dialog gives the exact `gh auth refresh` command above and closes the app — there is no "continue anyway", since `gh` already has a working account for this host, and falling back silently would leave two half-finished credentials instead of one working one |
+| Installed but not logged in, or its scopes could not be confirmed (e.g. offline at startup) | No dialog; falls straight back to step 3. `gh` not being ready yet is not the same as `gh` being confirmed wrong, so this is not treated as an error |
+
+`gh` being installed and logged in with something else set up (review dot only, say) is covered by
+its own dialog — see [Red dot for pending PR reviews](#red-dot-for-pending-pr-reviews).
 
 ### 2. Build
 
@@ -75,7 +79,7 @@ On macOS the bare binary works from a terminal, but it takes a Dock icon and an 
 `LSUIElement` can only be set in an app bundle. To get the real thing:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 2.3.0
+scripts/bundle-macos.sh target/release/git-system-tray dist 2.4.0
 open dist/git-system-tray.app
 ```
 

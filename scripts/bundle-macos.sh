@@ -8,7 +8,7 @@
 # — wrong for something whose whole UI is one status item.
 #
 # Usage: scripts/bundle-macos.sh <binary> <out-dir> <version>
-#   e.g. scripts/bundle-macos.sh target/release/git-system-tray dist 2.3.0
+#   e.g. scripts/bundle-macos.sh target/release/git-system-tray dist 2.4.0
 
 set -euo pipefail
 
