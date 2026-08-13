@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings regardless of the checkout platform. This repo is developed on
+# Windows, where `core.autocrlf=true` would otherwise hand macOS a script whose shebang line ends in
+# a carriage return — which fails as `bad interpreter: /usr/bin/env bash^M`.
+*.sh text eol=lf

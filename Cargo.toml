@@ -24,7 +24,11 @@ gtk = "0.18.2"
 # same libglib-2.0, so the GTK main loop and our timer came from different bindings.
 libappindicator = "0.9.0"
 
-[target.'cfg(target_os = "windows")'.dependencies]
+# Windows and macOS share one tray implementation: both drive `tray-icon` from a `winit` event
+# loop. Only the *timing* of the tray's creation differs (see `main.rs`), not the crates.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.21.1"
 winit = "0.30.12"
+
+[target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3.9", features = ["winuser", "synchapi", "errhandlingapi"] }

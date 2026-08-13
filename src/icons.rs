@@ -176,10 +176,15 @@ pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
     Ok(IconSet { variants: paths })
 }
 
-// ─── Windows ──────────────────────────────────────────────────────────────────
+// ─── Windows and macOS ────────────────────────────────────────────────────────
 
 /// Decodes and composites the embedded assets into `tray_icon::Icon` objects.
-#[cfg(target_os = "windows")]
+///
+/// Shared by both `tray-icon` platforms. Deliberately *not* paired with
+/// `TrayIconBuilder::with_icon_as_template(true)` on macOS: template mode is the idiomatic way to
+/// get automatic menu-bar tinting, but it forces the image monochrome, which would erase both the
+/// blue unread glyph and the red review dot — the only two things this icon exists to say.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn load_tray_icons() -> Result<IconSet<tray_icon::Icon>, String> {
     fn to_icon(img: &RgbaImage) -> Result<tray_icon::Icon, String> {
         let (w, h) = img.dimensions();

@@ -246,6 +246,25 @@ fn run(args: &[&str]) -> Result<String, GhError> {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
+    // A `.app` launched from Finder inherits `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — not the shell's
+    // — which is where `gh` is exactly never installed. Without this, a Mac where `gh` works
+    // perfectly in Terminal reports `NotInstalled` from the bundle, and the review dot goes quietly
+    // dark: the precise confusion `load_review_credential` exists to prevent.
+    //
+    // Appended, not prepended, so a user who has put their own `gh` on `PATH` still wins. A no-op
+    // when these are already present, and harmless when they do not exist.
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let missing: Vec<&str> = ["/opt/homebrew/bin", "/usr/local/bin"]
+            .into_iter()
+            .filter(|dir| !path.split(':').any(|entry| entry == *dir))
+            .collect();
+        if !missing.is_empty() {
+            command.env("PATH", format!("{}:{}", path, missing.join(":")));
+        }
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(GhError::NotInstalled),

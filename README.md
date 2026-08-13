@@ -22,8 +22,11 @@ A lightweight Rust system tray app that watches your GitHub notifications and ch
   credential to create or store (see below)
 - 🖱️ **Tray menu** — open GitHub Notifications in the browser or quit, right from the tray
 - 🪟 **Windows** — native system tray via `tray-icon` + `winit`, no console window
+- 🍎 **macOS** — native menu bar via `tray-icon` + `winit`, shipped as an `LSUIElement` app bundle
+  so there is no Dock icon and no app menu
 - 🐧 **Linux** — native system tray via `libappindicator` + GTK 3
-- 🔁 **Single instance** — launching a second copy shows a notice and exits cleanly
+- 🔁 **Single instance** — launching a second copy shows a notice and exits cleanly (Windows;
+  on macOS the same is handled by macOS itself when launching the bundle)
 
 ---
 
@@ -52,6 +55,17 @@ cargo build --release
 ```
 
 The binary is at `target/release/git-system-tray` (or `.exe` on Windows).
+
+On macOS the bare binary works from a terminal, but it takes a Dock icon and an app menu, because
+`LSUIElement` can only be set in an app bundle. To get the real thing:
+
+```bash
+scripts/bundle-macos.sh target/release/git-system-tray dist 2.2.0
+open dist/git-system-tray.app
+```
+
+That is the same script the release workflow runs, so a local bundle and a released one are built
+identically.
 
 ### 3. First launch
 
@@ -139,8 +153,8 @@ need.
 ## Troubleshooting
 
 The icon's tooltip always states what the app currently believes, including *why* it is unsure.
-A full history is appended to `~/.github-trayicon/log.txt` — the only way to see errors on
-Windows, where the app runs without a console. The log never contains your token.
+A full history is appended to `~/.github-trayicon/log.txt` — the only way to see errors on Windows
+and on macOS, where the app runs without a console. The log never contains your token.
 
 | Tooltip says | Meaning |
 |---|---|
@@ -163,7 +177,34 @@ unconditional poll → notifications→fresh reviews→fresh → No/Yes (next in
 
 ## Pre-built binaries
 
-Download the latest Windows or Linux binary from the [Releases](../../releases) page.
+Download the latest build for your platform from the [Releases](../../releases) page.
+
+| Platform | Asset |
+|---|---|
+| Windows x86-64 | `git-system-tray.exe` |
+| Linux x86-64 | `git-system-tray` |
+| macOS Apple Silicon | `git-system-tray-macos-aarch64.zip` |
+
+### macOS
+
+The bundle is ad-hoc signed, not notarized — that would need a paid Apple Developer account — so
+Gatekeeper quarantines it on download and refuses to open it. Clear the flag once:
+
+```bash
+unzip git-system-tray-macos-aarch64.zip
+xattr -dr com.apple.quarantine git-system-tray.app
+open git-system-tray.app
+```
+
+The icon then appears in the menu bar with no Dock icon. Two things to know:
+
+- For the red review dot to work, `gh` has to be findable. Launched from Finder an app inherits a
+  minimal `PATH`, so the app also looks in `/opt/homebrew/bin` and `/usr/local/bin`. A `gh`
+  installed anywhere else needs to be on the `PATH` the app inherits.
+- The menu-bar image keeps its colour rather than using a macOS template image, because a template
+  is drawn monochrome and that would erase both the blue "unread" glyph and the red dot.
+
+Intel Macs are not built for; `cargo build --release` on one works if you build it yourself.
 
 ---
 

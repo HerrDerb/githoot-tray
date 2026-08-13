@@ -81,41 +81,20 @@ impl std::error::Error for AuthError {}
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
 
-/// Shows a message-box dialog on Windows.
-/// `pub` so `main.rs` can reuse it for fatal-startup and single-instance notices.
-#[cfg(target_os = "windows")]
-pub fn win_msgbox(title: &str, msg: &str) {
-    use std::ptr::null_mut;
-    use winapi::um::winuser::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+// Windows and macOS both run without a usable console — Windows because of
+// `windows_subsystem = "windows"`, macOS because the release artefact is an `LSUIElement` app
+// bundle — so both take the dialog path below wherever the two differ from Linux.
 
-    let title_w: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-    let msg_w: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        MessageBoxW(
-            null_mut(),
-            msg_w.as_ptr(),
-            title_w.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
-
-/// Blocks until the user confirms (Windows: OK button, Linux: Enter key).
+/// Blocks until the user confirms (Windows/macOS: OK button, Linux: Enter key).
 ///
 /// Only ever called during first-run setup from the main thread — the poll thread must never
-/// block on stdin.
+/// block on stdin. `dialog::message` already picks the right mechanism per platform; this stays a
+/// named wrapper so that contract has somewhere to be written down.
 fn wait_for_user_confirmation(title: &str, msg: &str) {
-    #[cfg(target_os = "windows")]
-    win_msgbox(title, msg);
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        println!("\n{}: {}\nPress Enter to continue...", title, msg);
-        let _ = std::io::stdin().read_line(&mut String::new());
-    }
+    crate::dialog::message(title, msg);
 }
 
-/// Displays the device-code prompt. On Windows this opens a non-blocking MessageBox in a
+/// Displays the device-code prompt. Where dialogs are used this opens a non-blocking one in a
 /// background thread so polling can proceed immediately.
 ///
 /// The details also go to the log, because this is reachable from the poll thread long after
@@ -123,12 +102,12 @@ fn wait_for_user_confirmation(title: &str, msg: &str) {
 fn show_auth_prompt(user_code: &str, verification_uri: &str) {
     logln!("authorization required: open {verification_uri} and enter code {user_code}");
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let user_code = user_code.to_string();
         let verification_uri = verification_uri.to_string();
         std::thread::spawn(move || {
-            win_msgbox(
+            crate::dialog::message(
                 "GitHub Authorization Required",
                 &format!(
                     "Open: {}\n\nEnter code: {}\n\nThis dialog can be closed once you have entered the code.",
@@ -137,7 +116,7 @@ fn show_auth_prompt(user_code: &str, verification_uri: &str) {
             );
         });
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         println!();
         println!("━━━  GitHub Authorization Required  ━━━");
@@ -152,8 +131,8 @@ fn show_auth_prompt(user_code: &str, verification_uri: &str) {
 fn show_auth_success() {
     logln!("authorization successful");
 
-    #[cfg(target_os = "windows")]
-    win_msgbox("GitHub Authorization", "Authorization successful!");
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::dialog::message("GitHub Authorization", "Authorization successful!");
 }
 
 // ── Token storage ─────────────────────────────────────────────────────────────

@@ -118,3 +118,44 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
             --clobber
+
+  # ── 3. Build the macOS .app bundle ──────────────────────────────────────────
+  # A separate job rather than a third matrix entry: this one needs bundling, signing and zipping
+  # steps the other two have no use for, and the alternative is making every step in `build`
+  # conditional on the runner OS. The cost is a few duplicated setup lines; the benefit is that the
+  # working Windows and Linux path is left exactly as it was.
+  build-macos:
+    needs: release-notes
+    if: always()
+    # Pinned rather than `macos-latest` so the runner architecture cannot change under us: the
+    # artefact name promises aarch64.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Bundle, sign and zip
+        run: |
+          set -euo pipefail
+          # The tag is the source of truth for the version here, as it is for the release notes.
+          # Cargo.toml's version is never consulted by this workflow.
+          bash scripts/bundle-macos.sh \
+            target/aarch64-apple-darwin/release/git-system-tray \
+            dist \
+            "${GITHUB_REF_NAME#v}"
+
+      - name: Attach bundle to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/git-system-tray-macos-aarch64.zip \
+            --clobber

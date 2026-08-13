@@ -422,15 +422,26 @@ pub fn start_notification_scheduler(
     });
 }
 
-// ─── Windows ──────────────────────────────────────────────────────────────────
+// ─── Windows and macOS ────────────────────────────────────────────────────────
 
-/// The custom event type sent from the polling thread to the winit event loop.
-#[cfg(target_os = "windows")]
+/// The custom event type sent into the winit event loop from outside it.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub enum TrayEvent {
+    /// The polling thread has a new notification state to show.
     Update(Update),
+    /// A tray menu entry was chosen.
+    ///
+    /// macOS only. There, menu events arrive through a `muda` callback rather than the polled
+    /// channel, and a callback has no way to reach the event loop except as a user event. On
+    /// Windows the polled channel is used instead, so this variant would never be constructed.
+    #[cfg(target_os = "macos")]
+    MenuClick(tray_icon::menu::MenuId),
+    /// The tray icon itself was clicked. macOS only, for the same reason.
+    #[cfg(target_os = "macos")]
+    IconClick,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn start_notification_scheduler(
     tokens: TokenStore,
     reviews: Option<ReviewToken>,
