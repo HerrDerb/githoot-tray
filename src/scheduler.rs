@@ -161,6 +161,11 @@ pub struct PollInputs {
     pub app_asset_path: PathBuf,
     /// Whether to look for newer releases at all. See `config::Config::update_check`.
     pub update_check: bool,
+    /// Which PR signals the user wants, indexed by `PrAxis::index`.
+    ///
+    /// The **configuration only**, never ANDed with whether a credential exists. See
+    /// `PollState::new` for what folding those two together would break.
+    pub pr_enabled: [bool; 3],
 }
 
 // ─── Shared polling core ──────────────────────────────────────────────────────
@@ -193,7 +198,13 @@ fn run_poll_loop(
     mut emit: impl FnMut(Update) -> bool,
     restart: impl Fn(RestartPlan) + Send + Clone + 'static,
 ) {
-    let PollInputs { mut tokens, pr, app_asset_path, update_check: update_check_enabled } = inputs;
+    let PollInputs {
+        mut tokens,
+        pr,
+        app_asset_path,
+        update_check: update_check_enabled,
+        pr_enabled,
+    } = inputs;
     let client = match github::build_client() {
         Ok(client) => client,
         Err(e) => {
@@ -208,7 +219,10 @@ fn run_poll_loop(
         PrStatus::Off(reason) => (None, Some(reason), false),
     };
 
-    let mut state = PollState::new(tokens.is_some(), [pr.is_some(); 3]);
+    // The config, not `[pr.is_some(); 3]`. Whether a credential exists is said by the two calls
+    // below; putting it here as well would make `require_pr_auth` a no-op on the very path that
+    // exists to obtain one. See `PollState::new`.
+    let mut state = PollState::new(tokens.is_some(), pr_enabled);
     // Both branches mean "no PR dots", and both are deliberately said differently: one has a menu
     // item waiting to be clicked, the other has a reason clicking cannot address. The three axes
     // share one credential, so whichever it is applies to all three at once.
@@ -262,6 +276,16 @@ fn run_poll_loop(
         let mut pr_kinds: Vec<(PrAxis, &'static str)> = Vec::new();
         if let Some(store) = pr.as_ref() {
             for axis in PrAxis::ALL {
+                // Skipped before the request, not after: `apply_pr` would discard the answer for an
+                // axis that is not in play, and Search has its own 30-per-minute budget, so issuing
+                // it would be pure cost. Also keeps the log line below free of axes whose result was
+                // thrown away.
+                //
+                // An `if` rather than `.filter()` on the iterator: the adaptor would hold `&state`
+                // across a body that needs `&mut state` for `apply_pr`.
+                if !state.pr_in_play(axis) {
+                    continue;
+                }
                 let response = github::poll_reviews(&client, store.token(), pr_query(axis));
                 pr_kinds.push((axis, response.result.kind()));
                 state.apply_pr(axis, response);

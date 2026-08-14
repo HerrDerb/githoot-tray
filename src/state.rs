@@ -274,6 +274,14 @@ pub struct PollState {
     /// `None` in a slot means that PR axis is off — no credential, or GitHub reported the
     /// credential lacks the scope/permission the search needs, and no search is issued for it.
     pr: [Option<Track>; 3],
+    /// Whether the user asked for each PR axis at all, indexed by `PrAxis::index`.
+    ///
+    /// **Write-once**: set in `new` and never touched again. The distinction from `pr` is the whole
+    /// point of the field existing. `pr[i]` says whether an axis is in play *right now*, which any
+    /// runtime event may change — a missing credential, a permission failure. This says whether it is
+    /// *allowed* to be, which nothing at runtime may change. Keeping the two apart is what lets
+    /// `clear_pr_auth` put axes back after a sign-in without resurrecting one the user switched off.
+    pr_enabled: [bool; 3],
     /// Why the corresponding `pr` slot is off, when we know. Without this a dark dot for a broken
     /// credential looks exactly like a dark dot because nothing needs attention, which is the one
     /// confusion this module exists to prevent.
@@ -296,10 +304,20 @@ pub struct PollState {
 }
 
 impl PollState {
-    pub fn new(notifications_configured: bool, pr_configured: [bool; 3]) -> Self {
+    /// `pr_enabled` is the user's configuration **only**.
+    ///
+    /// Deliberately not "configured and we hold a credential". Folding credential presence in here
+    /// would make `require_pr_auth` a no-op on precisely the path that exists to recover from a
+    /// missing credential — every flag would be false, so there would be no exclamation icon, no
+    /// `Authenticate` menu entry, and no way to ever obtain one. A missing credential is said
+    /// afterwards, by calling `require_pr_auth` or `disable_pr`.
+    pub fn new(notifications_configured: bool, pr_enabled: [bool; 3]) -> Self {
         Self {
             notifications: notifications_configured.then(Track::new),
-            pr: pr_configured.map(|configured| configured.then(Track::new)),
+            // Derived from the value stored below, not from a second read of the argument, so the
+            // two can never disagree about which axes exist.
+            pr: pr_enabled.map(|enabled| enabled.then(Track::new)),
+            pr_enabled,
             pr_off: [None, None, None],
             pr_needs_auth: false,
             update_available: None,
@@ -315,10 +333,13 @@ impl PollState {
         self.notifications.is_some()
     }
 
-    /// Whether a given PR axis is configured. Mirrors `notifications_configured`.
+    /// Whether a given PR axis is *enabled by config*, regardless of whether it is live right now.
+    ///
+    /// Split from `pr_in_play` because this change makes the two diverge: an axis can be enabled by
+    /// config and still not in play, which is exactly the state a missing credential produces.
     #[cfg(test)]
-    pub fn pr_configured(&self, axis: PrAxis) -> bool {
-        self.pr[axis.index()].is_some()
+    pub fn pr_enabled(&self, axis: PrAxis) -> bool {
+        self.pr_enabled[axis.index()]
     }
 
     /// Turns a PR axis off and records why, so the tooltip can say so.
@@ -326,8 +347,17 @@ impl PollState {
     /// Called at startup when the PR credential cannot be obtained, and mid-run if GitHub reports
     /// that the credential lacks what the search needs.
     pub fn disable_pr(&mut self, axis: PrAxis, reason: String) {
-        self.pr[axis.index()] = None;
-        self.pr_off[axis.index()] = Some(reason);
+        let i = axis.index();
+        // Skipped, and not merely as an optimisation. Setting `pr[i] = None` on an already-disabled
+        // axis would be harmless; recording a *reason* is not. `tooltip` prints a reason as a line of
+        // its own, so a config-disabled axis would grow a hover line explaining a feature the user
+        // switched off. Both callers loop over all three axes for a credential-wide failure, so this
+        // is a real path, not a hypothetical one.
+        if !self.pr_enabled[i] {
+            return;
+        }
+        self.pr[i] = None;
+        self.pr_off[i] = Some(reason);
     }
 
     /// Records that PR status is waiting for the user to authorize it.
@@ -337,6 +367,15 @@ impl PollState {
     /// burn rate limit. No per-axis reason is stored — `tooltip` says it once for all three, and
     /// the icon and menu item say it without hovering.
     pub fn require_pr_auth(&mut self) {
+        // Nothing to authorize when every axis is switched off: the exclamation and the
+        // `Authenticate` entry would be demanding a credential that no search would ever use.
+        //
+        // The guard lives here rather than at the call sites because `pr_needs_auth` drives three
+        // things at once — the icon override, a tooltip line, and the menu entry's visibility — and
+        // one flag with three consumers should have one gate.
+        if !self.any_pr_enabled() {
+            return;
+        }
         self.pr_needs_auth = true;
         for axis in PrAxis::ALL {
             self.pr[axis.index()] = None;
@@ -354,9 +393,33 @@ impl PollState {
     pub fn clear_pr_auth(&mut self) {
         self.pr_needs_auth = false;
         for axis in PrAxis::ALL {
-            self.pr[axis.index()] = Some(Track::new());
-            self.pr_off[axis.index()] = None;
+            let i = axis.index();
+            // The guard that matters, and the reason `pr_enabled` exists. This used to be an
+            // unconditional `Some(Track::new())`, which meant obtaining a credential switched **on**
+            // every axis — including ones the config had turned off. Getting a credential says
+            // nothing about whether a signal is wanted.
+            self.pr[i] = self.pr_enabled[i].then(Track::new);
+            // Unconditional, unlike `pr` above: a disabled axis has no reason recorded to begin with
+            // (see `disable_pr`), so this is self-healing rather than wrong.
+            self.pr_off[i] = None;
         }
+    }
+
+    /// Whether any PR axis is enabled at all.
+    fn any_pr_enabled(&self) -> bool {
+        self.pr_enabled.iter().any(|&enabled| enabled)
+    }
+
+    /// Whether `axis` is in play: enabled by config, and not currently silenced.
+    ///
+    /// The poll loop's question, and so the one accessor here that is not `#[cfg(test)]`. Search has
+    /// its own 30-per-minute budget and `apply_pr` discards the answer for an axis that is not in
+    /// play, so issuing the request is pure cost.
+    ///
+    /// Deliberately the *live* predicate rather than `pr_enabled`, so an axis silenced at runtime — no
+    /// credential, App not installed — is skipped too, where searching is equally pointless.
+    pub fn pr_in_play(&self, axis: PrAxis) -> bool {
+        self.pr[axis.index()].is_some()
     }
 
     /// Records the newest release above this build, or clears it.
@@ -649,7 +712,7 @@ mod tests {
     #[test]
     fn unconfigured_reviews_read_as_a_confirmed_no_dot() {
         let state = new_state(true, false);
-        assert!(!state.pr_configured(PrAxis::ReviewRequested));
+        assert!(!state.pr_in_play(PrAxis::ReviewRequested));
         // Not Unknown: we are not failing to find out, the feature is simply off.
         assert_eq!(state.icon().review_requested, Presence::No);
         assert_eq!(state.icon().review_requested.as_confirmed(), Some(false));
@@ -931,7 +994,10 @@ mod tests {
     /// disabled axis has to say why on hover.
     #[test]
     fn a_disabled_review_axis_explains_itself_in_the_tooltip() {
-        let mut state = new_state(true, false);
+        // Enabled by config, then silenced at runtime — which is the only combination that produces a
+        // reason. An axis the config never asked for is silent instead, deliberately: see
+        // `a_config_disabled_axis_shows_no_dot_no_count_and_no_tooltip_line`.
+        let mut state = new_state(true, true);
         state.disable_pr(PrAxis::ReviewRequested, "PR status off: sign-in failed".to_string());
         cycle(&mut state, fresh(false), None);
 
@@ -1060,9 +1126,17 @@ mod tests {
     #[test]
     fn all_three_pr_axes_are_independently_configurable() {
         let state = PollState::new(false, [true, false, true]);
-        assert!(state.pr_configured(PrAxis::ReviewRequested));
-        assert!(!state.pr_configured(PrAxis::ReadyToMerge));
-        assert!(state.pr_configured(PrAxis::ChangesRequested));
+        // At construction the config notion and the live notion agree, and this is the only place
+        // that is true — so both are pinned here, and their divergence is pinned in
+        // `each_pr_axis_can_be_disabled_independently` below.
+        for (axis, expected) in [
+            (PrAxis::ReviewRequested, true),
+            (PrAxis::ReadyToMerge, false),
+            (PrAxis::ChangesRequested, true),
+        ] {
+            assert_eq!(state.pr_enabled(axis), expected, "{axis:?} config");
+            assert_eq!(state.pr_in_play(axis), expected, "{axis:?} live");
+        }
     }
 
     #[test]
@@ -1107,9 +1181,17 @@ mod tests {
         let mut state = PollState::new(false, [true, true, true]);
         state.disable_pr(PrAxis::ReadyToMerge, "merge dot off: test reason".to_string());
 
-        assert!(state.pr_configured(PrAxis::ReviewRequested));
-        assert!(!state.pr_configured(PrAxis::ReadyToMerge));
-        assert!(state.pr_configured(PrAxis::ChangesRequested));
+        assert!(state.pr_in_play(PrAxis::ReviewRequested));
+        assert!(!state.pr_in_play(PrAxis::ReadyToMerge));
+        assert!(state.pr_in_play(PrAxis::ChangesRequested));
+
+        // The divergence `pr_enabled` exists for: this axis was silenced at *runtime*, so it is out of
+        // play, but it is still enabled by config — which is what lets `clear_pr_auth` know to bring it
+        // back while leaving a config-disabled axis alone.
+        assert!(
+            state.pr_enabled(PrAxis::ReadyToMerge),
+            "a runtime disable must not rewrite the user's configuration"
+        );
 
         let tip = state.tooltip();
         assert!(tip.contains("merge dot off: test reason"), "got {tip:?}");
@@ -1126,7 +1208,7 @@ mod tests {
         assert!(state.icon().needs_auth, "the icon must carry the override");
         for axis in PrAxis::ALL {
             assert!(
-                !state.pr_configured(axis),
+                !state.pr_in_play(axis),
                 "{axis:?} must be silenced — one credential is missing, so all three are"
             );
         }
@@ -1190,7 +1272,7 @@ mod tests {
         assert!(!state.pr_needs_auth());
         assert!(!state.icon().needs_auth);
         for axis in PrAxis::ALL {
-            assert!(state.pr_configured(axis), "{axis:?} must be searchable again");
+            assert!(state.pr_in_play(axis), "{axis:?} must be searchable again");
         }
         // `Unknown`, not `Yes` and not `No`: the count of 4 predates the credential going away, and
         // nothing has confirmed anything since. `Unknown` is also what stops the icon flickering —
@@ -1210,6 +1292,181 @@ mod tests {
         let tip = state.tooltip();
         assert!(!tip.contains("earlier reason"), "got {tip:?}");
         assert_eq!(tip, PR_NEEDS_AUTH_TOOLTIP);
+    }
+
+    // ── Per-axis configuration ──────────────────────────────────────────────
+    //
+    // A config-disabled axis has to be invisible in six separate ways: no bar, no count, no tooltip
+    // line, no search, no contribution to backoff, and no credential renewal. Most of those are true
+    // today only as a side effect of `pr[i] == None`, with nothing saying so — which is what these pin.
+
+    /// One line, but four modules index `[T; 3]` by `PrAxis::index` and nothing asserted that `ALL` is
+    /// in that order. The config array makes a fifth.
+    #[test]
+    fn pr_axis_all_is_in_index_order() {
+        assert_eq!(PrAxis::ALL.map(PrAxis::index), [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_config_disabled_axis_shows_no_dot_no_count_and_no_tooltip_line() {
+        let mut state = PollState::new(false, [true, false, true]);
+        state.begin_cycle();
+        for axis in PrAxis::ALL {
+            state.apply_pr(axis, fresh_count(4));
+        }
+
+        assert!(!state.pr_enabled(PrAxis::ReadyToMerge));
+        assert!(!state.pr_in_play(PrAxis::ReadyToMerge));
+
+        // `No`, and emphatically not `Unknown`. This is what makes the UI need no changes at all: the
+        // drains use `as_confirmed().unwrap_or(current)`, so an `Unknown` would leave whatever bar is
+        // already on screen lit rather than hiding it.
+        assert_eq!(state.icon().ready_to_merge, Presence::No);
+        assert_eq!(state.icon().ready_to_merge.as_confirmed(), Some(false));
+        // No count appended, so the menu entry reads as bare even though a response arrived.
+        assert_eq!(state.pr_menu_label(PrAxis::ReadyToMerge), PrAxis::ReadyToMerge.menu_label());
+
+        let tip = state.tooltip();
+        for phrase in [PrAxis::ReadyToMerge.tooltip_no(), PrAxis::ReadyToMerge.tooltip_unknown()] {
+            assert!(!tip.contains(phrase), "disabled axis leaked {phrase:?} into {tip:?}");
+        }
+        // …while the two enabled axes still report.
+        assert!(tip.contains("4 PR(s) awaiting your review"), "got {tip:?}");
+    }
+
+    /// Asserted as an exact string, not a `contains`: the point is that the PR half contributes
+    /// *nothing*, and a stray blank line from `lines.join` or a leaked detail would slip past a
+    /// looser check.
+    #[test]
+    fn every_axis_disabled_leaves_the_pr_half_completely_silent() {
+        let mut state = PollState::new(true, [false; 3]);
+        state.begin_cycle();
+        state.apply_notifications(fresh(true));
+
+        assert_eq!(state.tooltip(), "GitHub: unread notifications");
+    }
+
+    /// Paired with the test below on purpose. The plausible slip is writing `all` where `any` was
+    /// meant, and this test alone would still pass if that happened.
+    #[test]
+    fn require_pr_auth_is_ignored_when_every_axis_is_config_disabled() {
+        let mut state = PollState::new(false, [false; 3]);
+        state.require_pr_auth();
+
+        assert!(!state.pr_needs_auth(), "nothing to authorize when nothing is enabled");
+        assert!(!state.icon().needs_auth, "no exclamation for a feature that is switched off");
+        assert_eq!(state.tooltip(), "", "and no hover line either");
+    }
+
+    #[test]
+    fn require_pr_auth_still_flags_the_icon_when_only_one_axis_is_enabled() {
+        let mut state = PollState::new(false, [false, true, false]);
+        state.require_pr_auth();
+
+        assert!(state.pr_needs_auth());
+        assert!(state.icon().needs_auth);
+        assert_eq!(state.tooltip(), PR_NEEDS_AUTH_TOOLTIP);
+    }
+
+    /// Mimics the credential-wide failure loop in `scheduler`, which calls `disable_pr` for all three
+    /// axes. The count is exact: a `contains` would pass even with a third line for the disabled axis.
+    #[test]
+    fn disable_pr_does_not_give_a_config_disabled_axis_a_reason_to_show() {
+        let mut state = PollState::new(false, [true, false, true]);
+        let reason = "PR status off: sign-in failed";
+        for axis in PrAxis::ALL {
+            state.disable_pr(axis, reason.to_string());
+        }
+
+        let tip = state.tooltip();
+        assert_eq!(tip.matches(reason).count(), 2, "one line per *enabled* axis, got {tip:?}");
+    }
+
+    /// The bug this whole field exists to fix. Obtaining a credential says nothing about whether a
+    /// signal is wanted, but `clear_pr_auth` used to switch all three back on regardless.
+    #[test]
+    fn clear_pr_auth_does_not_resurrect_a_config_disabled_axis() {
+        let mut state = PollState::new(false, [true, false, true]);
+        state.require_pr_auth();
+        state.clear_pr_auth();
+
+        assert!(state.pr_in_play(PrAxis::ReviewRequested), "an enabled axis must come back");
+        assert!(state.pr_in_play(PrAxis::ChangesRequested), "an enabled axis must come back");
+        assert!(
+            !state.pr_in_play(PrAxis::ReadyToMerge),
+            "authenticating must not switch on an axis the config turned off"
+        );
+        assert_eq!(state.icon().ready_to_merge, Presence::No);
+        assert!(!state.tooltip().contains(PrAxis::ReadyToMerge.tooltip_no()));
+    }
+
+    /// Extends the documented in-flight-response race across the one moment `pr[i]` is rewritten,
+    /// which is exactly where the old `clear_pr_auth` would have handed the response a live `Track`.
+    #[test]
+    fn a_response_for_a_config_disabled_axis_is_ignored_even_after_authenticating() {
+        let mut state = PollState::new(false, [true, false, false]);
+        state.require_pr_auth();
+        state.clear_pr_auth();
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReadyToMerge, fresh_count(7));
+
+        assert_eq!(state.icon().ready_to_merge, Presence::No);
+        assert_eq!(state.pr_menu_label(PrAxis::ReadyToMerge), PrAxis::ReadyToMerge.menu_label());
+    }
+
+    /// A disabled axis must not be able to slow the notification half down. True today only because
+    /// the backoff fold skips `None` slots, which nothing stated.
+    #[test]
+    fn a_config_disabled_axis_contributes_no_failures_to_backoff() {
+        let mut state = PollState::new(true, [true, false, false]);
+        for _ in 0..6 {
+            state.begin_cycle();
+            state.apply_pr(PrAxis::ReadyToMerge, transient());
+        }
+        assert_eq!(
+            state.next_delay(),
+            MIN_POLL_INTERVAL,
+            "failures on a disabled axis must not back anything off"
+        );
+
+        // …while the same failures on an enabled axis do.
+        for _ in 0..4 {
+            state.begin_cycle();
+            state.apply_pr(PrAxis::ReviewRequested, transient());
+        }
+        assert!(state.next_delay() > MIN_POLL_INTERVAL, "an enabled axis still backs off");
+    }
+
+    /// A stray 401 on a disabled axis must not start a refresh grant or a device flow.
+    #[test]
+    fn a_config_disabled_axis_never_asks_for_credential_re_auth() {
+        let mut state = PollState::new(false, [true, false, false]);
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReadyToMerge, respond(PollResult::Unauthorized));
+        assert!(!state.take_pr_reauth(PrAxis::ReadyToMerge));
+
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReviewRequested, respond(PollResult::Unauthorized));
+        assert!(state.take_pr_reauth(PrAxis::ReviewRequested), "an enabled axis still asks");
+    }
+
+    /// "No search is issued" has to follow from state, not from a second copy of the config living in
+    /// the scheduler. Walks the four situations the poll loop can observe.
+    #[test]
+    fn the_poll_loop_is_told_which_axes_to_skip() {
+        let mut state = PollState::new(false, [true, false, true]);
+        let in_play = |s: &PollState| PrAxis::ALL.map(|a| s.pr_in_play(a));
+
+        assert_eq!(in_play(&state), [true, false, true], "from config");
+
+        state.require_pr_auth();
+        assert_eq!(in_play(&state), [false; 3], "nothing to search without a credential");
+
+        state.clear_pr_auth();
+        assert_eq!(in_play(&state), [true, false, true], "back to the config, not to all three");
+
+        state.disable_pr(PrAxis::ReviewRequested, "x".to_string());
+        assert_eq!(in_play(&state), [false, false, true], "a runtime disable also stops the search");
     }
 
     #[test]

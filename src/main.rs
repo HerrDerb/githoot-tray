@@ -207,7 +207,7 @@ fn main() {
     };
 
     let config = config::Config::load(&app_asset_path);
-    let tokens = if config.notifications {
+    let tokens = if config.notification_indication {
         match access_token::TokenStore::load(&app_asset_path) {
             Ok(tokens) => Some(tokens),
             Err(e) => {
@@ -216,11 +216,19 @@ fn main() {
             }
         }
     } else {
-        logln!("notifications disabled (enable with \"notifications=on\" in config.txt)");
+        logln!("notification indication off (enable with \"notificationIndication=on\" in config.txt)");
         None
     };
 
-    let pr = load_pr_credential(&app_asset_path);
+    // Skipped entirely when every PR signal is switched off. Without this guard a disabled feature
+    // would still make a network call (`installation_count`) and, on Windows and macOS, could raise a
+    // sign-in dialog — for something the user turned off.
+    let pr = if config.any_pr_enabled() {
+        load_pr_credential(&app_asset_path)
+    } else {
+        logln!("all PR signals are off in config.txt — skipping PR sign-in entirely");
+        github_app::PrStatus::Off("PR status off in config.txt".to_string())
+    };
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
@@ -339,6 +347,10 @@ fn main() {
             pr,
             app_asset_path: app_asset_path.clone(),
             update_check: config.update_check,
+            // Mapped over the axes rather than written as a literal, so the axis name appears on both
+            // sides of each pairing. A literal `[a, b, c]` compiles, type-checks, and silently swaps
+            // which bar a setting controls.
+            pr_enabled: state::PrAxis::ALL.map(|axis| config.pr_enabled(axis)),
         },
         wake_rx,
         restart_tx,
@@ -467,17 +479,25 @@ fn main() {
     update::clean_up_after_update();
 
     let config = config::Config::load(&app_asset_path);
-    let tokens = if config.notifications {
+    let tokens = if config.notification_indication {
         match access_token::TokenStore::load(&app_asset_path) {
             Ok(tokens) => Some(tokens),
             Err(e) => fatal(&format!("Could not authenticate with GitHub: {e}")),
         }
     } else {
-        logln!("notifications disabled (enable with \"notifications=on\" in config.txt)");
+        logln!("notification indication off (enable with \"notificationIndication=on\" in config.txt)");
         None
     };
 
-    let pr = load_pr_credential(&app_asset_path);
+    // Skipped entirely when every PR signal is switched off. Without this guard a disabled feature
+    // would still make a network call (`installation_count`) and, on Windows and macOS, could raise a
+    // sign-in dialog — for something the user turned off.
+    let pr = if config.any_pr_enabled() {
+        load_pr_credential(&app_asset_path)
+    } else {
+        logln!("all PR signals are off in config.txt — skipping PR sign-in entirely");
+        github_app::PrStatus::Off("PR status off in config.txt".to_string())
+    };
 
     // ── Tray ─────────────────────────────────────────────────────────────────
 
@@ -695,6 +715,10 @@ fn main() {
             pr,
             app_asset_path: app_asset_path.clone(),
             update_check: config.update_check,
+            // Mapped over the axes rather than written as a literal, so the axis name appears on both
+            // sides of each pairing. A literal `[a, b, c]` compiles, type-checks, and silently swaps
+            // which bar a setting controls.
+            pr_enabled: state::PrAxis::ALL.map(|axis| config.pr_enabled(axis)),
         },
         wake_rx,
         proxy,
