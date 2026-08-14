@@ -17,8 +17,8 @@ GitHub notification watching is still built in, as an optional extra.
 - 🔴 **Review requested** — red bar, top of the right-hand column, when a PR is waiting on your review
 - 🟢 **Ready to merge** — green bar, when your own PR is approved and passing checks
 - 🟠 **Changes requested** — amber bar, when a reviewer asked for changes on your PR
-- 🟣 **Self-updating** — checks for newer releases daily, shows an up-arrow and what changed, and
-  installs only when you say so. Every download is verified against a signature whose public key is
+- 🟢 **Self-updating** — checks for newer releases daily, shows a large green up-arrow and what changed,
+  and installs only when you say so. Every download is verified against a signature whose public key is
   compiled into the copy you already have (see [Updating](#updating))
 - 🔑 **One shared credential, nothing to register** — all three bars come from one GitHub App's
   Device Flow login. The Client ID is public and baked into the binary; you just authorize in your
@@ -59,7 +59,7 @@ The base glyph is dark, or blue when notifications are on and something is unrea
 | 🔴 rounded bar | Right column, slot 1 | A PR is waiting on your review |
 | 🟢 rounded bar | Right column, slot 2 | One of your PRs is approved and passing |
 | 🟠 rounded bar | Right column, slot 3 | A reviewer asked for changes on your PR |
-| 🟣 up-arrow | Top-left | A newer release is available |
+| 🟢 up-arrow | Top-left | A newer release is available |
 | 🔴 exclamation | Right-hand side | PR status is not authorized yet |
 
 The three PR bars stack in one column down the right-hand side, so there is one place to look rather
@@ -87,7 +87,7 @@ On macOS the bare binary works from a terminal, but it takes a Dock icon and an 
 `LSUIElement` can only be set in an app bundle. To get the real thing:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 1.3.1
+scripts/bundle-macos.sh target/release/git-system-tray dist 1.3.2
 open dist/git-system-tray.app
 ```
 
@@ -236,8 +236,8 @@ poll → conditional notifications→fresh, ReviewRequested→fresh, ReadyToMerg
 ## Updating
 
 The app checks GitHub for a newer release once a day, and immediately at startup. When it finds one, a
-violet up-arrow appears in the top-left of the tray icon and an **Install update** entry appears in the
-menu carrying the new version number.
+large green up-arrow appears in the top-left of the tray icon and an **Install update** entry appears in
+the menu carrying the new version number.
 
 Picking it shows what changed — the release notes of **every** version between the one installed and the
 newest, not just the latest — and asks before doing anything. Nothing is ever installed silently. On
@@ -322,6 +322,25 @@ than silent. `the_compiled_in_key_parses` catches a bad paste at test time.
 Rotating the key means shipping a release signed with the *old* key that carries the *new* one, since
 users can only verify with the key they already have. That is the unavoidable cost of the guarantee. The
 signature tests use a throwaway fixture key, so they survive a rotation without being regenerated.
+
+### Releases are immutable
+
+Once published, a release's assets and its Git tag are frozen: nothing can be added, changed or deleted,
+and the tag cannot be moved or removed. GitHub also generates a signed release attestation.
+
+That shapes how the workflow is built. It creates the release as a **draft**, attaches the three binaries
+and the signed manifest to the draft, and only then publishes — because after publication no asset can be
+attached. The consequences worth knowing:
+
+- **A release cannot be re-cut.** Re-running the workflow against a published tag is refused outright,
+  rather than half-succeeding and leaving a release without its signed manifest. Cut a new patch tag.
+- **A broken release cannot be repaired in place.** Fix forward.
+- Attestations do **not** replace the minisign signature the updater checks: an attestation is verified
+  against GitHub over the network, while the updater verifies offline against a key compiled into the
+  copy already installed. That offline property is the point, so both exist.
+
+Immutability applies only to releases published after the repository setting was enabled, and turning the
+setting off again does not un-freeze anything already published under it.
 
 ### Version numbers
 

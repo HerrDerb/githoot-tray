@@ -9,7 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  # ── 1. Create release with commit changelog ──────────────────────────────────
+  # ── 1. Create the release as a DRAFT, with the commit changelog ──────────────
+  #
+  # A draft, not a published release, and that ordering is the whole shape of this workflow.
+  #
+  # With release immutability enabled, a published release's assets cannot be added, changed or deleted,
+  # so anything that attaches an asset has to happen *before* publication. GitHub's guidance is to create
+  # a draft, attach everything, then publish — which is what jobs 2 to 5 below do, in that order.
+  #
+  # This also means a re-run against an already-published release cannot work, and must not pretend to.
+  # See the refusal at the end of this job.
   release-notes:
     runs-on: ubuntu-latest
     steps:
@@ -54,20 +63,32 @@ jobs:
           CHANGELOG=$(git log ${RANGE} --oneline --no-merges)
           printf '%s\n\n%s\n' "$HEADING" "${CHANGELOG:-_No new commits in this range._}" > notes.md
 
-          # The release may already exist. Creating one through the GitHub UI or with
-          # `gh release create` also creates the tag, and that tag push is what triggers this
-          # workflow — so the job can be triggered by the very release it is trying to create.
+          # The release may already exist. Creating one through the GitHub UI, or with
+          # `gh release create`, also creates the tag, and that tag push is what triggers this
+          # workflow — so this job can be triggered by the very release it is trying to create.
           if gh release view "$CURRENT_TAG" >/dev/null 2>&1; then
+            IS_DRAFT=$(gh release view "$CURRENT_TAG" --json isDraft --jq '.isDraft')
+            if [ "$IS_DRAFT" != "true" ]; then
+              # Refused rather than attempted. Under immutability the asset uploads in the jobs below
+              # would be rejected anyway, and a run that half-succeeds is worse than one that stops: it
+              # leaves a published release missing its signed manifest, which the updater then refuses
+              # with a confusing "no entry in the signed sums file".
+              echo "::error::Release $CURRENT_TAG is already published, so its assets cannot be" \
+                   "changed. Cut a new patch tag instead of re-running this one."
+              exit 1
+            fi
+
             EXISTING=$(gh release view "$CURRENT_TAG" --json body --jq '.body // ""' | tr -d '[:space:]')
             if [ -z "$EXISTING" ]; then
-              echo "Release $CURRENT_TAG exists with empty notes — filling in the changelog."
+              echo "Draft $CURRENT_TAG exists with empty notes — filling in the changelog."
               gh release edit "$CURRENT_TAG" --notes-file notes.md
             else
               # Never clobber notes a human wrote by hand.
-              echo "Release $CURRENT_TAG already has notes — leaving them untouched."
+              echo "Draft $CURRENT_TAG already has notes — leaving them untouched."
             fi
           else
             gh release create "$CURRENT_TAG" \
+              --draft \
               --title "$CURRENT_TAG" \
               --notes-file notes.md
           fi
@@ -75,7 +96,6 @@ jobs:
   # ── 2. Build release binaries for Windows and Linux ─────────────────────────
   build:
     needs: release-notes
-    if: always()
     strategy:
       fail-fast: false
       matrix:
@@ -119,14 +139,26 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
         shell: bash
 
-      - name: Attach binary to release
+      - name: Attach binary to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           gh release upload "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
             "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
             --clobber
+
+      # Also handed to the sign job as a workflow artifact, rather than having it download from the
+      # release. Whether `gh release download` works against a *draft* is undocumented, and the signing
+      # step is not somewhere to rely on an unverified capability. This way the digests are computed over
+      # exactly the bytes this job built, in the same run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 1
 
   # ── 3. Build the macOS .app bundle ──────────────────────────────────────────
   # A separate job rather than a third matrix entry: this one needs bundling, signing and zipping
@@ -135,7 +167,6 @@ jobs:
   # working Windows and Linux path is left exactly as it was.
   build-macos:
     needs: release-notes
-    if: always()
     # Pinned rather than `macos-latest` so the runner architecture cannot change under us: the
     # artefact name promises aarch64.
     runs-on: macos-14
@@ -165,13 +196,21 @@ jobs:
             dist \
             "${GITHUB_REF_NAME#v}"
 
-      - name: Attach bundle to release
+      - name: Attach bundle to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             dist/git-system-tray-macos-aarch64.zip \
             --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-macos
+          path: dist/git-system-tray-macos-aarch64.zip
+          if-no-files-found: error
+          retention-days: 1
 
   # ── 4. Sign the release assets ──────────────────────────────────────────────
   # This is what makes the self-updater safe, and it is the only part of the chain that provides
@@ -190,18 +229,26 @@ jobs:
     needs: [build, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - name: Download the release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # From the build jobs' artifacts, not from the release. The release is still a draft at this point,
+      # and `gh release download`'s behaviour against a draft is undocumented; this also means the digests
+      # cover exactly what was built in this run.
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+
+      - name: Collect the assets
         run: |
           set -euo pipefail
-          mkdir -p dist && cd dist
-          gh release download "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --pattern 'git-system-tray' \
-            --pattern 'git-system-tray.exe' \
-            --pattern 'git-system-tray-macos-aarch64.zip'
-          ls -l
+          mkdir -p dist
+          # `download-artifact` without a name puts each artifact in its own subdirectory, so flatten.
+          find incoming -type f -exec mv -t dist {} +
+          ls -l dist
+          # All three must be present. Hashing two of three would publish a manifest that silently does
+          # not cover a platform, and the updater would then refuse that platform with a message about a
+          # missing entry rather than the truth.
+          for f in git-system-tray git-system-tray.exe git-system-tray-macos-aarch64.zip; do
+            test -s "dist/$f" || { echo "::error::dist/$f is missing or empty"; exit 1; }
+          done
 
       - name: Hash them
         run: |
@@ -261,3 +308,41 @@ jobs:
             dist/sha256sums.txt \
             dist/sha256sums.txt.minisig \
             --clobber
+
+  # ── 5. Publish the draft ────────────────────────────────────────────────────
+  # The last thing that happens, and deliberately so: publication is the point of no return once release
+  # immutability is enabled — the assets and the tag are frozen, and a signed release attestation is
+  # generated. Everything that needs to attach a file has already run.
+  #
+  # Note this is *not* redundant with the minisign signature the updater checks. An attestation is
+  # verified against GitHub, over the network; the updater's signature is verified offline against a key
+  # compiled into the copy already installed, which is the property its whole trust model rests on.
+  publish:
+    needs: sign
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
+
+      - name: Confirm it is actually published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # `gh release edit` exiting 0 is not proof. A release left as a draft is invisible to everyone
+          # except repository collaborators, so this would otherwise be a silent non-release.
+          STATE=$(gh release view "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --json isDraft,isImmutable \
+            --jq '"draft=\(.isDraft) immutable=\(.isImmutable)"')
+          echo "$STATE"
+          case "$STATE" in
+            draft=false*) echo "published" ;;
+            *) echo "::error::release is still a draft"; exit 1 ;;
+          esac

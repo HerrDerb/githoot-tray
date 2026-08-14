@@ -85,16 +85,29 @@ const INDICATOR_COLORS: [[u8; 4]; 3] = [REVIEW_DOT_COLOR, MERGE_DOT_COLOR, CHANG
 // the icon has to be able to show both. That is what takes the packed variant index from four bits to
 // five — see `IconSet`.
 
-/// The arrow's colour. Violet, chosen to be unmistakable against the three indicator hues (red, green,
-/// amber) *and* against the blue unread-notifications glyph it may be drawn on top of. It is the only
-/// colour here that is not already in use, which is the point: a new meaning gets a new colour rather
-/// than borrowing one and making two things ambiguous.
-const UPDATE_ARROW_COLOR: [u8; 4] = [0x7A, 0x5C, 0xF0, 0xFF];
+/// The arrow's colour: a bright green, deliberately **not** `MERGE_DOT_COLOR`.
+///
+/// Green because that is the conventional "there is something good waiting for you" colour, and a
+/// *brighter* green than the merge bar because the icon's one rule is that a colour means exactly one
+/// thing. Reusing the merge green would leave the icon impossible to describe without also saying where
+/// the mark is — "green means an update, unless it is on the right, in which case a PR is mergeable".
+/// Position already distinguishes them; the hue not having to do that work as well is what keeps this
+/// legible.
+const UPDATE_ARROW_COLOR: [u8; 4] = [0x2B, 0xE8, 0x6B, 0xFF];
 /// Distance from the icon's top and left edges to the arrow's bounding box, as a fraction of width.
 const ARROW_MARGIN_RATIO: f32 = 0.045;
 /// Arrow width as a fraction of icon width, and total height as a fraction of icon height.
-const ARROW_WIDTH_RATIO: f32 = 0.33;
-const ARROW_HEIGHT_RATIO: f32 = 0.37;
+///
+/// Sized to fill the top-left quadrant. The first version at 0.33 × 0.37 was too easy to miss at the
+/// 16px a taskbar actually renders — the point of an update indicator is being noticed without being
+/// looked for.
+///
+/// These are the constants with the least headroom in this file: at 0.48 the arrow plus its border
+/// reaches roughly x 54 of 98, and the indicator bars plus theirs begin near x 59. Raising the width
+/// much further makes the two collide, which is what `the_arrow_never_reaches_the_indicator_column`
+/// exists to catch. If that test fails after a change here, the width is wrong, not the test.
+const ARROW_WIDTH_RATIO: f32 = 0.48;
+const ARROW_HEIGHT_RATIO: f32 = 0.52;
 /// Where the triangular head ends and the shaft begins, as a fraction of the arrow's own height.
 /// Above this is head, below is shaft.
 const ARROW_HEAD_SPLIT: f32 = 0.55;
@@ -953,7 +966,7 @@ mod tests {
     /// Both parts have to be drawn. A head with no shaft is a triangle, and a shaft with no head is a
     /// bar — neither reads as "up".
     #[test]
-    fn both_parts_of_the_arrow_are_opaque_violet() {
+    fn both_parts_of_the_arrow_are_opaque_and_the_arrow_colour() {
         let out = with_update_arrow(&base());
         let (head, shaft) = arrow_probes();
         for (label, (x, y)) in [("head", head), ("shaft", shaft)] {
