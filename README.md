@@ -6,8 +6,11 @@ notifications are an optional extra. It keeps itself up to date.
 
 Nothing here shells out to the `gh` CLI; every credential comes from GitHub's own Device Flow.
 
-> **Transparency notice:** largely built with AI assistance. The human author reviewed, guided and
-> directed the work throughout.
+> **Transparency notice:** largely built with AI assistance — specifically Claude (Anthropic), driven
+> through Claude Code, which did the bulk of the hauling: most of the code, the tests, the release
+> workflow and this README. The human author set the goals, reviewed and directed the work throughout,
+> and is accountable for what ships. Roughly half the commits carry a `Co-Authored-By: Claude` trailer,
+> so `git log` shows where that help actually landed.
 
 ---
 
