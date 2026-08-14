@@ -24,9 +24,13 @@ The base glyph is dark, or blue when notifications are on and something is unrea
 | 🟢 up-arrow | Top-left | A newer release is available |
 | 🔴 exclamation | Right-hand side | PR status is not authorized yet |
 
-The three PR bars stack in one column, so there is one place to look rather than three corners. A fourth
-slot is laid out but unused, reserved so a future signal needs no re-tuning. Positions are fixed, so a
-bar always means the same thing.
+The three PR bars stack in one column, so there is one place to look rather than three corners, and they
+fill nearly the whole height — 92 of 96 pixels. Positions are fixed, so a bar always means the same thing
+and switching one off leaves a gap rather than closing up.
+
+There is deliberately no spare slot. One was reserved for a while for a signal that never arrived, and
+holding it open cost a quarter of the icon's height, taken straight out of the bars that do exist. Adding a
+fourth signal later means re-tuning the geometry, which is the right way round.
 
 Everything combines freely except one case: the exclamation *replaces* the bars, because with no
 credential there are no answers to draw. The arrow still shows beside it.
@@ -42,7 +46,7 @@ cargo build --release          # -> target/release/git-system-tray
 On macOS the bare binary takes a Dock icon and an app menu, because `LSUIElement` needs a bundle:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 1.4.0
+scripts/bundle-macos.sh target/release/git-system-tray dist 1.4.1
 open dist/git-system-tray.app
 ```
 

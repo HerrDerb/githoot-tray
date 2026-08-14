@@ -8,8 +8,8 @@
 //!     your PRs
 //!
 //! The three indicators are stacked in a column down the right-hand side, as rounded bars twice as
-//! wide as they are tall. They used to be discs in three separate corners; one column reads as a
-//! single place to look instead of three, and gives a fourth slot somewhere obvious to go.
+//! wide as they are tall, filling nearly the whole height. They used to be discs in three separate
+//! corners; one column reads as a single place to look instead of three.
 //!
 //! Everything is composited at runtime rather than shipped as extra PNGs, so there is one code
 //! path, the variants can never drift between the two base icons, and `assets/` stays at two files.
@@ -34,23 +34,30 @@ const GITHUB_BLUE_ICON: &[u8] = include_bytes!("../assets/github_blue.png");
 // stops separating anything at all. So the column cannot be made to fit more slots by tightening the
 // gaps — extra slots have to come out of the bar height instead.
 //
-// Four slots at 15px bars and 7px gaps was chosen over 16/6 (red and green merge at 16px) and 13/9
-// (bars start to look thin), rendered and compared at 16px and 22px.
+// Sized to use nearly all of the available height: three slots at 26px with 7px gaps occupy 92 of 96
+// pixels. An earlier four-slot layout reserved a spare slot and used only 81, which left the bars too
+// small to notice at the 16px a taskbar actually renders — the reservation was costing the feature that
+// exists today to benefit one that does not.
+//
+// Width is capped by the update arrow, not by the canvas: the arrow sits in the top-left and its colour
+// reaches x 38 of 98, so a bar growing leftward would eventually collide with it. At 52px wide the two
+// stay 4px apart. `the_arrow_never_reaches_the_indicator_column` is what holds that.
 
-/// How many slots the column reserves.
+/// How many slots the column has: exactly one per signal.
 ///
-/// Deliberately one more than the three signals in use. Reserving the space now is free; discovering
-/// later that a fourth signal has nowhere to go means re-tuning every ratio here and re-checking them
-/// all at 16px. Slot 4 is laid out but never drawn, so it costs only the height it holds open.
-const INDICATOR_SLOTS: usize = 4;
-/// Bar height as a fraction of icon height.
-const BAR_HEIGHT_RATIO: f32 = 0.156;
+/// A fourth was reserved for a while, for a signal that never arrived. Holding it open cost 22px of
+/// height — a quarter of the icon — which came straight out of the bars that do exist. If a fourth
+/// signal is ever added, every ratio here has to be re-tuned and re-checked at 16px; that is the price
+/// of the bars being legible now, and it is the right way round.
+const INDICATOR_SLOTS: usize = 3;
+/// Bar height as a fraction of icon height. 26px of 96, so three bars and two gaps fill 92.
+const BAR_HEIGHT_RATIO: f32 = 0.271;
 /// Bar width as a multiple of its height. Wider than tall so a bar reads as a bar and not a dot.
 const BAR_ASPECT: f32 = 2.0;
 /// Vertical gap between bars, as a fraction of icon height. See the constraint above before lowering.
 const BAR_GAP_RATIO: f32 = 0.073;
 /// Gap between the column's right edge and the icon's, as a fraction of icon width.
-const BAR_RIGHT_MARGIN_RATIO: f32 = 0.061;
+const BAR_RIGHT_MARGIN_RATIO: f32 = 0.041;
 /// Width of the transparent border carved around each bar, in source pixels.
 ///
 /// Not a soft ring: the border is a bar-shaped hole punched to full transparency, one of these
@@ -98,16 +105,19 @@ const UPDATE_ARROW_COLOR: [u8; 4] = [0x2B, 0xE8, 0x6B, 0xFF];
 const ARROW_MARGIN_RATIO: f32 = 0.045;
 /// Arrow width as a fraction of icon width, and total height as a fraction of icon height.
 ///
-/// Sized to fill the top-left quadrant. The first version at 0.33 × 0.37 was too easy to miss at the
-/// 16px a taskbar actually renders — the point of an update indicator is being noticed without being
-/// looked for.
+/// The arrow and the bars compete for the middle of the icon, and this is the constant that settles it.
 ///
-/// These are the constants with the least headroom in this file: at 0.48 the arrow plus its border
-/// reaches roughly x 54 of 98, and the indicator bars plus theirs begin near x 59. Raising the width
-/// much further makes the two collide, which is what `the_arrow_never_reaches_the_indicator_column`
-/// exists to catch. If that test fails after a change here, the width is wrong, not the test.
-const ARROW_WIDTH_RATIO: f32 = 0.48;
-const ARROW_HEIGHT_RATIO: f32 = 0.52;
+/// It was briefly 0.48, which made the arrow unmissable but had two costs that only showed on a real
+/// tray: it capped how wide the bars could grow, and it *hollowed out* the octocat's upper left —
+/// thinning the ring's top rows from 52 opaque pixels to 28 while the bottom stayed full, so the glyph
+/// read as sitting low even though its centroid and bounding box were unchanged. Neither measurement
+/// catches that; the eye does.
+///
+/// At 0.34 the arrow's colour reaches x 38 of 98 and the bars begin at x 42, so the two are 4px apart
+/// and the glyph keeps its shape. `the_arrow_never_reaches_the_indicator_column` fails if this grows far
+/// enough to collide again — if it does, this is wrong, not the test.
+const ARROW_WIDTH_RATIO: f32 = 0.34;
+const ARROW_HEIGHT_RATIO: f32 = 0.37;
 /// Where the triangular head ends and the shaft begins, as a fraction of the arrow's own height.
 /// Above this is head, below is shaft.
 const ARROW_HEAD_SPLIT: f32 = 0.55;
@@ -785,24 +795,33 @@ mod tests {
         }
     }
 
-    /// The reserved fourth slot must actually be held open: the three lit bars have to sit in the top
-    /// three of four positions, leaving the bottom one empty. If the column silently re-centred on
-    /// three, adding a fourth signal later would move every existing bar.
+    /// One slot per signal, and no more.
+    ///
+    /// A fourth was reserved for a while and this test asserted it stayed empty. Holding it open cost a
+    /// quarter of the icon's height, taken straight out of the bars that do exist, so the reservation
+    /// was dropped — and the assertion inverted: there must now be *exactly* as many slots as signals,
+    /// because a spare one would be that cost creeping back.
     #[test]
-    fn the_fourth_slot_is_reserved_and_left_empty() {
-        assert_eq!(INDICATOR_SLOTS, 4, "this test describes a four-slot column");
+    fn there_is_exactly_one_slot_per_signal() {
+        assert_eq!(INDICATOR_SLOTS, INDICATOR_COLORS.len(), "one slot per signal, no spares");
+        assert_eq!(INDICATOR_SLOTS, crate::state::PrAxis::ALL.len(), "and one signal per PR axis");
+    }
 
+    /// The column is centred as a block, so the empty space is split evenly rather than all landing at
+    /// one end. With the stack filling 92 of 96 there is little to split, which is the point.
+    #[test]
+    fn the_column_is_centred_as_a_block() {
         let out = with_indicator_bars(&base(), [true, true, true]);
-        let src = base();
-        let (cx, cy) = slot_centre(3);
+        let is_bar = |px: &Rgba<u8>| px[3] > 200 && INDICATOR_COLORS.contains(&px.0);
 
-        assert_eq!(
-            out.get_pixel(cx, cy).0,
-            src.get_pixel(cx, cy).0,
-            "slot 4 must be untouched — reserved, not drawn"
+        let rows: Vec<u32> = (0..96).filter(|&y| (0..98).any(|x| is_bar(out.get_pixel(x, y)))).collect();
+        let (top, bottom) = (rows[0], rows[rows.len() - 1]);
+        let (above, below) = (top, 95 - bottom);
+        assert!(
+            (above as i32 - below as i32).abs() <= 1,
+            "column sits {above}px from the top and {below}px from the bottom"
         );
-        // And it must be inside the canvas, or "reserved" would mean nothing.
-        assert!(cy < 96, "slot 4 must fall within the icon, got y={cy}");
+        assert!(above <= 4, "the column should use nearly the whole height, {above}px is too much slack");
     }
 
     /// Nothing lit must leave the base icon completely untouched, so a quiet state is exactly the
@@ -1086,24 +1105,25 @@ mod tests {
         assert_eq!(set.get(true, true, true, true, true).as_raw(), set.variants[0b11111].as_raw());
     }
 
-    /// Geometric proof, independent of the rendered-pixel tests above, that the whole column fits.
+    /// Geometric proof, independent of the rendered-pixel tests above, that the column fits.
     ///
     /// Two things have to hold at once and they pull against each other, which is exactly why this is
-    /// asserted rather than eyeballed: all four slots plus their borders must fit inside the icon's
-    /// height, and the gap between two bars must survive being scaled to a 16px tray slot. Shrink the
-    /// gap to buy room for a fifth slot and the second assertion fails.
+    /// asserted rather than eyeballed: the three bars must fit inside the icon's height, and the gap
+    /// between two of them must survive being scaled to a 16px tray slot. Shrink the gap to buy room
+    /// for a fourth slot and the second assertion fails.
     #[test]
-    fn the_four_slot_column_fits_and_its_gaps_survive_scaling() {
+    fn the_column_fits_and_its_gaps_survive_scaling() {
         let bar_h = 96.0 * BAR_HEIGHT_RATIO;
         let gap = 96.0 * BAR_GAP_RATIO;
         let slots = INDICATOR_SLOTS as f32;
 
         let stack = slots * bar_h + (slots - 1.0) * gap;
-        assert!(
-            stack + 2.0 * BAR_BORDER_PX <= 96.0,
-            "column plus borders is {:.1}px, taller than the 96px icon",
-            stack + 2.0 * BAR_BORDER_PX
-        );
+        assert!(stack <= 96.0, "the bars themselves are {stack:.1}px, taller than the 96px icon");
+        // Deliberately *not* `stack + 2 * BAR_BORDER_PX <= 96.0`. With the column filling nearly the
+        // whole height the top and bottom bars' transparent borders run off the edge and are clipped,
+        // exactly as the authorization mark's ring already is. Clipping a transparent border costs
+        // nothing; leaving 6px of height unused to avoid it would cost the bars their legibility.
+        assert!(stack > 96.0 - 3.0 * bar_h, "the column should use most of the height, not a third");
 
         // A gap below one rendered pixel separates nothing. 96px of source becomes 16px of tray.
         let rendered_gap = gap * 16.0 / 96.0;
