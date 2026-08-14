@@ -253,7 +253,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # `--repo` is required: this job deliberately does not check the repository out (it only needs
+          # the published assets), so `gh` has no git remote to infer the repo from. The download step
+          # above passes it for the same reason; omitting it here is what broke the v1.3.0 run.
           gh release upload "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
             dist/sha256sums.txt \
             dist/sha256sums.txt.minisig \
             --clobber
