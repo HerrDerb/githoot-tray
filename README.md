@@ -78,11 +78,17 @@ be **installed** on that org — see [PR status](#pr-status).
 | **Open GitHub Notifications** | Notifications on and something unread | Opens them, then re-checks a few seconds later |
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
 | **Open Ready to Merge (N)** | One of yours is approved and passing | Opens exactly what the green bar counts |
-| **Open Changes Requested (N)** | A reviewer asked for changes | Opens exactly what the amber bar counts |
+| **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
 | **Quit** | Always | Exits |
 
-Every list URL is generated from the same query its bar counts, so a page can never disagree with the
-icon. Labels carry the exact count, unbounded.
+The requested-reviews and ready-to-merge URLs are generated from the same query their bar counts, so
+those pages cannot disagree with the icon. Labels carry the exact count, unbounded.
+
+**Changes requested is the one exception.** Its bar counts pull requests where a reviewer asked for
+changes *and no re-review is pending from that reviewer* — so once you push fixes and re-request the
+review, the bar goes dark. GitHub's web search cannot express that condition, so the menu entry opens
+the unfiltered list, which may still include a pull request you have already handed back. The bar is the
+accurate one.
 
 ---
 
@@ -127,6 +133,17 @@ Three independent signals, each a GitHub Search query against your own pull requ
 "Ready to merge" is an approximation — Search has no single "mergeable" qualifier — so it can read wrong
 where branch protection needs multiple approvals, named reviewers, or checks the combined commit status
 does not reflect.
+
+**Changes requested does one thing more than its query.** Re-requesting a review does not dismiss the
+reviewer's earlier verdict, so `review:changes_requested` keeps matching a pull request you have already
+handed back, and the bar used to stay lit until the reviewer replied. That query is now sent through
+GraphQL, which also returns each pull request's pending review requests, and a hit is counted only when
+**no re-review is pending from a reviewer who requested changes**. Adding a *different* reviewer does not
+clear it — the original objection still stands. A pending *team* request does not clear it either, since a
+team has no login to match against the blocker; erring that way keeps the bar lit rather than hiding work.
+
+Caps, which undercount rather than overcount: the first 100 matching pull requests, and the first 20
+reviews and 20 pending requests within each.
 
 ### Why a GitHub App
 

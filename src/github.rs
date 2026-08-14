@@ -13,7 +13,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NOTIFICATIONS_URL: &str = "https://api.github.com/notifications";
 const SEARCH_URL: &str = "https://api.github.com/search/issues";
+const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const AGENT: &str = "git-system-tray";
+
+/// How many search hits the changes-requested query inspects, and how many reviews and pending
+/// requests it reads per hit.
+///
+/// Both are caps rather than pagination, and both undercount rather than overcount: past 100
+/// matching pull requests the extras are simply not seen, and a pull request with more than 20
+/// opinionated reviews or 20 pending review requests could be judged on a partial list. Neither
+/// figure is reachable by the inbox this app exists for, and paginating would trade a real
+/// increase in complexity for a case nobody has.
+const CHANGES_HITS_CAP: u32 = 100;
+const CHANGES_REVIEWS_CAP: u32 = 20;
 
 /// Kept well under the 60s poll floor so a stalled request cannot delay the next one.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -126,6 +138,43 @@ pub fn poll_reviews(client: &Client, token: &str, query: &str) -> PollResponse {
     send(request, token, None, parse_search_total)
 }
 
+/// The one query that cannot be a `total_count` read.
+///
+/// Re-requesting a review does not dismiss the reviewer's earlier `CHANGES_REQUESTED` verdict — it only
+/// puts a pending request back on them. So GitHub keeps reporting `reviewDecision: CHANGES_REQUESTED`, and
+/// `review:changes_requested` keeps matching, for a pull request whose ball is squarely in the reviewer's
+/// court. Measured, not assumed: see the tests below for the exact payload shape.
+///
+/// The only field that separates "still on me" from "handed back" is `reviewRequests`, and Search has no
+/// qualifier for it — `review:` accepts only `none`/`required`/`approved`/`changes_requested`, which are
+/// mutually exclusive projections of the same `reviewDecision`. Hence GraphQL: the same server-side query
+/// string, plus the two lists needed to intersect client-side.
+const CHANGES_REQUESTED_DOCUMENT: &str = "\
+query($q:String!,$hits:Int!,$reviews:Int!){\
+  search(query:$q,type:ISSUE,first:$hits){\
+    nodes{...on PullRequest{\
+      latestOpinionatedReviews(first:$reviews){nodes{state author{login}}}\
+      reviewRequests(first:$reviews){nodes{requestedReviewer{__typename ...on User{login}}}}\
+    }}\
+  }\
+}";
+
+/// Polls the user's own pull requests where a reviewer requested changes and the work is *still on them*.
+///
+/// `query` is the same Search query string the other axes use, handed to GraphQL's `search` verbatim, so
+/// the server-side filter is unchanged and only the client-side intersection is new.
+///
+/// No `If-None-Match`: GraphQL is a POST and does not answer `304`.
+pub fn poll_changes_requested(client: &Client, token: &str, query: &str) -> PollResponse {
+    let body = serde_json::json!({
+        "query": CHANGES_REQUESTED_DOCUMENT,
+        "variables": { "q": query, "hits": CHANGES_HITS_CAP, "reviews": CHANGES_REVIEWS_CAP },
+    });
+    let request = client.post(GRAPHQL_URL).json(&body);
+
+    send(request, token, None, parse_changes_requested)
+}
+
 /// Shared request/response plumbing for both endpoints.
 fn send(
     request: reqwest::blocking::RequestBuilder,
@@ -181,6 +230,146 @@ fn parse_search_total(body: &str) -> Result<(bool, Option<u32>), String> {
     serde_json::from_str::<SearchResult>(body)
         .map(|r| (r.total_count > 0, Some(r.total_count)))
         .map_err(|e| format!("unparseable search payload: {e}"))
+}
+
+// ─── The changes-requested payload ────────────────────────────────────────────
+//
+// Every level is optional or lenient on purpose. GraphQL is free to answer with partial `data`
+// alongside `errors`, and a node the token cannot fully see comes back with fields missing rather
+// than as a failure. Each such hole is read as "no evidence this was handed back", which keeps the
+// bar lit — see `still_on_you` for why that direction is the safe one.
+
+#[derive(Debug, Deserialize)]
+struct GraphQlResponse {
+    #[serde(default)]
+    data: Option<GraphQlData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlData {
+    search: SearchConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchConnection {
+    nodes: Vec<Option<PullRequestNode>>,
+}
+
+/// A search hit. Both fields are `Option` because a node that is not a pull request matches the
+/// inline fragment with an empty object — `is:pr` should prevent that, but the type system is a
+/// cheaper guarantee than the query string.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestNode {
+    latest_opinionated_reviews: Option<ReviewConnection>,
+    review_requests: Option<RequestConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewConnection {
+    nodes: Vec<Option<Review>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Review {
+    state: String,
+    /// `None` for a review whose author has since been deleted.
+    author: Option<Author>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestConnection {
+    nodes: Vec<Option<ReviewRequest>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewRequest {
+    requested_reviewer: Option<RequestedReviewer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestedReviewer {
+    #[serde(rename = "__typename")]
+    typename: String,
+    /// Present for a `User`; absent for a `Team`, which is the whole reason `typename` is read.
+    login: Option<String>,
+}
+
+/// Whether this pull request is still waiting on *you* rather than on a reviewer.
+///
+/// The rule: a pending review request from someone who actually requested changes means you handed it
+/// back. A pending request from anyone else does not — adding a fresh reviewer while the original
+/// blocker's objection stands leaves the work with you.
+///
+/// Both fallbacks below return `true`, i.e. keep the bar lit. A lit bar that should be dark costs a
+/// glance; a dark bar that should be lit hides work you owe someone, which is the failure this whole
+/// module is written to avoid.
+fn still_on_you(pr: &PullRequestNode) -> bool {
+    let blockers: Vec<&str> = pr
+        .latest_opinionated_reviews
+        .iter()
+        .flat_map(|c| c.nodes.iter().flatten())
+        .filter(|review| review.state == "CHANGES_REQUESTED")
+        .filter_map(|review| review.author.as_ref().map(|a| a.login.as_str()))
+        .collect();
+
+    // GitHub matched `review:changes_requested` but names nobody we can intersect against — a deleted
+    // account, or a review list truncated by the cap. Trust the server's verdict over our own reading.
+    if blockers.is_empty() {
+        return true;
+    }
+
+    let handed_back = pr
+        .review_requests
+        .iter()
+        .flat_map(|c| c.nodes.iter().flatten())
+        .filter_map(|request| request.requested_reviewer.as_ref())
+        // A pending *team* request has no login to match. Resolving membership would cost extra
+        // requests and org-level permissions to settle a case that barely occurs, since re-requesting
+        // a review re-requests the individual. Treated as "not handed back".
+        .filter(|reviewer| reviewer.typename == "User")
+        .filter_map(|reviewer| reviewer.login.as_deref())
+        .any(|login| blockers.contains(&login));
+
+    !handed_back
+}
+
+/// Success-body parser for the changes-requested GraphQL query.
+///
+/// GraphQL answers `200 OK` and puts failures in an `errors` array, so `classify_with` cannot see them
+/// from the status line. A parser that read only `data` would turn any such failure into a confident
+/// **zero** — a dark bar meaning "the request broke". Errors are therefore checked before anything else
+/// and surface as `Err`, which becomes `Transient`, which leaves the previous count standing.
+fn parse_changes_requested(body: &str) -> Result<(bool, Option<u32>), String> {
+    let response: GraphQlResponse = serde_json::from_str(body)
+        .map_err(|e| format!("unparseable changes-requested payload: {e}"))?;
+
+    if !response.errors.is_empty() {
+        let joined =
+            response.errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("; ");
+        return Err(format!("GraphQL reported an error: {joined}"));
+    }
+
+    let search = response
+        .data
+        .ok_or_else(|| "GraphQL answered with neither data nor errors".to_string())?
+        .search;
+
+    let count = search.nodes.iter().flatten().filter(|pr| still_on_you(pr)).count() as u32;
+    Ok((count > 0, Some(count)))
 }
 
 /// Maps one HTTP response onto a `PollResult`.
@@ -338,6 +527,172 @@ mod tests {
             notif(StatusCode::OK, &headers(&[]), "not json at all", 0),
             PollResult::Transient(_)
         ));
+    }
+
+    // ── Changes-requested body parsing ────────────────────────────────────────
+
+    /// Shorthand: classify a CHANGES-REQUESTED (GraphQL) response.
+    fn changes(status: StatusCode, h: &HeaderMap, body: &str, now: u64) -> PollResult {
+        classify_with(status, h, body, now, parse_changes_requested)
+    }
+
+    /// One search hit, described by who blocked it and who has a re-review pending.
+    ///
+    /// `blockers` are logins whose latest opinionated review requested changes; `pending` are
+    /// `(typename, login)` pairs for the pending review requests, so a `Team` can be expressed.
+    fn hit(blockers: &[&str], pending: &[(&str, &str)]) -> String {
+        let reviews = blockers
+            .iter()
+            .map(|l| format!(r#"{{"state":"CHANGES_REQUESTED","author":{{"login":"{l}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let requests = pending
+            .iter()
+            .map(|(kind, login)| {
+                let reviewer = if *kind == "Team" {
+                    format!(r#"{{"__typename":"Team","name":"{login}"}}"#)
+                } else {
+                    format!(r#"{{"__typename":"User","login":"{login}"}}"#)
+                };
+                format!(r#"{{"requestedReviewer":{reviewer}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"reviewRequests":{{"nodes":[{requests}]}}}}"#
+        )
+    }
+
+    fn payload(hits: &[String]) -> String {
+        format!(r#"{{"data":{{"search":{{"nodes":[{}]}}}}}}"#, hits.join(","))
+    }
+
+    fn count_of(body: &str) -> u32 {
+        match changes(StatusCode::OK, &headers(&[]), body, 0) {
+            PollResult::Fresh { count: Some(n), .. } => n,
+            other => panic!("expected Fresh with a count, got {:?}", other),
+        }
+    }
+
+    /// The bug this whole endpoint switch exists for: changes applied, review re-requested, and the
+    /// bar stayed lit because `review:changes_requested` still matched.
+    #[test]
+    fn a_re_review_pending_from_the_blocker_is_not_on_you() {
+        let body = payload(&[hit(&["alice"], &[("User", "alice")])]);
+        match changes(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(!present, "handed back to the reviewer, so nothing is on you");
+                assert_eq!(count, Some(0));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn changes_requested_with_nothing_pending_is_still_on_you() {
+        assert_eq!(count_of(&payload(&[hit(&["alice"], &[])])), 1);
+    }
+
+    /// Adding a fresh reviewer is not the same as addressing the blocker's objection.
+    #[test]
+    fn a_pending_request_for_someone_else_leaves_it_on_you() {
+        assert_eq!(count_of(&payload(&[hit(&["alice"], &[("User", "bob")])])), 1);
+    }
+
+    /// A team has no login to intersect, so it cannot prove the blocker was asked again.
+    #[test]
+    fn a_pending_team_request_does_not_count_as_handing_it_back() {
+        assert_eq!(count_of(&payload(&[hit(&["alice"], &[("Team", "backend")])])), 1);
+    }
+
+    /// GitHub matched the query but named nobody we can check. Its verdict wins over our reading.
+    #[test]
+    fn a_hit_with_no_identifiable_blocker_stays_counted() {
+        assert_eq!(count_of(&payload(&[hit(&[], &[("User", "alice")])])), 1);
+        assert_eq!(count_of(&payload(&[r#"{}"#.to_string()])), 1, "a node with no fields at all");
+    }
+
+    #[test]
+    fn several_blockers_need_all_of_them_asked_again() {
+        let one_of_two = payload(&[hit(&["alice", "bob"], &[("User", "alice")])]);
+        assert_eq!(
+            count_of(&one_of_two),
+            0,
+            "any blocker asked again means the ball has moved, even if others also objected"
+        );
+    }
+
+    #[test]
+    fn a_mixed_page_counts_only_the_ones_still_on_you() {
+        let body = payload(&[
+            hit(&["alice"], &[("User", "alice")]), // handed back
+            hit(&["bob"], &[]),                    // on you
+            hit(&["carol"], &[("User", "dave")]),  // on you: wrong reviewer asked
+            hit(&["erin"], &[("Team", "core")]),   // on you: team request proves nothing
+        ]);
+        assert_eq!(count_of(&body), 3);
+    }
+
+    /// The gotcha that makes this endpoint different from the other two: GraphQL reports failure with
+    /// `200 OK` and an `errors` array. Reading only `data` would render a broken request as a
+    /// confident zero — the one answer this module must never give.
+    #[test]
+    fn a_graphql_error_at_status_200_is_transient_not_zero() {
+        let body = r#"{"data":null,"errors":[{"message":"Something went wrong"}]}"#;
+        match changes(StatusCode::OK, &headers(&[]), body, 0) {
+            PollResult::Transient(why) => assert!(why.contains("Something went wrong")),
+            other => panic!("expected Transient, got {:?}", other),
+        }
+    }
+
+    /// Partial success is still failure: an `errors` array alongside usable `data` means the page we
+    /// were handed is incomplete, so counting it would undercount.
+    #[test]
+    fn errors_win_even_when_data_is_present() {
+        let body = format!(
+            r#"{{"data":{{"search":{{"nodes":[{}]}}}},"errors":[{{"message":"partial"}}]}}"#,
+            hit(&["alice"], &[])
+        );
+        assert!(matches!(changes(StatusCode::OK, &headers(&[]), &body, 0), PollResult::Transient(_)));
+    }
+
+    #[test]
+    fn a_response_with_neither_data_nor_errors_is_transient() {
+        assert!(matches!(
+            changes(StatusCode::OK, &headers(&[]), "{}", 0),
+            PollResult::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_changes_requested_body_is_transient() {
+        assert!(matches!(
+            changes(StatusCode::OK, &headers(&[]), "not json at all", 0),
+            PollResult::Transient(_)
+        ));
+    }
+
+    /// An empty page is a real answer, unlike every failure above.
+    #[test]
+    fn no_hits_means_nothing_is_on_you() {
+        match changes(StatusCode::OK, &headers(&[]), &payload(&[]), 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(!present);
+                assert_eq!(count, Some(0));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// The document has to name every variable it uses, or GitHub rejects the whole query.
+    #[test]
+    fn the_query_document_declares_the_variables_it_sends() {
+        for var in ["$q", "$hits", "$reviews"] {
+            assert!(
+                CHANGES_REQUESTED_DOCUMENT.matches(var).count() >= 2,
+                "{var} should be both declared and used"
+            );
+        }
     }
 
     // ── Search body parsing ───────────────────────────────────────────────────

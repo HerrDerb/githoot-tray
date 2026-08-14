@@ -77,6 +77,20 @@ fn pr_query(axis: PrAxis) -> &'static str {
     }
 }
 
+/// Issues `axis`'s poll.
+///
+/// Two axes are a `total_count` read off the Search API. `ChangesRequested` is not, because the query
+/// alone cannot tell "still on me" from "handed back to the reviewer" — see
+/// `github::poll_changes_requested`. Both take the same query string; they differ only in which endpoint
+/// answers it and how much of the answer has to be read.
+fn poll_pr(client: &reqwest::blocking::Client, token: &str, axis: PrAxis) -> github::PollResponse {
+    let query = pr_query(axis);
+    match axis {
+        PrAxis::ChangesRequested => github::poll_changes_requested(client, token, query),
+        PrAxis::ReviewRequested | PrAxis::ReadyToMerge => github::poll_reviews(client, token, query),
+    }
+}
+
 /// The GitHub page listing exactly what `axis`'s dot is counting.
 ///
 /// Built from the same query the search itself uses, so the page can never disagree with the
@@ -286,7 +300,7 @@ fn run_poll_loop(
                 if !state.pr_in_play(axis) {
                     continue;
                 }
-                let response = github::poll_reviews(&client, store.token(), pr_query(axis));
+                let response = poll_pr(&client, store.token(), axis);
                 pr_kinds.push((axis, response.result.kind()));
                 state.apply_pr(axis, response);
             }

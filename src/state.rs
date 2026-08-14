@@ -124,11 +124,15 @@ pub const UPDATE_MENU_LABEL: &str = "Install update";
 
 /// One of the three independent PR-search signals.
 ///
-/// All three are searched with the same mechanism (`github::poll_reviews`, despite its name — see
-/// its own doc comment) against one shared credential, differing only in the query and in how each
-/// is displayed. `ALL` fixes the order used both for tooltip-detail priority and, by convention, for
-/// which corner/color `icons::IconSet` assigns each dot: review-requested (red, top-right),
-/// ready-to-merge (green, bottom-right), changes-requested (orange, bottom-left).
+/// All three share one credential and one query string apiece, and all three land in the same
+/// `Track` machinery. Two of them are a `total_count` read off the Search API (`github::poll_reviews`,
+/// despite its name — see its own doc comment); changes-requested goes through GraphQL instead, because
+/// its query alone cannot tell "still on me" from "handed back to the reviewer". See
+/// `github::poll_changes_requested`. `scheduler::poll_pr` is the one place that mapping lives.
+///
+/// `ALL` fixes the order used both for tooltip-detail priority and, by convention, for which slot and
+/// colour `icons::IconSet` assigns each bar, top to bottom: review-requested (red), ready-to-merge
+/// (green), changes-requested (amber).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrAxis {
     ReviewRequested,
