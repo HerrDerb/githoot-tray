@@ -17,6 +17,8 @@ pub struct Config {
     /// core of the app is PR status now, not notifications. Someone who wants the notification
     /// half back opts in explicitly.
     pub notifications: bool,
+    /// Whether to check GitHub for newer releases once a day. On unless explicitly turned off.
+    pub update_check: bool,
 }
 
 impl Config {
@@ -27,8 +29,25 @@ impl Config {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let values = parse(&content);
 
-        Config { notifications: values.get("notifications").is_some_and(|v| is_on(v)) }
+        Config {
+            notifications: values.get("notifications").is_some_and(|v| is_on(v)),
+            // Default **on**, unlike every other setting here, which deliberately departs from the
+            // "preserve today's behaviour for someone who never creates the file" rule stated above.
+            // An auto-update mechanism that is off until you find out it exists does not do the job it
+            // was asked to do. `is_on` cannot express a default-on flag, hence `is_off` for the opt-out.
+            update_check: !values.get("update_check").is_some_and(|v| is_off(v)),
+        }
     }
+}
+
+/// Whether a value reads as "off".
+///
+/// The mirror of `is_on`, needed because a default-on setting cannot be expressed with `is_on`: absent
+/// has to mean on, so only an explicit off may turn it off. Deliberately not `!is_on(v)` — that would
+/// make a typo like `update_check=yse` read as off, silently disabling a feature the user was trying to
+/// confirm. An unrecognised value leaves the default alone.
+fn is_off(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "off" | "false" | "0" | "no")
 }
 
 /// Parses `key=value` lines into a lookup, tolerating comments, blank lines, and stray

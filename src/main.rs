@@ -13,8 +13,93 @@ mod icons;
 mod log;
 mod scheduler;
 mod state;
+mod update;
+mod version;
 
 const NOTIFICATIONS_URL: &str = "https://github.com/notifications";
+
+// ─── Command-line contract ────────────────────────────────────────────────────
+//
+// Two flags, both of which exist for the self-updater rather than for people.
+//
+// **This is a compatibility contract with every future release.** The updater in version N downloads
+// version N+1 and then relies on N+1 honouring these flags: `--print-version` is how N verifies it
+// downloaded what it meant to, and `--await-exit` is how N hands the tray over to N+1. Removing or
+// renaming either would break updating *from* every release that already shipped, and those releases
+// cannot be fixed retroactively. Treat them as frozen.
+//
+// Both are parsed as the very first thing each `main` does, ahead of `gtk::init()` on Linux and ahead
+// of the single-instance mutex on Windows. After either, both features break: `--print-version` would
+// need a display to answer, and `--await-exit` exists precisely to wait *before* the mutex is touched.
+
+/// Print the version and exit. Used by the updater to smoke-test a freshly downloaded binary.
+const FLAG_PRINT_VERSION: &str = "--print-version";
+/// Wait for the given PID to exit before starting up. Used by the updater's restart handshake.
+const FLAG_AWAIT_EXIT: &str = "--await-exit";
+
+/// How long to wait for the old process before giving up and starting anyway.
+///
+/// Bounded rather than unbounded: a parent that somehow never exits must not leave the user with no
+/// tray icon at all. Starting anyway is the safer failure — on Windows the mutex check that follows
+/// will simply report "already running", which is a visible, explicable outcome.
+#[cfg(target_os = "windows")]
+const AWAIT_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Handles the flags that must be answered before the app initialises anything.
+///
+/// Returns `true` if the process should exit immediately (the caller has been served).
+fn handle_startup_flags() -> bool {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == FLAG_PRINT_VERSION {
+            // Deliberately plain stdout with no logging: the updater parses this, and a log line or a
+            // banner would have to be stripped back off. On Windows this still works under
+            // `windows_subsystem = "windows"` when the caller supplies the pipe.
+            println!("{}", version::VERSION);
+            return true;
+        }
+        if arg == FLAG_AWAIT_EXIT {
+            let pid = args.next();
+            await_process_exit(pid.as_deref());
+        }
+    }
+    false
+}
+
+/// Blocks until the process identified by `pid` has exited, or a timeout elapses.
+///
+/// Only meaningful on Windows, where the single-instance mutex is held until the old process exits and
+/// a relaunch that starts first is turned away. Elsewhere this is a no-op: Linux re-execs over itself
+/// so there is never a second process, and macOS waits in a shell before launching at all.
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn await_process_exit(pid: Option<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::synchapi::WaitForSingleObject;
+        use winapi::um::winnt::SYNCHRONIZE;
+
+        let Some(pid) = pid.and_then(|p| p.parse::<u32>().ok()) else {
+            return;
+        };
+
+        // SAFETY: `OpenProcess` is safe to call with any PID; it returns null when the process is gone
+        // or inaccessible, which is the common and expected case here.
+        unsafe {
+            let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                // Already exited, or not ours to wait on. Either way there is nothing to wait for.
+                return;
+            }
+            // Waiting on the process object rather than retrying the mutex: the object signals at
+            // termination, which is the same instant the mutex is released, so this is a real signal
+            // instead of a guessed delay.
+            WaitForSingleObject(handle, AWAIT_EXIT_TIMEOUT.as_millis() as u32);
+            CloseHandle(handle);
+        }
+    }
+}
 
 /// Brings up the shared PR-status credential (the `github_app` Device Flow) as far as it can go
 /// *without involving the user*, and confirms it can actually see something.
@@ -92,6 +177,12 @@ fn main() {
     use gtk::{Menu, MenuItem};
     use libappindicator::{AppIndicator, AppIndicatorStatus};
 
+    // Before `gtk::init`: `--print-version` must answer without needing a display, since the updater
+    // runs it as a smoke test on a machine whose session it knows nothing about.
+    if handle_startup_flags() {
+        return;
+    }
+
     gtk::init().expect("Failed to initialize GTK.");
 
     let app_asset_path = match get_app_asset_path() {
@@ -102,6 +193,10 @@ fn main() {
         }
     };
     log::init(&app_asset_path);
+    // After `log::init` so its findings are recorded, and at startup rather than at the end of an
+    // install: on Windows the previous `.exe` cannot be deleted until the process holding it has gone,
+    // and that process is this one's predecessor.
+    update::clean_up_after_update();
 
     let icons = match icons::create_icons(&app_asset_path) {
         Ok(icons) => icons,
@@ -129,10 +224,13 @@ fn main() {
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
-    indicator.set_icon(icons.get(false, false, false, false).as_str());
+    indicator.set_icon(icons.get(false, false, false, false, false).as_str());
 
     // The poll loop waits on this channel, so a menu click can pull the next poll forward.
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
+    // Carries a completed install from the update thread to this one. Read after `gtk::main()` returns,
+    // because that is the only point at which the tray is gone but the process still exists.
+    let (restart_tx, restart_rx) = std::sync::mpsc::channel::<update::RestartPlan>();
 
     let mut menu = Menu::new();
     let item = MenuItem::with_label("Open GitHub Notifications");
@@ -185,8 +283,19 @@ fn main() {
         let _ = authenticate_wake_tx.send(scheduler::Wake::Authenticate);
     });
 
+    // Placed with Authenticate at the top, for the same reason: when the icon is wearing a mark, the
+    // thing that clears it should be the first thing under the cursor. Starts hidden — unlike the four
+    // signal entries, offering to install an update before one is known to exist would be a lie, and
+    // `show_all` below would otherwise make it visible.
+    let update_item = MenuItem::with_label(state::UPDATE_MENU_LABEL);
+    let update_wake_tx = wake_tx.clone();
+    update_item.connect_activate(move |_| {
+        let _ = update_wake_tx.send(scheduler::Wake::UpdateNow);
+    });
+
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
+    menu.append(&update_item);
     menu.append(&authenticate_item);
     menu.append(&item);
     menu.append(&reviews_item);
@@ -194,6 +303,9 @@ fn main() {
     menu.append(&changes_requested_item);
     menu.append(&quit_item);
     menu.show_all();
+    // After `show_all`, which shows everything it is given. The poll loop turns this on the moment a
+    // check finds a newer release.
+    update_item.set_visible(false);
 
     // The closest Linux equivalent of clicking the icon: the menu being popped up. Connected after
     // `show_all` so the initial layout pass is not mistaken for a click.
@@ -220,14 +332,60 @@ fn main() {
             ready_to_merge: ready_to_merge_item.clone(),
             changes_requested: changes_requested_item.clone(),
             authenticate: authenticate_item.clone(),
+            update: update_item.clone(),
         },
-        tokens,
-        pr,
-        app_asset_path.clone(),
+        scheduler::PollInputs {
+            tokens,
+            pr,
+            app_asset_path: app_asset_path.clone(),
+            update_check: config.update_check,
+        },
         wake_rx,
+        restart_tx,
     );
 
     gtk::main();
+
+    // Past this point the GTK loop has unwound, so the StatusNotifierItem has been withdrawn properly
+    // rather than dropped when the process image was replaced. Only now is it safe to hand over.
+    //
+    // `exec` rather than spawn-and-exit, deliberately: it keeps the PID, so a systemd user unit or any
+    // other supervisor sees one continuous process instead of a service that died and an orphan that
+    // appeared. It also inherits DISPLAY, WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS and XDG_* exactly as
+    // they were.
+    if let Ok(plan) = restart_rx.try_recv() {
+        exec_into(&plan);
+    }
+}
+
+/// Replaces this process with the newly installed binary. Only returns if it failed.
+#[cfg(target_os = "linux")]
+fn exec_into(plan: &update::RestartPlan) -> ! {
+    use std::os::unix::process::CommandExt;
+
+    logln!("restarting into {}", plan.target.display());
+    // Args are forwarded so a launcher's own flags survive the hand-over. `current_exe`'s path is used
+    // rather than argv[0], which may be relative to a working directory that has since changed.
+    let error = std::process::Command::new(&plan.target)
+        .args(std::env::args_os().skip(1))
+        .exec();
+
+    // `exec` only returns on failure. Try the binary that was working a moment ago before giving up.
+    logln!("could not start the updated binary ({error}) — falling back to the previous version");
+    if let Some(backup) = plan.backup.as_ref()
+        && backup.exists()
+    {
+        let _ = std::fs::rename(backup, &plan.target);
+        let error = std::process::Command::new(&plan.target)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        logln!("the previous version would not start either ({error})");
+    }
+    dialog::report(
+        "git-system-tray: restart failed",
+        "The update was installed but the app could not restart. Start it again by hand.",
+    );
+    std::process::exit(1);
 }
 
 // ─── Windows and macOS ────────────────────────────────────────────────────────
@@ -256,6 +414,13 @@ fn main() {
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
     use winit::window::WindowId;
+
+    // Before the single-instance guard, and that order is load-bearing: `--await-exit` exists to wait
+    // for the *previous* process to die, and the mutex it holds is released only when it does. Check
+    // the mutex first and an update's relaunch would always be turned away as a duplicate.
+    if handle_startup_flags() {
+        return;
+    }
 
     // ── Single-instance guard ────────────────────────────────────────────────
     // Windows only. CreateMutexW returns the existing handle if the named mutex already exists,
@@ -296,6 +461,10 @@ fn main() {
         }
     };
     log::init(&app_asset_path);
+    // After `log::init` so its findings are recorded, and at startup rather than at the end of an
+    // install: on Windows the previous `.exe` cannot be deleted until the process holding it has gone,
+    // and that process is this one's predecessor.
+    update::clean_up_after_update();
 
     let config = config::Config::load(&app_asset_path);
     let tokens = if config.notifications {
@@ -336,6 +505,10 @@ fn main() {
         /// Offered only while PR status is waiting to be authorized.
         authenticate_item: tray_icon::menu::MenuItem,
         authenticate_item_id: tray_icon::menu::MenuId,
+        /// Offered only while a newer release exists. Its label carries the version, so it is
+        /// relabelled as well as added and removed.
+        update_item: tray_icon::menu::MenuItem,
+        update_item_id: tray_icon::menu::MenuId,
         quit_item: tray_icon::menu::MenuItem,
         quit_item_id: tray_icon::menu::MenuId,
         /// Which image the tray is actually showing, as `[notifications, review_requested,
@@ -345,13 +518,17 @@ fn main() {
         /// Whether the icon currently shows the needs-authorization variant. Separate from `applied`
         /// because it is not one of the four signals but a replacement for all of them.
         applied_needs_auth: Option<bool>,
+        /// Likewise for the update arrow, which is a fifth independent signal rather than a replacement.
+        applied_update: Option<bool>,
+        /// And for the install entry's text, which carries the version.
+        applied_update_label: Option<String>,
         /// Likewise for the three PR menu items' text, indexed by `PrAxis::index`, so an
         /// unchanged count does not rewrite the item.
         applied_labels: [Option<String>; 3],
         /// And for which entries the menu currently holds — the four signals plus whether the
         /// Authenticate entry is in. Tracked separately from `applied` because a failed `set_icon`
         /// must not also suppress the menu update.
-        applied_menu: Option<([bool; 4], bool)>,
+        applied_menu: Option<([bool; 4], bool, bool)>,
     }
 
     /// Decodes the icons, builds the menu, and creates the tray icon.
@@ -381,6 +558,8 @@ fn main() {
         let changes_requested_item_id = changes_requested_item.id().clone();
         let authenticate_item = MenuItem::new(state::AUTHENTICATE_MENU_LABEL, true, None);
         let authenticate_item_id = authenticate_item.id().clone();
+        let update_item = MenuItem::new(state::UPDATE_MENU_LABEL, true, None);
+        let update_item_id = update_item.id().clone();
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_item_id = quit_item.id().clone();
         let menu = Menu::new();
@@ -402,7 +581,7 @@ fn main() {
 
         let tray_icon = TrayIconBuilder::new()
             .with_tooltip("GitHub Notifications")
-            .with_icon(icons.get(false, false, false, false).clone())
+            .with_icon(icons.get(false, false, false, false, false).clone())
             // Cloned rather than moved: `Menu` is a reference-counted handle, and the app keeps one
             // so it can take entries out later. The tray gets the same underlying menu.
             .with_menu(Box::new(menu.clone()))
@@ -423,16 +602,20 @@ fn main() {
             changes_requested_item_id,
             authenticate_item,
             authenticate_item_id,
+            update_item,
+            update_item_id,
             quit_item,
             quit_item_id,
             // The builder set the plain icon above, but treat that as unproven so the first
             // confirmed poll always writes the image it wants.
             applied: None,
             applied_needs_auth: None,
+            applied_update: None,
+            applied_update_label: None,
             applied_labels: [None, None, None],
-            // The menu was built with the four signal entries present and Authenticate absent, and
-            // that much we did do, so it is recorded as such. Only a confirmed answer changes it.
-            applied_menu: Some(([true; 4], false)),
+            // The menu was built with the four signal entries present and both conditional entries
+            // absent, and that much we did do, so it is recorded as such.
+            applied_menu: Some(([true; 4], false, false)),
         })
     }
 
@@ -506,7 +689,16 @@ fn main() {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
 
     // Launch the polling thread; it communicates back via the proxy.
-    scheduler::start_notification_scheduler(tokens, pr, app_asset_path.clone(), wake_rx, proxy);
+    scheduler::start_notification_scheduler(
+        scheduler::PollInputs {
+            tokens,
+            pr,
+            app_asset_path: app_asset_path.clone(),
+            update_check: config.update_check,
+        },
+        wake_rx,
+        proxy,
+    );
 
     // ── Application handler ──────────────────────────────────────────────────
 
@@ -560,9 +752,103 @@ fn main() {
                 // `scheduler::Wake::Authenticate`), because it blocks for as long as the user takes
                 // and doing that here would freeze the event loop and the tray with it.
                 let _ = self.wake_tx.send(scheduler::Wake::Authenticate);
+            } else if *id == tray.update_item_id {
+                // Only asks. The download, verification and swap all happen on the update thread —
+                // see `scheduler::Wake::UpdateNow`.
+                let _ = self.wake_tx.send(scheduler::Wake::UpdateNow);
             } else if *id == tray.quit_item_id {
                 event_loop.exit();
             }
+        }
+
+        /// Starts the newly installed binary and ends this process.
+        ///
+        /// On the UI thread on purpose: dropping the tray is what makes the shell remove the icon
+        /// properly, and it has to happen before this process goes away or the taskbar is left holding a
+        /// dead one.
+        fn hand_over(&mut self, plan: update::RestartPlan, event_loop: &ActiveEventLoop) {
+            logln!("restarting into {}", plan.target.display());
+
+            // First, so the icon is gone before its owner is.
+            self.tray = None;
+
+            match self.spawn_successor(&plan) {
+                Ok(()) => {
+                    event_loop.exit();
+                    // Belt and braces. If `exit()` somehow does not unwind `run_app`, the Windows
+                    // single-instance mutex is never released and the successor times out waiting for a
+                    // process that will not die. A few lines here removes that whole hang class.
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    // Roll the swap back rather than leave the user with a binary that will not start.
+                    // This is only reportable *because* the check happens before exiting — otherwise the
+                    // reporter has already gone.
+                    logln!("the updated binary would not start ({e}) — rolling back");
+                    if let Some(backup) = plan.backup.as_ref() {
+                        let _ = std::fs::remove_file(&plan.target);
+                        let _ = std::fs::rename(backup, &plan.target);
+                    }
+                    dialog::report(
+                        "git-system-tray: update failed",
+                        &format!(
+                            "The update was installed but would not start, so the previous version \
+                             has been put back.\n\n{e}"
+                        ),
+                    );
+                }
+            }
+        }
+
+        /// Launches the successor, and confirms it actually started.
+        #[cfg(target_os = "windows")]
+        fn spawn_successor(&self, plan: &update::RestartPlan) -> Result<(), String> {
+            // `--await-exit` with our own PID: the successor waits on this process's handle, which
+            // signals at termination — the same instant the single-instance mutex is released. Without
+            // it the new instance would race the mutex and be turned away as a duplicate.
+            let mut child = std::process::Command::new(&plan.target)
+                .arg(FLAG_AWAIT_EXIT)
+                .arg(std::process::id().to_string())
+                .args(std::env::args_os().skip(1))
+                .spawn()
+                .map_err(|e| e.to_string())?;
+
+            // A healthy successor is blocked in `WaitForSingleObject`, so "still running" is an
+            // unambiguous "it started". An immediate exit means it could not run at all — Defender
+            // quarantining an unsigned binary is the realistic cause — and that is worth catching here
+            // rather than discovering as a tray icon that never came back.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            match child.try_wait() {
+                Ok(None) => Ok(()),
+                Ok(Some(status)) => Err(format!("it exited immediately with {status}")),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn spawn_successor(&self, plan: &update::RestartPlan) -> Result<(), String> {
+            // LaunchServices refuses to start a second instance of the same bundle identifier, and would
+            // activate this one instead. So a detached shell waits for this process to disappear and only
+            // then opens the bundle. `/bin/sh` is guaranteed present; the iteration count is bounded so a
+            // parent that somehow never exits cannot leave an immortal waiter behind.
+            //
+            // The absolute path matters: `open -a <name>` resolves through the LaunchServices database,
+            // which may still point at the bundle that was just renamed aside.
+            let target = plan.target.display().to_string();
+            if target.contains('\'') {
+                return Err("the bundle path contains a quote, which is not safe to pass to sh".into());
+            }
+            let script = format!(
+                "n=0; while kill -0 {pid} 2>/dev/null && [ $n -lt 300 ]; do sleep 0.2; n=$((n+1)); \
+                 done; exec open '{target}'",
+                pid = std::process::id()
+            );
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
 
         /// Acts on a click on the icon itself.
@@ -583,12 +869,13 @@ fn main() {
         ///
         /// Only called when the set actually changes, which is rare. It can still land while the
         /// user has the menu open, since nothing tells us whether it is showing.
-        fn rebuild_menu(&self, wanted: [bool; 4], needs_auth: bool) {
+        fn rebuild_menu(&self, wanted: [bool; 4], needs_auth: bool, update: bool) {
             while self.menu.remove_at(0).is_some() {}
 
             for (item, wanted, what) in [
-                // First, so it is the obvious thing to click when the icon is wearing an
-                // exclamation and the three PR entries are gone.
+                // The two conditional entries first, so whatever mark the icon is wearing, the thing
+                // that clears it is the first entry under the cursor.
+                (&self.update_item, update, "update"),
                 (&self.authenticate_item, needs_auth, "authenticate"),
                 // Notifications is *not* gated on `needs_auth`: it is a separate credential that may
                 // be working perfectly, and hiding a working entry because a different one needs
@@ -624,16 +911,24 @@ fn main() {
             ];
 
             let needs_auth = update.icon.needs_auth;
+            let update_available = update.icon.update_available;
 
-            if self.applied != Some(wanted) || self.applied_needs_auth != Some(needs_auth) {
+            if self.applied != Some(wanted)
+                || self.applied_needs_auth != Some(needs_auth)
+                || self.applied_update != Some(update_available)
+            {
                 // The override is checked first because with no credential there is nothing to draw
                 // a dot from. `wanted` is still recorded either way, so the moment authorization
                 // succeeds the icon goes straight back to the right variant rather than waiting for
                 // one of the four signals to change.
+                // The arrow rides along with either branch: an available update is orthogonal to
+                // whether a credential is missing, and the two marks sit in opposite corners.
                 let icon = if needs_auth {
-                    self.icons.needs_auth().clone()
+                    self.icons.needs_auth(update_available).clone()
                 } else {
-                    self.icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).clone()
+                    self.icons
+                        .get(wanted[0], wanted[1], wanted[2], wanted[3], update_available)
+                        .clone()
                 };
                 match self.tray_icon.set_icon(Some(icon)) {
                     // Only record success. A failed update leaves these `None` so the next
@@ -641,6 +936,7 @@ fn main() {
                     Ok(()) => {
                         self.applied = Some(wanted);
                         self.applied_needs_auth = Some(needs_auth);
+                        self.applied_update = Some(update_available);
                     }
                     Err(e) => logln!("failed to update tray icon: {e}"),
                 }
@@ -675,9 +971,18 @@ fn main() {
             // Note this inherits `wanted`'s treatment of `Unknown`: an axis we have lost track of
             // keeps whatever it last had. A failed poll must not remove an entry, because "I could
             // not ask" is not the same as "there is nothing there".
-            if self.applied_menu != Some((wanted, needs_auth)) {
-                self.rebuild_menu(wanted, needs_auth);
-                self.applied_menu = Some((wanted, needs_auth));
+            // Relabelled before the rebuild, so a rebuild that lands in the same tick shows the new
+            // text rather than the previous version's.
+            if let Some(label) = update.update_label.as_deref()
+                && self.applied_update_label.as_deref() != Some(label)
+            {
+                self.update_item.set_text(label);
+                self.applied_update_label = Some(label.to_string());
+            }
+
+            if self.applied_menu != Some((wanted, needs_auth, update_available)) {
+                self.rebuild_menu(wanted, needs_auth, update_available);
+                self.applied_menu = Some((wanted, needs_auth, update_available));
             }
         }
     }
@@ -734,6 +1039,7 @@ fn main() {
                 TrayEvent::MenuClick(id) => self.on_menu(&id, event_loop),
                 #[cfg(target_os = "macos")]
                 TrayEvent::IconClick => self.on_icon_click(),
+                TrayEvent::Restart(plan) => self.hand_over(plan, event_loop),
             }
         }
 

@@ -73,6 +73,39 @@ const CHANGES_DOT_COLOR: [u8; 4] = [0xE0, 0x8A, 0x00, 0xFF];
 /// it has no signal yet; `bar_slots` simply never lights it.
 const INDICATOR_COLORS: [[u8; 4]; 3] = [REVIEW_DOT_COLOR, MERGE_DOT_COLOR, CHANGES_DOT_COLOR];
 
+// ── Update-available arrow geometry ─────────────────────────────────────────
+// An up-arrow in the **top-left** corner, meaning "a newer release exists".
+//
+// Top-left because it is the one part of the icon nothing else claims: the indicator bars own the
+// right-hand column, and the authorization mark owns the right edge. So this needs no negotiation with
+// either and can never overlap them.
+//
+// It is a fifth *independent* signal, unlike the authorization mark which replaces everything. An
+// update being available says nothing about your PRs, and vice versa, so both can be true at once and
+// the icon has to be able to show both. That is what takes the packed variant index from four bits to
+// five — see `IconSet`.
+
+/// The arrow's colour. Violet, chosen to be unmistakable against the three indicator hues (red, green,
+/// amber) *and* against the blue unread-notifications glyph it may be drawn on top of. It is the only
+/// colour here that is not already in use, which is the point: a new meaning gets a new colour rather
+/// than borrowing one and making two things ambiguous.
+const UPDATE_ARROW_COLOR: [u8; 4] = [0x7A, 0x5C, 0xF0, 0xFF];
+/// Distance from the icon's top and left edges to the arrow's bounding box, as a fraction of width.
+const ARROW_MARGIN_RATIO: f32 = 0.045;
+/// Arrow width as a fraction of icon width, and total height as a fraction of icon height.
+const ARROW_WIDTH_RATIO: f32 = 0.33;
+const ARROW_HEIGHT_RATIO: f32 = 0.37;
+/// Where the triangular head ends and the shaft begins, as a fraction of the arrow's own height.
+/// Above this is head, below is shaft.
+const ARROW_HEAD_SPLIT: f32 = 0.55;
+/// Shaft width as a fraction of the arrow's own width. Wide enough to survive being scaled to 16px —
+/// at 0.38 the head still read but the stem thinned to nothing — and still narrower than the head, which
+/// is what `the_arrow_points_up` pins down.
+const ARROW_SHAFT_RATIO: f32 = 0.50;
+/// Transparent border carved around the arrow, in source pixels. Matches `BAR_BORDER_PX` so the two
+/// overlays look like they belong to the same icon.
+const ARROW_BORDER_PX: f32 = BAR_BORDER_PX;
+
 // ── Authorization mark geometry ─────────────────────────────────────────────
 // A big exclamation mark down the **right-hand side** of the icon, for the one state where the app
 // has no credential and therefore no answer to give. Deliberately unlike the corner dots: a dot says
@@ -140,6 +173,108 @@ fn rounded_rect_sd(px: f32, py: f32, cx: f32, cy: f32, half_w: f32, half_h: f32,
     let dx = (px - cx).abs() - (half_w - r);
     let dy = (py - cy).abs() - (half_h - r);
     dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - r
+}
+
+/// Distance from a point to a line segment. The building block for the arrowhead, whose edges are
+/// three segments rather than the axis-aligned box `rounded_rect_sd` handles.
+fn segment_distance(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (vx, vy) = (bx - ax, by - ay);
+    let (wx, wy) = (px - ax, py - ay);
+    let len_sq = vx * vx + vy * vy;
+    // A degenerate segment collapses to its start point; guarding avoids a divide by zero if a future
+    // geometry change ever makes two vertices coincide.
+    let t = if len_sq <= f32::EPSILON { 0.0 } else { ((wx * vx + wy * vy) / len_sq).clamp(0.0, 1.0) };
+    (wx - t * vx).hypot(wy - t * vy)
+}
+
+/// Signed distance to a triangle: negative inside, positive outside, magnitude is the distance to the
+/// outline.
+///
+/// The sign comes from the three edge cross-products agreeing, which works for either winding order, so
+/// the caller does not have to remember whether the vertices go clockwise. That property is worth
+/// having because "the arrow silently vanished" is what a wrong winding would look like.
+fn triangle_sd(px: f32, py: f32, tri: [(f32, f32); 3]) -> f32 {
+    let [(ax, ay), (bx, by), (cx, cy)] = tri;
+    let distance = segment_distance(px, py, ax, ay, bx, by)
+        .min(segment_distance(px, py, bx, by, cx, cy))
+        .min(segment_distance(px, py, cx, cy, ax, ay));
+
+    let cross = |x1: f32, y1: f32, x2: f32, y2: f32| x1 * y2 - y1 * x2;
+    let s1 = cross(bx - ax, by - ay, px - ax, py - ay);
+    let s2 = cross(cx - bx, cy - by, px - bx, py - by);
+    let s3 = cross(ax - cx, ay - cy, px - cx, py - cy);
+    let inside = (s1 >= 0.0 && s2 >= 0.0 && s3 >= 0.0) || (s1 <= 0.0 && s2 <= 0.0 && s3 <= 0.0);
+
+    if inside { -distance } else { distance }
+}
+
+/// Signed distance to the whole up-arrow: the union of its head and its shaft.
+///
+/// A union of signed distances is their minimum, which is what makes carving the border trivial here.
+/// Unlike the bars, where the border had to be built by inflating the rectangle's own half-extents, a
+/// true signed distance means "one border-width outside the shape" is just `d <= BORDER`. Same visual
+/// result, considerably less arithmetic to get wrong.
+fn arrow_sd(px: f32, py: f32, width: f32, height: f32) -> f32 {
+    let margin_x = width * ARROW_MARGIN_RATIO;
+    let margin_y = width * ARROW_MARGIN_RATIO;
+    let arrow_w = width * ARROW_WIDTH_RATIO;
+    let arrow_h = height * ARROW_HEIGHT_RATIO;
+
+    let left = margin_x;
+    let top = margin_y;
+    let centre_x = left + arrow_w / 2.0;
+    let split_y = top + arrow_h * ARROW_HEAD_SPLIT;
+    let bottom = top + arrow_h;
+
+    // Head: apex up, base at the split.
+    let head = triangle_sd(px, py, [(centre_x, top), (left, split_y), (left + arrow_w, split_y)]);
+
+    // Shaft: from the split down to the bottom. Square corners, because a rounded shaft under a sharp
+    // head reads as two unrelated shapes.
+    let shaft_half_w = arrow_w * ARROW_SHAFT_RATIO / 2.0;
+    let shaft_half_h = (bottom - split_y) / 2.0;
+    let shaft = rounded_rect_sd(
+        px,
+        py,
+        centre_x,
+        split_y + shaft_half_h,
+        shaft_half_w,
+        shaft_half_h,
+        0.0,
+    );
+
+    head.min(shaft)
+}
+
+/// Returns a copy of `src` with the update-available arrow drawn in its top-left corner.
+///
+/// Same carve-then-paint treatment as the indicator bars, so the two overlays match: a transparent
+/// border is punched out around the shape first, then the colour is laid into it. Here it fits in one
+/// pass because there is a single shape — the carve region and the paint region are disjoint, so
+/// neither can eat the other. The bars need two passes only because several of them are adjacent.
+fn with_update_arrow(src: &RgbaImage) -> RgbaImage {
+    let (width, height) = src.dimensions();
+    let mut out = src.clone();
+    let w = width as f32;
+    let h = height as f32;
+
+    for y in 0..height {
+        for x in 0..width {
+            // Sample at the pixel centre so the anti-aliasing is symmetric, as everywhere else here.
+            let distance = arrow_sd(x as f32 + 0.5, y as f32 + 0.5, w, h);
+
+            if distance <= 0.5 {
+                let coverage = (0.5 - distance).clamp(0.0, 1.0);
+                let pixel = out.get_pixel_mut(x, y);
+                *pixel = over(UPDATE_ARROW_COLOR, *pixel, coverage);
+            } else if distance <= ARROW_BORDER_PX {
+                let pixel = out.get_pixel_mut(x, y);
+                pixel[3] = 0;
+            }
+        }
+    }
+
+    out
 }
 
 /// The bars to draw for a given set of lit signals, in slot order.
@@ -340,26 +475,32 @@ fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
 /// asked" — drawing dots alongside it would assert answers the app does not have. Keeping it out of
 /// the array means the 4-bit index can never reach it by accident.
 pub struct IconSet<T> {
-    variants: [T; 16],
-    needs_auth: T,
+    variants: [T; 32],
+    /// Indexed by whether an update is available, for the same reason the array grew: needing
+    /// authorization and having an update pending are independent facts, so all four combinations of
+    /// "waiting to authorize" and "update available" have to be drawable.
+    needs_auth: [T; 2],
 }
 
 impl<T> IconSet<T> {
-    fn index(unread: bool, review: bool, merge: bool, changes: bool) -> usize {
-        (usize::from(unread) << 3)
+    fn index(unread: bool, review: bool, merge: bool, changes: bool, update: bool) -> usize {
+        (usize::from(update) << 4)
+            | (usize::from(unread) << 3)
             | (usize::from(review) << 2)
             | (usize::from(merge) << 1)
             | usize::from(changes)
     }
 
-    pub fn get(&self, unread: bool, review: bool, merge: bool, changes: bool) -> &T {
-        &self.variants[Self::index(unread, review, merge, changes)]
+    pub fn get(&self, unread: bool, review: bool, merge: bool, changes: bool, update: bool) -> &T {
+        &self.variants[Self::index(unread, review, merge, changes, update)]
     }
 
-    /// The variant shown while a credential is waiting on the user: base glyph, big red
-    /// exclamation, no dots. Takes no arguments precisely because it overrides all four signals.
-    pub fn needs_auth(&self) -> &T {
-        &self.needs_auth
+    /// The variant shown while a credential is waiting on the user: base glyph, big red exclamation, no
+    /// bars. Takes only `update`, because the authorization mark overrides all four PR/notification
+    /// signals but *not* the update arrow — an update is still worth showing while you are unauthorized,
+    /// and the two live in opposite corners so they never collide.
+    pub fn needs_auth(&self, update: bool) -> &T {
+        &self.needs_auth[usize::from(update)]
     }
 }
 
@@ -373,25 +514,35 @@ fn build_variants() -> Result<IconSet<RgbaImage>, String> {
     let plain = decode(GITHUB_ICON)?;
     let blue = decode(GITHUB_BLUE_ICON)?;
 
-    let variants: [RgbaImage; 16] = std::array::from_fn(|i| {
-        let unread = i & 0b1000 != 0;
+    let variants: [RgbaImage; 32] = std::array::from_fn(|i| {
+        let unread = i & 0b01000 != 0;
         // One call for all three, unlike the per-corner discs this replaced: the bars share a carve
         // pass, and carving them one at a time would let each bar's border bite into the last bar's
         // colour. See `with_indicator_bars`.
-        let lit = [i & 0b0100 != 0, i & 0b0010 != 0, i & 0b0001 != 0];
+        let lit = [i & 0b00100 != 0, i & 0b00010 != 0, i & 0b00001 != 0];
         let base = if unread { &blue } else { &plain };
-        with_indicator_bars(base, lit)
+        let img = with_indicator_bars(base, lit);
+        // Applied last and independently, in the opposite corner from everything else, so it composes
+        // with any combination of the four signals below it.
+        if i & 0b10000 != 0 { with_update_arrow(&img) } else { img }
     });
 
     // Built from the plain glyph, never the blue one: the blue tint means "unread notifications",
     // which is exactly the kind of claim this variant exists to withhold.
-    Ok(IconSet { variants, needs_auth: with_exclamation(&plain) })
+    let needs_auth_plain = with_exclamation(&plain);
+    let needs_auth_update = with_update_arrow(&needs_auth_plain);
+
+    Ok(IconSet { variants, needs_auth: [needs_auth_plain, needs_auth_update] })
 }
 
 /// Filename of the needs-authorization variant. A fixed name rather than something
 /// `variant_filename` could produce, because it is not addressed by the 4-bit key.
 #[cfg(target_os = "linux")]
 const NEEDS_AUTH_FILENAME: &str = "github_needs_auth.png";
+/// Same, with the update arrow. A fixed name for the same reason: neither is addressed by the packed
+/// key.
+#[cfg(target_os = "linux")]
+const NEEDS_AUTH_UPDATE_FILENAME: &str = "github_needs_auth_update.png";
 
 /// Filename for variant `i`, built from which bits are set rather than a hand-written 16-entry
 /// table — the table would just be this function's output written out by hand, with all the same
@@ -408,8 +559,15 @@ fn variant_filename(i: usize) -> String {
     if i & 0b0010 != 0 {
         name.push_str("_merge");
     }
-    if i & 0b0001 != 0 {
+    if i & 0b00001 != 0 {
         name.push_str("_changes");
+    }
+    // Appended last even though it is the *high* bit, so that adding the update arrow did not rename
+    // any of the sixteen files that already existed in users' asset directories. Cosmetic, but it keeps
+    // `write_icon_if_changed`'s mtime-stability promise intact across the upgrade instead of rewriting
+    // every icon once.
+    if i & 0b10000 != 0 {
+        name.push_str("_update");
     }
     name.push_str(".png");
     name
@@ -445,7 +603,7 @@ fn write_icon_if_changed(bytes: &[u8], path: &Path) {
     }
 }
 
-/// Creates all seventeen icon files in the asset directory and returns their paths.
+/// Creates all thirty-four icon files in the asset directory and returns their paths.
 /// Used on Linux by libappindicator, which requires file-system paths.
 #[cfg(target_os = "linux")]
 pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
@@ -454,20 +612,29 @@ pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
     }
 
     let images = build_variants()?;
-    let mut paths = Vec::with_capacity(16);
+    let mut paths = Vec::with_capacity(32);
     for (i, image) in images.variants.iter().enumerate() {
         let path = app_asset_path.join(variant_filename(i));
         write_icon_if_changed(&encode_png(image)?, &path);
         paths.push(path.to_string_lossy().into_owned());
     }
 
-    let variants: [String; 16] = paths
+    let variants: [String; 32] = paths
         .try_into()
-        .map_err(|_| "internal error: expected exactly 16 icon variants".to_string())?;
+        .map_err(|_| "internal error: expected exactly 32 icon variants".to_string())?;
 
-    let needs_auth_path = app_asset_path.join(NEEDS_AUTH_FILENAME);
-    write_icon_if_changed(&encode_png(&images.needs_auth)?, &needs_auth_path);
-    let needs_auth = needs_auth_path.to_string_lossy().into_owned();
+    // The two needs-authorization variants, which are not addressed by the packed key and so have fixed
+    // names rather than generated ones. Indexed by whether the update arrow is drawn.
+    let needs_auth_names = [NEEDS_AUTH_FILENAME, NEEDS_AUTH_UPDATE_FILENAME];
+    let mut needs_auth_paths: Vec<String> = Vec::with_capacity(2);
+    for (image, name) in images.needs_auth.iter().zip(needs_auth_names) {
+        let path = app_asset_path.join(name);
+        write_icon_if_changed(&encode_png(image)?, &path);
+        needs_auth_paths.push(path.to_string_lossy().into_owned());
+    }
+    let needs_auth: [String; 2] = needs_auth_paths
+        .try_into()
+        .map_err(|_| "internal error: expected exactly 2 needs-auth variants".to_string())?;
 
     Ok(IconSet { variants, needs_auth })
 }
@@ -489,15 +656,15 @@ pub fn load_tray_icons() -> Result<IconSet<tray_icon::Icon>, String> {
     }
 
     let images = build_variants()?;
-    let mut icons = Vec::with_capacity(16);
+    let mut icons = Vec::with_capacity(32);
     for image in &images.variants {
         icons.push(to_icon(image)?);
     }
 
-    let variants: [tray_icon::Icon; 16] = icons
+    let variants: [tray_icon::Icon; 32] = icons
         .try_into()
-        .map_err(|_| "internal error: expected exactly 16 icon variants".to_string())?;
-    let needs_auth = to_icon(&images.needs_auth)?;
+        .map_err(|_| "internal error: expected exactly 32 icon variants".to_string())?;
+    let needs_auth = [to_icon(&images.needs_auth[0])?, to_icon(&images.needs_auth[1])?];
     Ok(IconSet { variants, needs_auth })
 }
 
@@ -635,14 +802,14 @@ mod tests {
     }
 
     #[test]
-    fn all_sixteen_variants_build_and_are_pairwise_distinct() {
+    fn all_thirty_two_variants_build_and_are_pairwise_distinct() {
         let set = build_variants().expect("variants must build");
-        for i in 0..16 {
-            for j in (i + 1)..16 {
+        for i in 0..32 {
+            for j in (i + 1)..32 {
                 assert_ne!(
                     set.variants[i].as_raw(),
                     set.variants[j].as_raw(),
-                    "variants {i:#06b} and {j:#06b} must be distinguishable"
+                    "variants {i:#07b} and {j:#07b} must be distinguishable"
                 );
             }
         }
@@ -738,18 +905,155 @@ mod tests {
         assert_eq!(px[3], 0, "the right edge must stay clear of the mark, got {px:?}");
     }
 
-    /// The needs-auth variant is reachable only through its own accessor, and is not a duplicate
-    /// of any of the sixteen — otherwise the one state that means "no answers available" would be
+    /// The needs-auth variants are reachable only through their own accessor, and are duplicates of
+    /// nothing in the array — otherwise the one state that means "no answers available" would be
     /// indistinguishable from a state that claims answers.
     #[test]
-    fn needs_auth_is_distinct_from_every_dotted_variant() {
+    fn needs_auth_is_distinct_from_every_indicator_variant() {
         let set = build_variants().expect("variants must build");
-        assert_eq!(set.needs_auth().as_raw(), set.needs_auth.as_raw());
-        for i in 0..16 {
+        for update in [false, true] {
+            let via_accessor = set.needs_auth(update).as_raw();
+            assert_eq!(via_accessor, set.needs_auth[usize::from(update)].as_raw());
+            for i in 0..32 {
+                assert_ne!(
+                    via_accessor,
+                    set.variants[i].as_raw(),
+                    "needs_auth(update={update}) must differ from variant {i:#07b}"
+                );
+            }
+        }
+        // And the two must differ from each other, or the arrow would be invisible in this state.
+        assert_ne!(set.needs_auth(false).as_raw(), set.needs_auth(true).as_raw());
+    }
+
+    // ── The update-available arrow ──────────────────────────────────────────
+
+    /// A point inside the arrow's shaft, and one inside its head, for a 98×96 source.
+    fn arrow_probes() -> ((u32, u32), (u32, u32)) {
+        let arrow_w = 98.0 * ARROW_WIDTH_RATIO;
+        let arrow_h = 96.0 * ARROW_HEIGHT_RATIO;
+        let left = 98.0 * ARROW_MARGIN_RATIO;
+        let top = 98.0 * ARROW_MARGIN_RATIO;
+        let centre_x = left + arrow_w / 2.0;
+        let split = top + arrow_h * ARROW_HEAD_SPLIT;
+        // Head: just below the apex, on the centre line, where the triangle is already wide enough to
+        // contain a whole pixel.
+        let head = (centre_x as u32, (top + arrow_h * 0.40) as u32);
+        // Shaft: midway between the split and the bottom.
+        let shaft = (centre_x as u32, ((split + top + arrow_h) / 2.0) as u32);
+        (head, shaft)
+    }
+
+    #[test]
+    fn the_arrow_preserves_dimensions() {
+        let src = base();
+        assert_eq!(with_update_arrow(&src).dimensions(), src.dimensions());
+    }
+
+    /// Both parts have to be drawn. A head with no shaft is a triangle, and a shaft with no head is a
+    /// bar — neither reads as "up".
+    #[test]
+    fn both_parts_of_the_arrow_are_opaque_violet() {
+        let out = with_update_arrow(&base());
+        let (head, shaft) = arrow_probes();
+        for (label, (x, y)) in [("head", head), ("shaft", shaft)] {
+            let px = out.get_pixel(x, y);
+            assert_eq!(px[3], 255, "the {label} must be fully opaque, got {px:?}");
+            assert_eq!(px.0, UPDATE_ARROW_COLOR, "the {label} must be the arrow colour, got {px:?}");
+        }
+    }
+
+    /// The arrow is in the top-left; the indicator bars are in the right-hand column. They must not
+    /// touch, or two independent signals would be corrupting each other's pixels.
+    #[test]
+    fn the_arrow_never_reaches_the_indicator_column() {
+        let with_bars = with_indicator_bars(&base(), [true, true, true]);
+        let with_both = with_update_arrow(&with_bars);
+
+        // Every bar pixel must survive the arrow being drawn over the same image.
+        for i in 0..3 {
+            let (cx, cy) = slot_centre(i);
+            assert_eq!(
+                with_both.get_pixel(cx, cy).0,
+                with_bars.get_pixel(cx, cy).0,
+                "the arrow must not disturb indicator slot {i}"
+            );
+        }
+
+        // And the reverse: the arrow's own pixels must survive too, which is what proves the two
+        // overlays are genuinely composable rather than merely usually-not-overlapping.
+        let arrow_only = with_update_arrow(&base());
+        let ((hx, hy), (sx, sy)) = arrow_probes();
+        for (x, y) in [(hx, hy), (sx, sy)] {
+            assert_eq!(
+                with_both.get_pixel(x, y).0,
+                arrow_only.get_pixel(x, y).0,
+                "the bars must not disturb the arrow"
+            );
+        }
+    }
+
+    /// Same carved-border treatment as the bars, so the arrow stays legible against the glyph and any
+    /// taskbar colour rather than blending into whichever is behind it.
+    #[test]
+    fn the_arrow_has_a_fully_transparent_border() {
+        let out = with_update_arrow(&base());
+        let ((hx, _), (sx, sy)) = arrow_probes();
+        let _ = hx;
+        let arrow_w = 98.0 * ARROW_WIDTH_RATIO;
+        let shaft_half = arrow_w * ARROW_SHAFT_RATIO / 2.0;
+
+        // Just outside the shaft's left edge: past its anti-aliased boundary, inside the carve.
+        let probe_x = (sx as f32 - shaft_half - 1.5) as u32;
+        let px = out.get_pixel(probe_x, sy);
+        assert_eq!(px[3], 0, "the border must be erased to full transparency, got {px:?}");
+    }
+
+    /// The signed distance must be negative inside and positive outside, for either winding order. A
+    /// sign error would make the arrow silently vanish, which no other test would obviously catch.
+    #[test]
+    fn triangle_distance_is_signed_consistently_for_either_winding() {
+        let clockwise = [(10.0, 0.0), (0.0, 20.0), (20.0, 20.0)];
+        let anticlockwise = [(10.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
+        for tri in [clockwise, anticlockwise] {
+            assert!(triangle_sd(10.0, 15.0, tri) < 0.0, "the centroid must read as inside");
+            assert!(triangle_sd(10.0, 40.0, tri) > 0.0, "far below must read as outside");
+            assert!(triangle_sd(-10.0, 10.0, tri) > 0.0, "far left must read as outside");
+        }
+    }
+
+    /// The arrow points **up**: its widest row is in the head, above the shaft, and it narrows towards
+    /// the bottom. Measured on rendered pixels rather than trusting the constants, so an inverted
+    /// geometry change fails here rather than shipping a down-arrow.
+    #[test]
+    fn the_arrow_points_up() {
+        let out = with_update_arrow(&base());
+        let is_arrow = |px: &Rgba<u8>| px.0 == UPDATE_ARROW_COLOR;
+        let width_at = |y: u32| (0..98).filter(|&x| is_arrow(out.get_pixel(x, y))).count();
+
+        let ((_, head_y), (_, shaft_y)) = arrow_probes();
+        let head_width = width_at(head_y);
+        let shaft_width = width_at(shaft_y);
+
+        assert!(head_width > 0 && shaft_width > 0, "both bands must be drawn");
+        assert!(
+            head_width > shaft_width,
+            "the head ({head_width}px) must be wider than the shaft ({shaft_width}px), or the arrow \
+             is pointing the wrong way"
+        );
+    }
+
+    /// The arrow composes with the sixteen indicator combinations rather than replacing them, which is
+    /// the whole reason the index grew a bit instead of getting a seventeenth slot.
+    #[test]
+    fn every_variant_has_an_arrow_bearing_twin() {
+        let set = build_variants().expect("variants must build");
+        for base_index in 0..16 {
+            let with_arrow = base_index | 0b10000;
             assert_ne!(
-                set.needs_auth.as_raw(),
-                set.variants[i].as_raw(),
-                "needs_auth must be distinguishable from variant {i:#06b}"
+                set.variants[base_index].as_raw(),
+                set.variants[with_arrow].as_raw(),
+                "variant {base_index:#07b} and its arrow twin must differ"
             );
         }
     }
@@ -758,14 +1062,15 @@ mod tests {
     fn get_indexes_by_the_matching_bit_pattern() {
         let set = build_variants().expect("variants must build");
         assert_eq!(
-            set.get(false, false, false, false).as_raw(),
+            set.get(false, false, false, false, false).as_raw(),
             set.variants[0b0000].as_raw()
         );
-        assert_eq!(set.get(true, false, false, false).as_raw(), set.variants[0b1000].as_raw());
-        assert_eq!(set.get(false, true, false, false).as_raw(), set.variants[0b0100].as_raw());
-        assert_eq!(set.get(false, false, true, false).as_raw(), set.variants[0b0010].as_raw());
-        assert_eq!(set.get(false, false, false, true).as_raw(), set.variants[0b0001].as_raw());
-        assert_eq!(set.get(true, true, true, true).as_raw(), set.variants[0b1111].as_raw());
+        assert_eq!(set.get(true, false, false, false, false).as_raw(), set.variants[0b01000].as_raw());
+        assert_eq!(set.get(false, true, false, false, false).as_raw(), set.variants[0b00100].as_raw());
+        assert_eq!(set.get(false, false, true, false, false).as_raw(), set.variants[0b00010].as_raw());
+        assert_eq!(set.get(false, false, false, true, false).as_raw(), set.variants[0b00001].as_raw());
+        assert_eq!(set.get(false, false, false, false, true).as_raw(), set.variants[0b10000].as_raw());
+        assert_eq!(set.get(true, true, true, true, true).as_raw(), set.variants[0b11111].as_raw());
     }
 
     /// Geometric proof, independent of the rendered-pixel tests above, that the whole column fits.
@@ -849,7 +1154,8 @@ mod render_dump {
         for (i, img) in set.variants.iter().enumerate() {
             img.save(dir.join(variant_filename(i))).expect("save");
         }
-        set.needs_auth.save(dir.join(NEEDS_AUTH_FILENAME)).expect("save");
-        println!("dumped 17 variants to {}", dir.display());
+        set.needs_auth[0].save(dir.join(NEEDS_AUTH_FILENAME)).expect("save");
+        set.needs_auth[1].save(dir.join(NEEDS_AUTH_UPDATE_FILENAME)).expect("save");
+        println!("dumped 34 variants to {}", dir.display());
     }
 }

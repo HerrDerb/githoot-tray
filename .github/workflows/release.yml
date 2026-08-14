@@ -108,7 +108,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        # The tag is baked into the binary, not read from Cargo.toml. This workflow has always treated
+        # the tag as the source of truth (see build-macos below), and the self-updater compares against
+        # whatever the binary reports — so if it reported Cargo.toml's version, a forgotten bump would
+        # make it either miss real updates or claim ones that do not exist.
+        env:
+          GST_VERSION: ${{ github.ref_name }}
+        run: |
+          export GST_VERSION="${GST_VERSION#v}"
+          cargo build --release --target ${{ matrix.target }}
+        shell: bash
 
       - name: Attach binary to release
         env:
@@ -140,7 +149,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --target aarch64-apple-darwin
+        env:
+          GST_VERSION: ${{ github.ref_name }}
+        run: |
+          export GST_VERSION="${GST_VERSION#v}"
+          cargo build --release --target aarch64-apple-darwin
 
       - name: Bundle, sign and zip
         run: |
@@ -158,4 +171,89 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" \
             dist/git-system-tray-macos-aarch64.zip \
+            --clobber
+
+  # ── 4. Sign the release assets ──────────────────────────────────────────────
+  # This is what makes the self-updater safe, and it is the only part of the chain that provides
+  # *authenticity* rather than just integrity.
+  #
+  # The updater fetches sha256sums.txt plus its detached signature, and verifies that signature against
+  # a public key compiled into the already-installed binary. A digest file on its own would be worthless
+  # here: it travels the same channel from the same host as the asset, so anyone able to replace one can
+  # replace the other. Only a key that was already on the user's machine breaks that circularity.
+  #
+  # Runs last, and needs every build job, because it hashes what they uploaded. `if: always()` is
+  # deliberately NOT used: signing a partial set would publish a manifest missing a platform, and the
+  # updater would then refuse that platform's asset with a confusing "no entry in the signed sums file"
+  # rather than the truth, which is that its build failed.
+  sign:
+    needs: [build, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist && cd dist
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'git-system-tray' \
+            --pattern 'git-system-tray.exe' \
+            --pattern 'git-system-tray-macos-aarch64.zip'
+          ls -l
+
+      - name: Hash them
+        run: |
+          set -euo pipefail
+          cd dist
+          # Plain `sha256sum` format: "<hex>  <name>". The updater matches on the file name only, so
+          # running this from inside dist/ keeps the paths bare.
+          sha256sum git-system-tray git-system-tray.exe git-system-tray-macos-aarch64.zip \
+            > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the signing tool
+        # `rsign2` rather than apt's `minisign`, deliberately: it is what generated the key, so there is
+        # no cross-tool compatibility question about a passwordless secret key, and its prehashed output
+        # is what `minisign-verify` in the app is tested against (see `update::tests`).
+        run: cargo install rsign2 --locked
+
+      - name: Sign the digest file
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set, so this release cannot be signed and the" \
+                 "self-updater would refuse it. See README, Maintainer setup: signing keys."
+            exit 1
+          fi
+          # Written outside the workspace and removed straight after, so it cannot be picked up by a
+          # later step or an artifact upload.
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keyfile"
+          # `-W` on *signing* too, not just generation: without it rsign tries to prompt for a password
+          # and fails on a runner with no tty.
+          rsign sign -W -s "$keyfile" -x dist/sha256sums.txt.minisig dist/sha256sums.txt
+          test -s dist/sha256sums.txt.minisig
+
+      - name: Verify what was just signed
+        # Cheap, and it is the difference between publishing a signature and publishing a signature that
+        # works. A release whose signature does not verify would be refused by every client.
+        run: |
+          set -euo pipefail
+          rsign verify -P 'RWSYrhd3sxiQUDZtxm8c+p0iRdj+z+fGQKdLq62ojrmfii2OjCG8PX8D' \
+            -x dist/sha256sums.txt.minisig dist/sha256sums.txt
+
+      - name: Attach the manifest and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            dist/sha256sums.txt \
+            dist/sha256sums.txt.minisig \
             --clobber

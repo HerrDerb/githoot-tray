@@ -1,6 +1,6 @@
 [package]
 name = "git-system-tray"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 
 [[bin]]
@@ -20,6 +20,16 @@ arboard = "3.4"
 # Shared, not Windows-only: Linux needs it to *encode* the composited review-dot icons, because
 # libappindicator takes a filesystem path rather than pixel data.
 image = { version = "0.24", default-features = false, features = ["png"] }
+# The self-updater's integrity chain. Both are small, pure-Rust and do no I/O of their own.
+#
+# `minisign-verify` is verify-only by design: it cannot sign, so no private-key handling can ever
+# creep into the shipped binary. It is what makes the update chain an *authenticity* check rather
+# than just a corruption check — see `update::verify_checksums`. A signature checked against a key
+# already compiled into the installed binary is the only link an attacker who can replace release
+# assets, or intercept TLS with a trusted root, cannot forge.
+minisign-verify = "0.2"
+# SHA-256 for the per-asset digests listed in the signed sums file.
+sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"
@@ -35,4 +45,4 @@ tray-icon = "0.21.1"
 winit = "0.30.12"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3.9", features = ["winuser", "synchapi", "errhandlingapi"] }
+winapi = { version = "0.3.9", features = ["winuser", "synchapi", "errhandlingapi", "processthreadsapi", "handleapi", "winnt"] }

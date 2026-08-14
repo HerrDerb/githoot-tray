@@ -72,11 +72,25 @@ pub fn message(title: &str, msg: &str) {
 /// Shows `msg` under `title` with two choices and blocks until the user picks one.
 ///
 /// Returns `true` for the accepting choice (`accept_label`), `false` for the declining one
-/// (`exit_label`). Best effort like `message`: if the dialog mechanism itself is unavailable the
-/// caller gets `true` back, so a platform quirk degrades to "do the thing anyway" rather than
-/// leaving the user with a prompt they never saw and an action that never happened. An explicit
-/// choice by the user is always honoured, including the declining one.
-fn confirm(title: &str, msg: &str, accept_label: &str, exit_label: &str) -> bool {
+/// (`exit_label`). An explicit choice by the user is always honoured, including the declining one.
+///
+/// `on_unavailable` is what to answer when **no dialog could be shown at all** — no display server, no
+/// `zenity` or `kdialog`, `osascript` missing, `MessageBoxW` failing. It is a parameter rather than a
+/// constant because the right answer depends entirely on what the caller does next, and getting it
+/// backwards is a real hazard in one direction:
+///
+///   * Opening a browser: `true`. The user misses a prompt and gets a web page, which is harmless and
+///     better than nothing happening at all.
+///   * Installing a downloaded executable: `false`. "I could not ask" must never be read as consent to
+///     replace the running binary. A headless box would otherwise self-update silently on the strength
+///     of a prompt nobody ever saw.
+fn confirm(
+    title: &str,
+    msg: &str,
+    accept_label: &str,
+    exit_label: &str,
+    on_unavailable: bool,
+) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::ptr::null_mut;
@@ -93,9 +107,10 @@ fn confirm(title: &str, msg: &str, accept_label: &str, exit_label: &str) -> bool
         let result = unsafe {
             MessageBoxW(null_mut(), msg_w.as_ptr(), title_w.as_ptr(), MB_OKCANCEL | MB_ICONQUESTION)
         };
-        // A failed call returns 0, which must read as accept, not as Cancel — so this checks for
-        // the one button that means stop rather than the one that means go.
-        result != IDCANCEL
+        // A failed call returns 0, which is "could not ask" rather than either button, so it takes
+        // `on_unavailable`. Otherwise this checks for the one button that means stop rather than the
+        // one that means go, so an unexpected return value still reads as accept.
+        if result == 0 { on_unavailable } else { result != IDCANCEL }
     }
 
     #[cfg(target_os = "macos")]
@@ -126,8 +141,8 @@ fn confirm(title: &str, msg: &str, accept_label: &str, exit_label: &str) -> bool
             // was used — a real choice, not a failure, so it is honoured as a decline.
             Ok(_) => false,
             // `osascript` itself could not run. Unlike a real choice this says nothing about what
-            // the user wants, so it must not silently swallow the action.
-            Err(_) => true,
+            // the user wants, so the caller decides what silence means.
+            Err(_) => on_unavailable,
         }
     }
 
@@ -189,21 +204,22 @@ fn confirm(title: &str, msg: &str, accept_label: &str, exit_label: &str) -> bool
             }
         }
 
-        // Nothing graphical available. Print what a dialog would have said and return `true`, so
-        // the caller still performs the action — for the device flow that means the browser opens
-        // by itself, which is exactly what this app did on Linux before there was a dialog at all.
+        // Nothing graphical available: no display server, or neither tool installed. Print what a
+        // dialog would have said and hand the decision to `on_unavailable`, because what "could not
+        // ask" should mean depends on the caller — opening a browser anyway is helpful, installing an
+        // executable anyway is not.
         //
-        // Deliberately no `stdin().read_line` here, unlike `message`: this is reachable at startup
-        // with nobody waiting to be asked (see the same reasoning in `main.rs`'s
-        // `load_pr_credential`), and blocking there would hold the tray icon hostage.
+        // Deliberately no `stdin().read_line` here, unlike `message`: this is reachable at startup and
+        // from background threads with nobody waiting to be asked (see the same reasoning in
+        // `main.rs`'s `load_pr_credential`), and blocking there would hold the tray icon hostage.
+        let assumed = if on_unavailable { accept_label } else { exit_label };
         println!();
         println!("━━━  {title}  ━━━");
         println!("{msg}");
-        println!("  (no zenity/kdialog available, continuing as if you chose \"{accept_label}\")");
+        println!("  (no zenity/kdialog available, continuing as if you chose \"{assumed}\")");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!();
-        let _ = exit_label;
-        true
+        on_unavailable
     }
 }
 
@@ -259,7 +275,9 @@ pub fn show_device_code_prompt(subject: &str, user_code: &str, verification_uri:
     let verification_uri = verification_uri.to_string();
 
     std::thread::spawn(move || {
-        if confirm(&title, &body, OPEN_WEBSITE_LABEL, "Close") {
+        // `true` when no dialog can be shown: the worst case is a browser opening unasked, which is
+        // how this app behaved on Linux before it had a dialog at all.
+        if confirm(&title, &body, OPEN_WEBSITE_LABEL, "Close", true) {
             copy_to_clipboard(&user_code);
             if let Err(e) = open::that(&verification_uri) {
                 crate::logln!("could not open browser automatically: {e}");
@@ -271,6 +289,41 @@ pub fn show_device_code_prompt(subject: &str, user_code: &str, verification_uri:
             );
         }
     });
+}
+
+/// Asks whether to install a downloaded update, and **declines if it cannot ask**.
+///
+/// That default is the point of this wrapper existing rather than callers using `confirm` directly.
+/// Everywhere else in this app, a dialog that cannot be shown degrades to "go ahead". Here it must
+/// degrade to "stop": the action on the other side replaces the running executable, and a machine with
+/// no display server or no `zenity` would otherwise install an update on the strength of a prompt no
+/// human ever saw.
+///
+/// Blocks until answered, so call it from the update thread — never from the UI thread, and never from
+/// the poll thread, which has notifications to fetch.
+pub fn confirm_install(title: &str, msg: &str) -> bool {
+    confirm(title, msg, "Install and restart", "Not now", false)
+}
+
+/// Reports an update outcome the user should see, without ever blocking on stdin.
+///
+/// `dialog::message`'s Linux arm waits on `stdin().read_line`, which on a machine launched from a
+/// desktop entry means a background thread parked forever. This is reachable only from the update
+/// thread, so it uses the graphical mechanisms and falls back to the log rather than to a terminal
+/// nobody is reading.
+pub fn report(title: &str, msg: &str) {
+    crate::logln!("{title}: {msg}");
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    message(title, msg);
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Reuses `confirm`'s tool discovery and display guard by asking a question with one real
+        // answer. `--info` would be tidier, but going through `confirm` means there is exactly one
+        // place that knows how to find zenity or kdialog and whether a display exists at all.
+        let _ = confirm(title, msg, "OK", "OK", false);
+    }
 }
 
 /// Records that a Device Flow authorization succeeded. Log only, deliberately no dialog — a second
@@ -327,16 +380,19 @@ mod confirm_tests {
             &format!("Click \"{OPEN_WEBSITE_LABEL}\" for this test to pass."),
             OPEN_WEBSITE_LABEL,
             "Close",
+            true,
         );
         assert!(accepted, "the accepting button must return true");
     }
 
-    /// With no display server the graphical path is skipped entirely and the fallback continues as
-    /// if accepted, so a headless launch still opens the browser. Linux-only: it is the only arm
-    /// that consults the environment.
+    /// With no display server the graphical path is skipped entirely and `on_unavailable` decides.
+    /// Asserted in **both** directions, because the whole hazard here is one caller silently getting
+    /// the other's default: the device-flow prompt must continue and open a browser, while the update
+    /// installer must refuse rather than replace a binary on the strength of a prompt nobody saw.
+    /// Linux-only: it is the only arm that consults the environment.
     #[test]
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    fn headless_falls_back_to_accepting() {
+    fn headless_answers_with_the_callers_chosen_default() {
         // SAFETY: single-threaded test, and both variables are restored before it returns.
         let (display, wayland) = (std::env::var_os("DISPLAY"), std::env::var_os("WAYLAND_DISPLAY"));
         unsafe {
@@ -344,7 +400,11 @@ mod confirm_tests {
             std::env::remove_var("WAYLAND_DISPLAY");
         }
 
-        let accepted = confirm("headless", "no display here", "accept", "decline");
+        let accepted = confirm("headless", "no display here", "accept", "decline", true);
+        let declined = !confirm("headless", "no display here", "accept", "decline", false);
+        // The wrapper the updater actually calls, checked through its real entry point rather than by
+        // trusting that it passes `false` down.
+        let install_declined = !confirm_install("headless", "no display here");
 
         unsafe {
             if let Some(v) = display {
@@ -354,7 +414,12 @@ mod confirm_tests {
                 std::env::set_var("WAYLAND_DISPLAY", v);
             }
         }
-        assert!(accepted, "no display must degrade to accepting, not to declining");
+        assert!(accepted, "on_unavailable=true must degrade to accepting");
+        assert!(declined, "on_unavailable=false must degrade to declining");
+        assert!(
+            install_declined,
+            "confirm_install must never read an unaskable prompt as consent to replace the binary"
+        );
     }
 }
 

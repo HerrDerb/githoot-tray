@@ -1,1 +1,5 @@
 /target
+
+# minisign signing key for releases. Never commit this: the whole update-integrity
+# guarantee rests on the private half existing only here and in the Actions secret.
+minisign.key

@@ -11,16 +11,34 @@
 use crate::access_token::TokenStore;
 use crate::github;
 use crate::github_app::{AuthError, PrStatus, PrTokenStore, PR_NOT_INSTALLED};
+use crate::update::{Available, RestartPlan};
 use crate::logln;
 use crate::state::{IconState, PollState, PrAxis, MENU_BURST, REFRESH_BURST};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// Floor between re-authentication attempts, so a credential GitHub keeps rejecting cannot
 /// produce a storm of authorization prompts.
 const MIN_REAUTH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How often to ask GitHub whether a newer release exists.
+///
+/// Once a day. The poll loop already wakes at least every 15 minutes, so this needs no timer of its
+/// own — just an elapsed-time gate, the same shape as `may_retry`. Releases happen at human pace and
+/// the unauthenticated rate limit is 60 requests an hour per IP, so anything faster would be spending
+/// budget to learn nothing. The first check runs immediately at startup, which is when someone who has
+/// just launched the app is most likely to be looking at it.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Guards against two overlapping installs.
+///
+/// A `static` rather than a loop local because the install runs on a detached thread that outlives the
+/// loop iteration that spawned it, so the flag has to live somewhere both can see. Clicking the menu
+/// entry twice is the case this exists for.
+static UPDATE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Search query for pull requests awaiting the user's review.
 ///
@@ -101,6 +119,12 @@ pub enum Wake {
     /// The user asked for an update directly, by clicking the icon. Nothing on GitHub's side is
     /// changing, so one poll answers it and a burst would just be traffic.
     PollNow,
+    /// The user picked the Install update item.
+    ///
+    /// Unlike `Authenticate`, the work does **not** happen on the poll thread: downloading several
+    /// megabytes would stall notification polling for as long as it takes, so this spawns a dedicated
+    /// thread and returns immediately. See `run_poll_loop`.
+    UpdateNow,
     /// The user picked the Authenticate item, asking for the PR-status device flow to run now.
     ///
     /// Handled on the poll thread rather than in the click handler because that is where the
@@ -119,6 +143,24 @@ pub struct Update {
     /// Worded in `state` rather than in each platform's UI code so the two cannot say it
     /// differently.
     pub pr_labels: [String; 3],
+    /// Text for the install-update entry, carrying the version. `None` when no update is available, in
+    /// which case the entry is hidden and its label is irrelevant.
+    pub update_label: Option<String>,
+}
+
+/// Everything the poll loop needs that is not a channel or a UI handle.
+///
+/// Grouped because both platforms' entry points were growing a parallel list of the same four values,
+/// and the Linux one had reached nine parameters — at which point the order is the only thing telling
+/// two `bool`s apart. Naming them at the call site is worth a struct.
+pub struct PollInputs {
+    pub tokens: Option<TokenStore>,
+    pub pr: PrStatus,
+    /// Held for the whole run because `Wake::Authenticate` can arrive at any time and
+    /// `PrTokenStore::authenticate` needs somewhere to save what it obtains.
+    pub app_asset_path: PathBuf,
+    /// Whether to look for newer releases at all. See `config::Config::update_check`.
+    pub update_check: bool,
 }
 
 // ─── Shared polling core ──────────────────────────────────────────────────────
@@ -128,15 +170,14 @@ pub struct Update {
 /// `emit` returns `false` once the UI is gone, which ends the loop. A panic in here used to
 /// freeze the icon at its last value with no trace; now it at least says so in the log.
 fn spawn_poll_thread(
-    tokens: Option<TokenStore>,
-    pr: PrStatus,
-    app_asset_path: PathBuf,
+    inputs: PollInputs,
     wake_rx: Receiver<Wake>,
     emit: impl FnMut(Update) -> bool + Send + 'static,
+    restart: impl Fn(RestartPlan) + Send + Clone + 'static,
 ) {
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            run_poll_loop(tokens, pr, app_asset_path, wake_rx, emit)
+            run_poll_loop(inputs, wake_rx, emit, restart)
         }));
         if outcome.is_err() {
             logln!("poll thread panicked — notification updates have stopped");
@@ -147,12 +188,12 @@ fn spawn_poll_thread(
 /// `app_asset_path` is held for the whole run because `Wake::Authenticate` can arrive at any time,
 /// and `PrTokenStore::authenticate` needs somewhere to save what it obtains.
 fn run_poll_loop(
-    mut tokens: Option<TokenStore>,
-    pr: PrStatus,
-    app_asset_path: PathBuf,
+    inputs: PollInputs,
     wake_rx: Receiver<Wake>,
     mut emit: impl FnMut(Update) -> bool,
+    restart: impl Fn(RestartPlan) + Send + Clone + 'static,
 ) {
+    let PollInputs { mut tokens, pr, app_asset_path, update_check: update_check_enabled } = inputs;
     let client = match github::build_client() {
         Ok(client) => client,
         Err(e) => {
@@ -182,6 +223,11 @@ fn run_poll_loop(
     let mut burst: VecDeque<Duration> = VecDeque::new();
     let mut last_reauth: Option<Instant> = None;
     let mut last_pr_reauth: Option<Instant> = None;
+    // `None` means "never checked", which is what makes the first check happen immediately.
+    let mut last_update_check: Option<Instant> = None;
+    // The release the last check found, held so the menu click has something to install without
+    // re-asking GitHub. Cleared when a check finds nothing newer.
+    let mut pending_update: Option<Available> = None;
 
     // While a refresh burst is draining we send no `If-None-Match`. A conditional request can
     // legitimately answer 304 from a cached view, which would leave a just-read icon stuck on
@@ -230,8 +276,43 @@ fn run_poll_loop(
         });
 
         // Update the UI before anything else here can block.
-        if !emit(Update { icon, tooltip: tooltip.clone(), pr_labels }) {
+        let update_label = state.update_menu_label();
+        if !emit(Update { icon, tooltip: tooltip.clone(), pr_labels, update_label }) {
             return; // UI has gone away
+        }
+
+        // ── Is there a newer release? ────────────────────────────────────────
+        // Cheap: one unauthenticated GET, gated to once a day, so it runs inline rather than needing a
+        // thread. Placed after `emit` deliberately — the icon is already showing this cycle's answer
+        // before this can add anything to it, so a slow or hanging check delays only itself.
+        //
+        // Failures are logged and dropped, never surfaced. Not being able to ask whether an update
+        // exists is not something the user can act on, and a dialog for it would be noise.
+        if update_check_enabled
+            && last_update_check.is_none_or(|at| at.elapsed() >= UPDATE_CHECK_INTERVAL)
+        {
+            last_update_check = Some(Instant::now());
+            match crate::version::Version::current() {
+                Some(current) => match crate::update::check(&client, current) {
+                    Ok(Some(available)) => {
+                        logln!(
+                            "update available: {} (installed {current})",
+                            available.version
+                        );
+                        state.set_update_available(Some(available.version.to_string()));
+                        pending_update = Some(available);
+                    }
+                    Ok(None) => {
+                        // Clears the arrow, which matters right after an install: the new binary is
+                        // current, so this is what takes the arrow back down.
+                        state.set_update_available(None);
+                        pending_update = None;
+                    }
+                    Err(e) => logln!("update check failed: {e}"),
+                },
+                // Unreachable from a normal build; see `Version::current`.
+                None => logln!("update check skipped: this build's version is unparseable"),
+            }
         }
 
         // ── Credential recovery, per axis ────────────────────────────────────
@@ -350,6 +431,40 @@ fn run_poll_loop(
                         );
                         burst = MENU_BURST.iter().copied().collect();
                     }
+                    // Deliberately *not* on this thread, unlike `Authenticate`. The download is
+                    // megabytes and the timeout is minutes, and polling has to keep working
+                    // throughout — a frozen icon during an install would look like a crash.
+                    Wake::UpdateNow => {
+                        if let Some(available) = pending_update.clone() {
+                            // `swap` rather than load-then-store: two menu clicks in quick succession
+                            // must not both get past this.
+                            if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                                logln!("an update install is already in progress");
+                            } else {
+                                let restart = restart.clone();
+                                std::thread::spawn(move || {
+                                    match crate::update::install(&available) {
+                                        // Hands the plan to the UI thread, which is the only one that
+                                        // can take the tray down cleanly before the process ends.
+                                        Ok(plan) => restart(plan),
+                                        Err(crate::update::UpdateError::Declined) => {
+                                            logln!("update declined by the user");
+                                        }
+                                        Err(e) => crate::dialog::report(
+                                            "git-system-tray: update failed",
+                                            &format!(
+                                                "The update was not installed and the current \
+                                                 version is untouched.\n\n{e}"
+                                            ),
+                                        ),
+                                    }
+                                    UPDATE_IN_FLIGHT.store(false, Ordering::SeqCst);
+                                });
+                            }
+                        } else {
+                            logln!("install requested, but no update is pending");
+                        }
+                    }
                     // Blocks this thread for as long as the user takes, which is exactly why it is
                     // here and not in the click handler: the tray stays responsive throughout, and
                     // the only cost is that polling pauses while a credential is being obtained —
@@ -456,6 +571,9 @@ pub struct MenuItems {
     /// above: they are hidden when there is nothing to open, this one is hidden when there is
     /// nothing to authorize.
     pub authenticate: gtk::MenuItem,
+    /// Shown only while a newer release exists. Its label carries the version, so it is relabelled as
+    /// well as shown and hidden.
+    pub update: gtk::MenuItem,
 }
 
 #[cfg(target_os = "linux")]
@@ -472,10 +590,9 @@ pub fn start_notification_scheduler(
     indicator: libappindicator::AppIndicator,
     icons: crate::icons::IconSet<String>,
     menu_items: MenuItems,
-    tokens: Option<TokenStore>,
-    pr: PrStatus,
-    app_asset_path: PathBuf,
+    inputs: PollInputs,
     wake_rx: Receiver<Wake>,
+    restart_tx: std::sync::mpsc::Sender<RestartPlan>,
 ) {
     // Use the glib that `gtk` itself was built against, so this timer is attached by the same
     // bindings that run the main loop.
@@ -484,9 +601,27 @@ pub fn start_notification_scheduler(
     use gtk::prelude::*;
 
     let (update_tx, update_rx) = std::sync::mpsc::channel::<Update>();
-    spawn_poll_thread(tokens, pr, app_asset_path, wake_rx, move |update| {
-        update_tx.send(update).is_ok()
-    });
+    // A second channel rather than a variant on `Update`: a restart is a one-off instruction, not part
+    // of the per-poll rendering state, and mixing them would mean every poll carried an `Option` that is
+    // `None` for the whole life of the process bar once.
+    spawn_poll_thread(
+        inputs,
+        wake_rx,
+        move |update| update_tx.send(update).is_ok(),
+        move |plan| {
+            // Two steps, because this runs on the update thread and GTK is main-thread-only. The plan
+            // goes down the channel `main` reads after `gtk::main()` returns, and then the main loop is
+            // asked to return at all — without that second half the plan would sit unread forever.
+            //
+            // `idle_add` rather than `idle_add_local`: this is a cross-thread post, so the closure must
+            // be `Send`. It captures nothing, which is what makes that hold.
+            let _ = restart_tx.send(plan);
+            glib::idle_add(|| {
+                gtk::main_quit();
+                glib::ControlFlow::Break
+            });
+        },
+    );
 
     // No `Arc<Mutex<_>>` here: `timeout_add_local` requires only `FnMut + 'static`, and this
     // closure runs on the GTK main thread, so the indicator can simply be owned by it.
@@ -499,6 +634,10 @@ pub fn start_notification_scheduler(
     // Tracked separately from `applied` because it is not one of the four signals but a replacement
     // for all of them, and because it drives a menu item the four do not.
     let mut applied_needs_auth: Option<bool> = None;
+    // Likewise separate: an available update is a fifth independent signal drawn in a corner the other
+    // four never touch, and it drives its own menu entry.
+    let mut applied_update: Option<bool> = None;
+    let mut applied_update_label: Option<String> = None;
 
     glib::timeout_add_local(UI_DRAIN_INTERVAL, move || {
         while let Ok(update) = update_rx.try_recv() {
@@ -513,6 +652,7 @@ pub fn start_notification_scheduler(
                 update.icon.changes_requested.as_confirmed().unwrap_or(current[3]),
             ];
             let needs_auth = update.icon.needs_auth;
+            let update_available = update.icon.update_available;
 
             // Checked before the four signals, because it overrides them: with no credential there
             // is nothing to draw a dot from. `wanted` is still computed and stored above, so the
@@ -526,12 +666,26 @@ pub fn start_notification_scheduler(
                 applied = None;
             }
 
+            if applied_update != Some(update_available) {
+                menu_items.update.set_visible(update_available);
+                applied_update = Some(update_available);
+                // Same reason as above: the arrow is part of the variant, so the image has to be
+                // re-applied even though none of the four signals moved.
+                applied = None;
+            }
+
             if applied != Some(wanted) {
+                // The arrow rides along with both branches, because it is orthogonal to whether a
+                // credential is missing: an update is worth showing either way, and the two marks sit
+                // in opposite corners.
                 if needs_auth {
-                    indicator.set_icon(icons.needs_auth().as_str());
+                    indicator.set_icon(icons.needs_auth(update_available).as_str());
                 } else {
-                    indicator
-                        .set_icon(icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).as_str());
+                    indicator.set_icon(
+                        icons
+                            .get(wanted[0], wanted[1], wanted[2], wanted[3], update_available)
+                            .as_str(),
+                    );
                 }
 
                 // An entry that opens an empty list is a dead end, so it is hidden. `wanted` says
@@ -567,6 +721,15 @@ pub fn start_notification_scheduler(
                 }
             }
 
+            // Carries the version, so it changes whenever a newer release appears. Same
+            // only-on-change guard as the PR labels, for the same reason.
+            if let Some(label) = update.update_label.as_deref()
+                && applied_update_label.as_deref() != Some(label)
+            {
+                menu_items.update.set_label(label);
+                applied_update_label = Some(label.to_string());
+            }
+
             indicator.set_title(&update.tooltip);
             // A label is the only part of an indicator visible without hovering, so an unknown
             // state gets a marker the user can actually notice.
@@ -597,19 +760,30 @@ pub enum TrayEvent {
     /// The tray icon itself was clicked. macOS only, for the same reason.
     #[cfg(target_os = "macos")]
     IconClick,
+    /// An update has been installed; hand over to it.
+    ///
+    /// Arrives from the update thread. Handled on the UI thread because the tray icon has to be dropped
+    /// before this process exits, or the shell is left holding a dead icon.
+    Restart(RestartPlan),
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn start_notification_scheduler(
-    tokens: Option<TokenStore>,
-    pr: PrStatus,
-    app_asset_path: PathBuf,
+    inputs: PollInputs,
     wake_rx: Receiver<Wake>,
     proxy: winit::event_loop::EventLoopProxy<TrayEvent>,
 ) {
-    spawn_poll_thread(tokens, pr, app_asset_path, wake_rx, move |update| {
-        proxy.send_event(TrayEvent::Update(update)).is_ok()
-    });
+    let restart_proxy = proxy.clone();
+    spawn_poll_thread(
+        inputs,
+        wake_rx,
+        move |update| proxy.send_event(TrayEvent::Update(update)).is_ok(),
+        move |plan| {
+            // Same asymmetry as everywhere else in this module: Linux uses a channel, these two use the
+            // event loop proxy. The tray has to come down on the UI thread before the process ends.
+            let _ = restart_proxy.send_event(TrayEvent::Restart(plan));
+        },
+    );
 }
 
 #[cfg(test)]

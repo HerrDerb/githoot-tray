@@ -88,6 +88,13 @@ pub struct IconState {
     /// It doubles as the "show the Authenticate menu item" signal, so the icon and the menu cannot
     /// disagree about whether a click is being waited on.
     pub needs_auth: bool,
+    /// A newer release exists, so the up-arrow is drawn in the top-left corner.
+    ///
+    /// Independent of every other field here, including `needs_auth`: an available update says nothing
+    /// about your PRs or your credentials, and the arrow sits in a corner nothing else uses. It also
+    /// doubles as the "show the Install update menu item" signal, for the same reason `needs_auth`
+    /// does — one source of truth means the icon and the menu cannot contradict each other.
+    pub update_available: bool,
     pub notifications: Presence,
     pub review_requested: Presence,
     pub ready_to_merge: Presence,
@@ -108,6 +115,12 @@ pub const AUTHENTICATE_MENU_LABEL: &str = "Authenticate GitHub PR Status";
 /// Hover text while PR status is waiting to be authorized. Says what is wrong *and* where the fix
 /// is, because the red exclamation on its own only says that something is.
 const PR_NEEDS_AUTH_TOOLTIP: &str = "PR status: not authorized yet. Use the menu to authorize.";
+
+/// Base text of the tray menu item that installs an available update.
+///
+/// The version is appended by `update_menu_label`, the same way `pr_menu_label` appends a count: the
+/// icon can only say *that* something is available, so the number goes where there is room for it.
+pub const UPDATE_MENU_LABEL: &str = "Install update";
 
 /// One of the three independent PR-search signals.
 ///
@@ -271,6 +284,11 @@ pub struct PollState {
     /// the user cannot clear from here (the GitHub App is not installed anywhere); this is a state
     /// with a menu item waiting to be clicked, so it gets its own icon and its own wording.
     pr_needs_auth: bool,
+    /// The version of the newest release above this build, once a check has found one.
+    ///
+    /// A `String` rather than a parsed version because its only consumers are a menu label and a
+    /// tooltip line, and it should be shown exactly as the release names itself.
+    update_available: Option<String>,
     /// Most recent `x-poll-interval`, once GitHub has told us one.
     server_interval: Option<Duration>,
     /// A wait GitHub explicitly demanded; overrides normal pacing for one cycle.
@@ -284,6 +302,7 @@ impl PollState {
             pr: pr_configured.map(|configured| configured.then(Track::new)),
             pr_off: [None, None, None],
             pr_needs_auth: false,
+            update_available: None,
             server_interval: None,
             forced_delay: None,
         }
@@ -338,6 +357,24 @@ impl PollState {
             self.pr[axis.index()] = Some(Track::new());
             self.pr_off[axis.index()] = None;
         }
+    }
+
+    /// Records the newest release above this build, or clears it.
+    ///
+    /// Called after each update check. Passing `None` clears the arrow, which matters after a
+    /// successful install: the new binary reports its own version, so the very next check finds
+    /// nothing newer and the arrow has to come back down.
+    pub fn set_update_available(&mut self, version: Option<String>) {
+        self.update_available = version;
+    }
+
+    /// Text for the tray menu item that installs the update, or `None` when there is none.
+    ///
+    /// Carries the version for the same reason `pr_menu_label` carries a count: the icon can only say
+    /// that *something* is available, and "Install update: 1.4.0" is what makes it actionable without
+    /// hovering.
+    pub fn update_menu_label(&self) -> Option<String> {
+        self.update_available.as_ref().map(|v| format!("{UPDATE_MENU_LABEL}: {v}"))
     }
 
     /// Whether PR status is waiting on the user.
@@ -395,6 +432,7 @@ impl PollState {
         // to find out, there is simply nothing configured to ask with.
         IconState {
             needs_auth: self.pr_needs_auth,
+            update_available: self.update_available.is_some(),
             notifications: self.notifications.as_ref().map_or(Presence::No, |t| t.value),
             review_requested: self.pr_value(PrAxis::ReviewRequested),
             ready_to_merge: self.pr_value(PrAxis::ReadyToMerge),
@@ -534,6 +572,12 @@ impl PollState {
                     (None, None) => {}
                 }
             }
+        }
+
+        // Last of the state lines, and deliberately not gated on anything above it: an available
+        // update is orthogonal to notifications and PRs, so it is reported whatever else is going on.
+        if let Some(version) = self.update_available.as_deref() {
+            lines.push(format!("Update available: {version}"));
         }
 
         // Surface at most one reason, preferring notifications and then PR axes in `PrAxis::ALL`
