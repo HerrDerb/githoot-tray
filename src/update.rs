@@ -1158,6 +1158,65 @@ mod tests {
         );
     }
 
+    /// Runs the whole integrity chain against the **real published release**: fetch the signed manifest,
+    /// verify its signature with the compiled-in key, download this platform's asset, match its digest,
+    /// check its magic bytes, and run it to confirm it honours the `--print-version` contract.
+    ///
+    /// `#[ignore]`d because it needs the network and several megabytes, but it is the test that would
+    /// have caught a release published without a signature, or a signature over the wrong bytes. Run it
+    /// after cutting a release:
+    /// `cargo test -- --ignored verifies_the_live_release --nocapture`
+    ///
+    /// Deliberately stops short of installing: the swap and the hand-over need a real desktop session
+    /// and a human to confirm, so those stay a manual step.
+    #[test]
+    #[ignore = "needs network; downloads the real release assets"]
+    fn verifies_the_live_release() {
+        let poll = crate::github::build_client().expect("a polling client");
+        // A version below any real release, so the newest one is always the target.
+        let ancient = Version::parse("0.0.1").expect("parses");
+        let available = check(&poll, ancient)
+            .expect("the releases list must be readable")
+            .expect("there must be at least one release newer than 0.0.1");
+        println!("target: {} (tag {})", available.version, available.tag);
+
+        let client = download_client().expect("a download client");
+        let sums = fetch_text(&client, &asset_url(&available.tag, SUMS_ASSET))
+            .expect("the release must publish sha256sums.txt");
+        let signature = fetch_text(&client, &asset_url(&available.tag, SIG_ASSET))
+            .expect("the release must publish sha256sums.txt.minisig");
+        verify_sums(&sums, &signature).expect("the live manifest must verify against the built-in key");
+        println!("signature verified against the compiled-in key");
+
+        let asset = ASSET.expect("this platform must have a published asset to run this test");
+        let expected = digest_for(&sums, asset).expect("the manifest must cover this platform's asset");
+
+        let dir = std::env::temp_dir().join(format!("gst-live-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let payload = dir.join(asset);
+
+        let bytes = fetch_file(&client, &asset_url(&available.tag, asset), &payload)
+            .expect("the asset must download");
+        let actual = sha256_file(&payload).expect("the download must be hashable");
+        assert_eq!(actual, expected, "the published asset must match its signed digest");
+        check_magic(&payload).expect("the asset must be the right kind of file");
+        println!("{bytes} bytes, digest {actual} matches the signed manifest");
+
+        // Only meaningful where the asset is a bare executable; the macOS asset is a zip.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            smoke_test(&payload, &available.version)
+                .expect("the published binary must honour --print-version and report its own version");
+            println!("smoke test passed: it reports {}", available.version);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn digests_are_looked_up_by_file_name() {
         assert_eq!(digest_for(FIXTURE_SUMS, "git-system-tray").unwrap(), "aaaa1111");
