@@ -53,7 +53,7 @@ const INDICATOR_SLOTS: usize = 3;
 /// Bar height as a fraction of icon height. 26px of 96, so three bars and two gaps fill 92.
 const BAR_HEIGHT_RATIO: f32 = 0.271;
 /// Bar width as a multiple of its height. Wider than tall so a bar reads as a bar and not a dot.
-const BAR_ASPECT: f32 = 2.0;
+const BAR_ASPECT: f32 = 1.5;
 /// Vertical gap between bars, as a fraction of icon height. See the constraint above before lowering.
 const BAR_GAP_RATIO: f32 = 0.073;
 /// Gap between the column's right edge and the icon's, as a fraction of icon width.
@@ -64,7 +64,13 @@ const BAR_RIGHT_MARGIN_RATIO: f32 = 0.041;
 /// larger than the bar itself, so it traces the bar's outline exactly. An earlier version used a
 /// distance-field ring with a soft fade, which pinched wherever two bars' rings met and let wedges
 /// of the glyph show through the gaps. See `with_indicator_bars` for why the two passes matter.
-const BAR_BORDER_PX: f32 = 3.0;
+///
+/// At this width it is no longer a hairline outline: 10px against a 39×26 bar clears the 7px gaps
+/// between bars completely and costs about 29% of the glyph's white pixels. That is the point — the
+/// bars have to separate from the octocat at a 16px tray slot, where 10 source px is barely 1.7
+/// rendered px. The top and bottom bars' borders run 8px off the canvas and are clipped, which is
+/// free: see `the_column_fits_and_its_gaps_survive_scaling` for why that is deliberate.
+const BAR_BORDER_PX: f32 = 10.0;
 
 /// Bright red, chosen to hold contrast on both light and dark taskbars.
 const REVIEW_DOT_COLOR: [u8; 4] = [0xF0, 0x3E, 0x3E, 0xFF];
