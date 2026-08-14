@@ -72,7 +72,7 @@ On macOS the bare binary works from a terminal, but it takes a Dock icon and an 
 `LSUIElement` can only be set in an app bundle. To get the real thing:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 2.4.0
+scripts/bundle-macos.sh target/release/git-system-tray dist 1.1.0
 open dist/git-system-tray.app
 ```
 

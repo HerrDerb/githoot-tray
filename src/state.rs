@@ -79,9 +79,15 @@ impl Presence {
 }
 
 /// What the UI should draw: one presence per dot/tint, matching `icons::IconSet`'s four
-/// independent signals.
+/// independent signals, plus the one flag that overrides all of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IconState {
+    /// PR status is waiting for the user to authorize it, so `icons::IconSet::needs_auth` is drawn
+    /// and the four fields below are not consulted at all.
+    ///
+    /// It doubles as the "show the Authenticate menu item" signal, so the icon and the menu cannot
+    /// disagree about whether a click is being waited on.
+    pub needs_auth: bool,
     pub notifications: Presence,
     pub review_requested: Presence,
     pub ready_to_merge: Presence,
@@ -92,6 +98,16 @@ pub struct IconState {
 ///
 /// Lives here, next to the code that appends the count to it, so the two cannot drift apart.
 pub const REVIEWS_MENU_LABEL: &str = "Open Requested Reviews";
+
+/// Text of the tray menu item that starts the PR-status Device Flow.
+///
+/// Shown only while `PollState::pr_needs_auth` holds. Lives here with the other menu wording so the
+/// platform UI code in `main.rs` and `scheduler.rs` cannot spell it two different ways.
+pub const AUTHENTICATE_MENU_LABEL: &str = "Authenticate GitHub PR Status";
+
+/// Hover text while PR status is waiting to be authorized. Says what is wrong *and* where the fix
+/// is, because the red exclamation on its own only says that something is.
+const PR_NEEDS_AUTH_TOOLTIP: &str = "PR status: not authorized yet. Use the menu to authorize.";
 
 /// One of the three independent PR-search signals.
 ///
@@ -249,6 +265,12 @@ pub struct PollState {
     /// credential looks exactly like a dark dot because nothing needs attention, which is the one
     /// confusion this module exists to prevent.
     pr_off: [Option<String>; 3],
+    /// PR status has no usable credential and needs the user to start a browser round trip.
+    ///
+    /// Deliberately separate from `pr_off`, even though both mean "no dots". `pr_off` is a dead end
+    /// the user cannot clear from here (the GitHub App is not installed anywhere); this is a state
+    /// with a menu item waiting to be clicked, so it gets its own icon and its own wording.
+    pr_needs_auth: bool,
     /// Most recent `x-poll-interval`, once GitHub has told us one.
     server_interval: Option<Duration>,
     /// A wait GitHub explicitly demanded; overrides normal pacing for one cycle.
@@ -261,6 +283,7 @@ impl PollState {
             notifications: notifications_configured.then(Track::new),
             pr: pr_configured.map(|configured| configured.then(Track::new)),
             pr_off: [None, None, None],
+            pr_needs_auth: false,
             server_interval: None,
             forced_delay: None,
         }
@@ -286,6 +309,45 @@ impl PollState {
     pub fn disable_pr(&mut self, axis: PrAxis, reason: String) {
         self.pr[axis.index()] = None;
         self.pr_off[axis.index()] = Some(reason);
+    }
+
+    /// Records that PR status is waiting for the user to authorize it.
+    ///
+    /// Silences all three axes, because they share one credential: with none in hand there is
+    /// nothing to search with, and issuing three searches that will each be rejected would only
+    /// burn rate limit. No per-axis reason is stored — `tooltip` says it once for all three, and
+    /// the icon and menu item say it without hovering.
+    pub fn require_pr_auth(&mut self) {
+        self.pr_needs_auth = true;
+        for axis in PrAxis::ALL {
+            self.pr[axis.index()] = None;
+            self.pr_off[axis.index()] = None;
+        }
+    }
+
+    /// Undoes `require_pr_auth` once a credential has been obtained, putting all three axes back in
+    /// play so the next cycle can fill them in.
+    ///
+    /// They come back as fresh `Track`s rather than with their old values restored: whatever was
+    /// last known predates the credential going away, and re-asserting it would be claiming an
+    /// answer nothing has confirmed since. A fresh `Track` starts at `Presence::Unknown`, which is
+    /// the honest answer and also the one that leaves the icon alone until a real poll lands.
+    pub fn clear_pr_auth(&mut self) {
+        self.pr_needs_auth = false;
+        for axis in PrAxis::ALL {
+            self.pr[axis.index()] = Some(Track::new());
+            self.pr_off[axis.index()] = None;
+        }
+    }
+
+    /// Whether PR status is waiting on the user.
+    ///
+    /// `#[cfg(test)]` like the two `*_configured` accessors above: the UI reads this through
+    /// `icon().needs_auth` so the icon and the menu item cannot disagree, which leaves no non-test
+    /// caller for a second way to ask.
+    #[cfg(test)]
+    pub fn pr_needs_auth(&self) -> bool {
+        self.pr_needs_auth
     }
 
     /// Call once per cycle, before applying that cycle's responses.
@@ -332,6 +394,7 @@ impl PollState {
         // Unavailable reads as a confirmed "no dot"/"no tint" on every axis: we are not failing
         // to find out, there is simply nothing configured to ask with.
         IconState {
+            needs_auth: self.pr_needs_auth,
             notifications: self.notifications.as_ref().map_or(Presence::No, |t| t.value),
             review_requested: self.pr_value(PrAxis::ReviewRequested),
             ready_to_merge: self.pr_value(PrAxis::ReadyToMerge),
@@ -452,16 +515,24 @@ impl PollState {
             });
         }
 
-        for axis in PrAxis::ALL {
-            match (self.pr[axis.index()].as_ref(), self.pr_off[axis.index()].as_deref()) {
-                (Some(track), _) => lines.push(match track.value {
-                    Presence::Yes => axis.tooltip_yes(track.count),
-                    Presence::No => axis.tooltip_no().to_string(),
-                    Presence::Unknown => axis.tooltip_unknown().to_string(),
-                }),
-                // The dot is off for a reason the user can fix, so hovering has to say which one.
-                (None, Some(reason)) => lines.push(reason.to_string()),
-                (None, None) => {}
+        // One line for all three axes, not one each. They share a single credential, so three
+        // copies of the same sentence would say nothing extra while eating the whole
+        // `MAX_TOOLTIP_CHARS` budget — and the per-axis lines below would be claiming answers that
+        // were never fetched.
+        if self.pr_needs_auth {
+            lines.push(PR_NEEDS_AUTH_TOOLTIP.to_string());
+        } else {
+            for axis in PrAxis::ALL {
+                match (self.pr[axis.index()].as_ref(), self.pr_off[axis.index()].as_deref()) {
+                    (Some(track), _) => lines.push(match track.value {
+                        Presence::Yes => axis.tooltip_yes(track.count),
+                        Presence::No => axis.tooltip_no().to_string(),
+                        Presence::Unknown => axis.tooltip_unknown().to_string(),
+                    }),
+                    // The dot is off for a reason the user can fix, so hovering has to say which one.
+                    (None, Some(reason)) => lines.push(reason.to_string()),
+                    (None, None) => {}
+                }
             }
         }
 
@@ -998,6 +1069,103 @@ mod tests {
 
         let tip = state.tooltip();
         assert!(tip.contains("merge dot off: test reason"), "got {tip:?}");
+    }
+
+    // ── Waiting on the user to authorize ───────────────────────────────────────
+
+    #[test]
+    fn require_pr_auth_silences_every_axis_and_flags_the_icon() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.require_pr_auth();
+
+        assert!(state.pr_needs_auth());
+        assert!(state.icon().needs_auth, "the icon must carry the override");
+        for axis in PrAxis::ALL {
+            assert!(
+                !state.pr_configured(axis),
+                "{axis:?} must be silenced — one credential is missing, so all three are"
+            );
+        }
+    }
+
+    /// A silenced axis must not be revivable by a stray response. `apply_pr` is documented as a
+    /// no-op when an axis is unconfigured, and this is the case that matters: a search already in
+    /// flight when the credential died must not put a dot back on an icon that is telling the user
+    /// nothing is known.
+    #[test]
+    fn responses_arriving_after_require_pr_auth_are_ignored() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.require_pr_auth();
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(7));
+
+        assert_eq!(state.icon().review_requested, Presence::No);
+        assert!(state.icon().needs_auth);
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), REVIEWS_MENU_LABEL);
+    }
+
+    /// The three axes share one credential, so the tooltip must explain it once. Three copies would
+    /// fit inside no sensible budget and add nothing.
+    #[test]
+    fn the_needs_auth_tooltip_is_said_once_not_once_per_axis() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.require_pr_auth();
+
+        let tip = state.tooltip();
+        assert_eq!(tip.matches(PR_NEEDS_AUTH_TOOLTIP).count(), 1, "got {tip:?}");
+        assert!(tip.chars().count() <= MAX_TOOLTIP_CHARS + 1, "got {} chars", tip.chars().count());
+        // The per-axis lines must be gone entirely: "No reviews requested" alongside "not
+        // authorized" would be answering a question that was never asked.
+        assert!(!tip.contains(PrAxis::ReviewRequested.tooltip_no()), "got {tip:?}");
+    }
+
+    /// Notifications are a separate credential, so their line must survive. This is the split case
+    /// the whole per-credential design exists for.
+    #[test]
+    fn needs_auth_leaves_the_notifications_line_alone() {
+        let mut state = PollState::new(true, [true, true, true]);
+        state.begin_cycle();
+        state.apply_notifications(fresh(true));
+        state.require_pr_auth();
+
+        let tip = state.tooltip();
+        assert!(tip.contains("unread notifications"), "got {tip:?}");
+        assert!(tip.contains(PR_NEEDS_AUTH_TOOLTIP), "got {tip:?}");
+    }
+
+    #[test]
+    fn clear_pr_auth_puts_every_axis_back_in_play_without_stale_values() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.begin_cycle();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(4));
+        assert_eq!(state.icon().review_requested, Presence::Yes);
+
+        state.require_pr_auth();
+        state.clear_pr_auth();
+
+        assert!(!state.pr_needs_auth());
+        assert!(!state.icon().needs_auth);
+        for axis in PrAxis::ALL {
+            assert!(state.pr_configured(axis), "{axis:?} must be searchable again");
+        }
+        // `Unknown`, not `Yes` and not `No`: the count of 4 predates the credential going away, and
+        // nothing has confirmed anything since. `Unknown` is also what stops the icon flickering —
+        // the UI leaves that dot as it is until a real answer lands.
+        assert_eq!(state.icon().review_requested, Presence::Unknown);
+        assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), REVIEWS_MENU_LABEL);
+    }
+
+    /// `require_pr_auth` must clear any earlier `disable_pr` reason, or the tooltip would carry a
+    /// stale "off because…" line next to the new "not authorized" one.
+    #[test]
+    fn require_pr_auth_supersedes_an_earlier_disable_reason() {
+        let mut state = PollState::new(false, [true, true, true]);
+        state.disable_pr(PrAxis::ReadyToMerge, "merge dot off: earlier reason".to_string());
+        state.require_pr_auth();
+
+        let tip = state.tooltip();
+        assert!(!tip.contains("earlier reason"), "got {tip:?}");
+        assert_eq!(tip, PR_NEEDS_AUTH_TOOLTIP);
     }
 
     #[test]

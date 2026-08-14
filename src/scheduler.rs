@@ -10,10 +10,11 @@
 
 use crate::access_token::TokenStore;
 use crate::github;
-use crate::github_app::PrTokenStore;
+use crate::github_app::{AuthError, PrStatus, PrTokenStore, PR_NOT_INSTALLED};
 use crate::logln;
 use crate::state::{IconState, PollState, PrAxis, MENU_BURST, REFRESH_BURST};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -89,9 +90,10 @@ fn percent_encode(input: &str) -> String {
 
 /// Reason the poll loop was woken early.
 ///
-/// Both cause an immediate unconditional poll. They differ in what happens *after* it, because they
-/// mean different things: one says the answer is about to change on GitHub's side, the other says
-/// the user wants to see the current answer now.
+/// The first two cause an immediate unconditional poll, differing only in what happens *after* it,
+/// because they mean different things: one says the answer is about to change on GitHub's side, the
+/// other says the user wants to see the current answer now. `Authenticate` is a different kind of
+/// thing altogether — it asks the loop to do work first, and there is no point polling until it has.
 pub enum Wake {
     /// The user opened a GitHub page, so what they have read is about to change. Needs follow-up
     /// polls, since GitHub takes a moment to register that things were read.
@@ -99,6 +101,13 @@ pub enum Wake {
     /// The user asked for an update directly, by clicking the icon. Nothing on GitHub's side is
     /// changing, so one poll answers it and a burst would just be traffic.
     PollNow,
+    /// The user picked the Authenticate item, asking for the PR-status device flow to run now.
+    ///
+    /// Handled on the poll thread rather than in the click handler because that is where the
+    /// credential lives, and because the flow blocks for as long as the user takes — up to GitHub's
+    /// 15-minute device-code lifetime. Running it on the UI thread would freeze the tray for all of
+    /// it, which on Linux means the whole GTK main loop.
+    Authenticate,
 }
 
 /// One rendering instruction for the UI thread.
@@ -120,14 +129,14 @@ pub struct Update {
 /// freeze the icon at its last value with no trace; now it at least says so in the log.
 fn spawn_poll_thread(
     tokens: Option<TokenStore>,
-    pr: Option<PrTokenStore>,
-    pr_off: Option<String>,
+    pr: PrStatus,
+    app_asset_path: PathBuf,
     wake_rx: Receiver<Wake>,
     emit: impl FnMut(Update) -> bool + Send + 'static,
 ) {
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            run_poll_loop(tokens, pr, pr_off, wake_rx, emit)
+            run_poll_loop(tokens, pr, app_asset_path, wake_rx, emit)
         }));
         if outcome.is_err() {
             logln!("poll thread panicked — notification updates have stopped");
@@ -135,10 +144,12 @@ fn spawn_poll_thread(
     });
 }
 
+/// `app_asset_path` is held for the whole run because `Wake::Authenticate` can arrive at any time,
+/// and `PrTokenStore::authenticate` needs somewhere to save what it obtains.
 fn run_poll_loop(
     mut tokens: Option<TokenStore>,
-    mut pr: Option<PrTokenStore>,
-    pr_off: Option<String>,
+    pr: PrStatus,
+    app_asset_path: PathBuf,
     wake_rx: Receiver<Wake>,
     mut emit: impl FnMut(Update) -> bool,
 ) {
@@ -150,9 +161,19 @@ fn run_poll_loop(
         }
     };
 
+    let (mut pr, pr_off, needs_auth) = match pr {
+        PrStatus::Ready(store) => (Some(store), None, false),
+        PrStatus::NeedsAuth => (None, None, true),
+        PrStatus::Off(reason) => (None, Some(reason), false),
+    };
+
     let mut state = PollState::new(tokens.is_some(), [pr.is_some(); 3]);
-    // Carry the startup verdict into the tooltip, so "no dot" always has a stated reason. All
-    // three PR axes share one credential, so one reason applies to all three.
+    // Both branches mean "no PR dots", and both are deliberately said differently: one has a menu
+    // item waiting to be clicked, the other has a reason clicking cannot address. The three axes
+    // share one credential, so whichever it is applies to all three at once.
+    if needs_auth {
+        state.require_pr_auth();
+    }
     if let Some(reason) = pr_off {
         for axis in PrAxis::ALL {
             state.disable_pr(axis, reason.clone());
@@ -248,18 +269,22 @@ fn run_poll_loop(
 
         if pr_needs_reauth && may_retry(&mut last_pr_reauth) {
             match pr.as_mut().map(PrTokenStore::reauthenticate) {
-                // Covers both a proactive refresh and a full fresh sign-in: `reauthenticate`
-                // tries the cheap refresh-token grant first and only falls back to a browser
-                // round trip if that fails, so either way the credential is worth retrying with
-                // at once.
+                // The silent refresh grant worked, so the new credential is worth retrying with at
+                // once. Nothing user-visible happened, which is the point.
                 Some(Ok(())) => retry_now = true,
-                Some(Err(e)) => {
-                    logln!("PR credential re-authentication failed: {e}");
-                    for axis in PrAxis::ALL {
-                        state.disable_pr(axis, "PR status off: re-authentication failed".to_string());
-                    }
+                // The grant cannot help: no refresh token, or GitHub rejected the one we have. Hand
+                // it to the user rather than opening a browser unannounced — the exclamation goes up
+                // and the Authenticate item appears, and `Wake::Authenticate` picks it up from there.
+                Some(Err(AuthError::AuthorizationRequired)) => {
+                    logln!("PR status needs authorization — waiting for the menu");
+                    state.require_pr_auth();
                     pr = None;
                 }
+                // Anything else is a failure to *ask*, not an answer. Most often the network is
+                // down. The credential is kept and the axes are left alone, so this retries on the
+                // next cycle instead of costing the user a click it did not need. `MIN_REAUTH_INTERVAL`
+                // is what stops that becoming a hot loop.
+                Some(Err(e)) => logln!("PR credential renewal could not be attempted ({e}) — will retry"),
                 None => {}
             }
         }
@@ -325,6 +350,39 @@ fn run_poll_loop(
                         );
                         burst = MENU_BURST.iter().copied().collect();
                     }
+                    // Blocks this thread for as long as the user takes, which is exactly why it is
+                    // here and not in the click handler: the tray stays responsive throughout, and
+                    // the only cost is that polling pauses while a credential is being obtained —
+                    // which it could not usefully do anyway.
+                    Wake::Authenticate => match PrTokenStore::authenticate(&app_asset_path) {
+                        Ok(store) => match store.installation_count() {
+                            // Authorized, but the App is installed nowhere, so search would see no
+                            // repositories at all. Another click cannot fix that, so the exclamation
+                            // comes down and a stated reason replaces it. Same check startup does.
+                            Ok(0) => {
+                                logln!("{PR_NOT_INSTALLED}");
+                                state.clear_pr_auth();
+                                for axis in PrAxis::ALL {
+                                    state.disable_pr(axis, PR_NOT_INSTALLED.to_string());
+                                }
+                                pr = None;
+                            }
+                            // Could not confirm installations. Start polling anyway rather than
+                            // refuse over a question we could not even ask — the same reasoning
+                            // startup uses.
+                            outcome => {
+                                if let Err(e) = outcome {
+                                    logln!("could not confirm installations ({e}) — continuing anyway");
+                                }
+                                logln!("PR status authorized");
+                                state.clear_pr_auth();
+                                pr = Some(store);
+                            }
+                        },
+                        // Denied, expired, or the network went away mid-flow. The state is left as
+                        // it was, so the item is still on the menu to try again.
+                        Err(e) => logln!("authorization failed: {e}"),
+                    },
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -394,6 +452,10 @@ pub struct MenuItems {
     pub reviews: gtk::MenuItem,
     pub ready_to_merge: gtk::MenuItem,
     pub changes_requested: gtk::MenuItem,
+    /// Shown only while PR status is waiting to be authorized. It is the counterpart of the four
+    /// above: they are hidden when there is nothing to open, this one is hidden when there is
+    /// nothing to authorize.
+    pub authenticate: gtk::MenuItem,
 }
 
 #[cfg(target_os = "linux")]
@@ -411,8 +473,8 @@ pub fn start_notification_scheduler(
     icons: crate::icons::IconSet<String>,
     menu_items: MenuItems,
     tokens: Option<TokenStore>,
-    pr: Option<PrTokenStore>,
-    pr_off: Option<String>,
+    pr: PrStatus,
+    app_asset_path: PathBuf,
     wake_rx: Receiver<Wake>,
 ) {
     // Use the glib that `gtk` itself was built against, so this timer is attached by the same
@@ -422,7 +484,7 @@ pub fn start_notification_scheduler(
     use gtk::prelude::*;
 
     let (update_tx, update_rx) = std::sync::mpsc::channel::<Update>();
-    spawn_poll_thread(tokens, pr, pr_off, wake_rx, move |update| {
+    spawn_poll_thread(tokens, pr, app_asset_path, wake_rx, move |update| {
         update_tx.send(update).is_ok()
     });
 
@@ -434,6 +496,9 @@ pub fn start_notification_scheduler(
     // instead of four separate bools so the loop below does not have to hand-repeat itself.
     let mut applied: Option<[bool; 4]> = None;
     let mut applied_labels: [Option<String>; 3] = [None, None, None];
+    // Tracked separately from `applied` because it is not one of the four signals but a replacement
+    // for all of them, and because it drives a menu item the four do not.
+    let mut applied_needs_auth: Option<bool> = None;
 
     glib::timeout_add_local(UI_DRAIN_INTERVAL, move || {
         while let Ok(update) = update_rx.try_recv() {
@@ -447,21 +512,45 @@ pub fn start_notification_scheduler(
                 update.icon.ready_to_merge.as_confirmed().unwrap_or(current[2]),
                 update.icon.changes_requested.as_confirmed().unwrap_or(current[3]),
             ];
+            let needs_auth = update.icon.needs_auth;
+
+            // Checked before the four signals, because it overrides them: with no credential there
+            // is nothing to draw a dot from. `wanted` is still computed and stored above, so the
+            // moment authorization succeeds the icon can go straight back to the right variant
+            // without waiting for a signal to change.
+            if applied_needs_auth != Some(needs_auth) {
+                menu_items.authenticate.set_visible(needs_auth);
+                applied_needs_auth = Some(needs_auth);
+                // Force the icon/menu block below to run: the variant it should show has just
+                // changed even if none of the four signals did.
+                applied = None;
+            }
 
             if applied != Some(wanted) {
-                indicator.set_icon(icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).as_str());
+                if needs_auth {
+                    indicator.set_icon(icons.needs_auth().as_str());
+                } else {
+                    indicator
+                        .set_icon(icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).as_str());
+                }
 
                 // An entry that opens an empty list is a dead end, so it is hidden. `wanted` says
                 // it directly: the icon carries a signal exactly when that entry has somewhere to
                 // go. Its treatment of `Unknown` carries over too, so a failed poll leaves the menu
                 // as it was rather than hiding an entry we simply could not ask about.
                 //
+                // The three PR entries are hidden outright while waiting to authorize, because none
+                // of them can have anything behind them. Notifications are *not*: that is a separate
+                // credential which may be working perfectly, and hiding a working entry because a
+                // different one needs attention would take away a feature that still functions. The
+                // icon cannot say both things at once, but the menu can.
+                //
                 // GTK has per-item visibility, so this is a flag rather than the remove-and-append
                 // dance the Windows side needs. `show_all` is called once during setup and never
                 // again, so nothing undoes these.
                 menu_items.notifications.set_visible(wanted[0]);
                 for (item, &visible) in menu_items.pr_items().into_iter().zip(&wanted[1..]) {
-                    item.set_visible(visible);
+                    item.set_visible(!needs_auth && visible);
                 }
 
                 applied = Some(wanted);
@@ -513,12 +602,12 @@ pub enum TrayEvent {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn start_notification_scheduler(
     tokens: Option<TokenStore>,
-    pr: Option<PrTokenStore>,
-    pr_off: Option<String>,
+    pr: PrStatus,
+    app_asset_path: PathBuf,
     wake_rx: Receiver<Wake>,
     proxy: winit::event_loop::EventLoopProxy<TrayEvent>,
 ) {
-    spawn_poll_thread(tokens, pr, pr_off, wake_rx, move |update| {
+    spawn_poll_thread(tokens, pr, app_asset_path, wake_rx, move |update| {
         proxy.send_event(TrayEvent::Update(update)).is_ok()
     });
 }

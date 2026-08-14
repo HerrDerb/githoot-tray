@@ -343,9 +343,9 @@ fn device_code_flow(http: &Client, client_id: &str) -> Result<String, AuthError>
         .map_err(|_| AuthError::Github(describe_device_code_failure(status, &body)))?;
 
     // ── Step 2: prompt the user ───────────────────────────────────────────────
-    if let Err(e) = open::that(&dc.verification_uri) {
-        logln!("could not open browser automatically: {e}");
-    }
+    // The prompt owns the browser launch — it opens the verification page when the user clicks its
+    // button, so the page never appears before the dialog explaining the code. Returns immediately;
+    // the dialog lives on its own thread so step 3 can start polling while it is still up.
     crate::dialog::show_device_code_prompt(AUTH_SUBJECT, &dc.user_code, &dc.verification_uri);
 
     // ── Step 3: poll until authorized or expired ──────────────────────────────

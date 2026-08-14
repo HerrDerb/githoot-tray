@@ -83,6 +83,13 @@ pub enum AuthError {
     Denied,
     Expired,
     Github(String),
+    /// Nothing left to try without the user: there is no refresh token, or GitHub rejected the one
+    /// we have. The only way forward is a device flow, which needs a browser and a human, so this
+    /// is reported rather than started — the caller raises the tray's Authenticate item and waits.
+    ///
+    /// Deliberately distinct from `Network`: unreachable is not the same as invalid, and a laptop
+    /// launched before its WiFi is up must not be told to sign in again.
+    AuthorizationRequired,
 }
 
 impl std::fmt::Display for AuthError {
@@ -92,6 +99,7 @@ impl std::fmt::Display for AuthError {
             AuthError::Denied => write!(f, "authorization was denied"),
             AuthError::Expired => write!(f, "device code expired before authorization completed"),
             AuthError::Github(e) => write!(f, "GitHub reported: {e}"),
+            AuthError::AuthorizationRequired => write!(f, "authorization required"),
         }
     }
 }
@@ -297,9 +305,8 @@ fn request_device_code(http: &Client) -> Result<DeviceCodeResponse, AuthError> {
 fn device_code_flow(http: &Client) -> Result<Credential, AuthError> {
     let dc = request_device_code(http)?;
 
-    if let Err(e) = open::that(&dc.verification_uri) {
-        logln!("could not open browser automatically: {e}");
-    }
+    // The prompt owns the browser launch — see `dialog::show_device_code_prompt`. Non-blocking, so
+    // the poll loop below starts while the dialog is still on screen.
     crate::dialog::show_device_code_prompt(AUTH_SUBJECT, &dc.user_code, &dc.verification_uri);
 
     let mut poll_interval = Duration::from_secs(dc.interval.max(MIN_DEVICE_POLL_INTERVAL));
@@ -378,6 +385,30 @@ fn installation_count(http: &Client, token: &str) -> Result<u64, AuthError> {
 
 // ── Token storage ─────────────────────────────────────────────────────────────
 
+/// Tooltip reason when the user is authorized but the App is installed on no account.
+///
+/// Shared by the two places that can discover it — `main.rs` at startup and the poll loop right
+/// after a menu-driven sign-in — so the same condition cannot be worded two ways.
+pub const PR_NOT_INSTALLED: &str = "PR status off: install the GitHub App to see your PRs";
+
+/// What PR status could be brought up to without asking the user anything.
+///
+/// Three outcomes rather than an `Option`, because "no dots on the icon" has three quite different
+/// meanings and each is said differently. Collapsing them is exactly the confusion this codebase is
+/// shaped around avoiding: a dark icon that means "nothing needs you" must never look like one that
+/// means "nobody could ask".
+pub enum PrStatus {
+    /// A usable credential. Polling starts immediately.
+    Ready(PrTokenStore),
+    /// Nothing usable on disk, or what was there can no longer be renewed silently. Red
+    /// exclamation, `Authenticate` on the menu, one click from being fixed.
+    NeedsAuth,
+    /// Signed in fine, but there is nothing to see and clicking would not change that — the App is
+    /// not installed on any account, or no HTTP client could be built at all. The reason travels
+    /// with it, for the tooltip.
+    Off(String),
+}
+
 /// Owns the PR-status credential and knows how to renew it.
 ///
 /// Lives on the poll thread so a mid-run 401, or an approaching expiry, can be recovered from
@@ -389,30 +420,63 @@ pub struct PrTokenStore {
 }
 
 impl PrTokenStore {
-    /// Startup path: reuse a saved credential if it is not expired (refreshing it first if it
-    /// is, and that succeeds), otherwise run the device flow.
-    pub fn load(app_asset_path: &Path) -> Result<Self, AuthError> {
+    /// Startup path, and deliberately **non-interactive**: reuse a saved credential, refreshing it
+    /// first if it is expiring and carries a refresh token.
+    ///
+    /// `Ok(None)` means there is nothing usable and a device flow is needed. That is reported rather
+    /// than run, because launching a browser during startup is the behaviour this design replaces:
+    /// the tray icon appears first, wearing the red exclamation, and the user starts the flow from
+    /// the menu when it suits them. `Err` is reserved for not being able to build an HTTP client at
+    /// all, which no amount of clicking would fix.
+    ///
+    /// A refresh grant *is* still attempted here, unlike the device flow: it needs no browser and no
+    /// human, so there is nothing to defer.
+    pub fn load_saved(app_asset_path: &Path) -> Result<Option<Self>, AuthError> {
         let http = build_client()?;
         let token_path = app_asset_path.join(PR_TOKEN_FILE);
 
-        if let Some(saved) = read_credential(&token_path) {
-            if !saved.needs_refresh() {
-                return Ok(Self { token_path, credential: saved, http });
-            }
+        let Some(saved) = read_credential(&token_path) else {
+            logln!("no saved PR credential — waiting for the user to authorize");
+            return Ok(None);
+        };
 
-            if let Some(refresh_token) = saved.refresh_token.clone() {
-                match refresh(&http, &refresh_token) {
-                    Ok(credential) => {
-                        save_credential(&token_path, &credential);
-                        return Ok(Self { token_path, credential, http });
-                    }
-                    Err(e) => {
-                        logln!("saved PR credential's refresh failed ({e}) — reauthenticating");
-                    }
-                }
-            }
+        if !saved.needs_refresh() {
+            return Ok(Some(Self { token_path, credential: saved, http }));
         }
 
+        let Some(refresh_token) = saved.refresh_token.clone() else {
+            logln!("saved PR credential has expired and carries no refresh token");
+            return Ok(None);
+        };
+
+        match refresh(&http, &refresh_token) {
+            Ok(credential) => {
+                save_credential(&token_path, &credential);
+                Ok(Some(Self { token_path, credential, http }))
+            }
+            // Could not reach GitHub, which says nothing about whether the refresh token is still
+            // good — the common cause is a tray app started at login before the network is up. Keep
+            // the stale credential and let the poll loop's own `needs_refresh` check retry every
+            // cycle, rather than demanding a click for something that heals itself.
+            Err(e @ AuthError::Network(_)) => {
+                logln!("could not refresh the PR credential yet ({e}) — retrying on the poll loop");
+                Ok(Some(Self { token_path, credential: saved, http }))
+            }
+            Err(e) => {
+                logln!("saved PR credential was rejected ({e}) — waiting for the user to authorize");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The interactive path: runs the full device flow and saves the result.
+    ///
+    /// Called only when the user picks the tray's Authenticate item, so a browser and a dialog are
+    /// expected here rather than a surprise. Blocks for as long as the flow takes (up to GitHub's
+    /// 15-minute device-code lifetime), so its caller must be the poll thread, never the UI thread.
+    pub fn authenticate(app_asset_path: &Path) -> Result<Self, AuthError> {
+        let http = build_client()?;
+        let token_path = app_asset_path.join(PR_TOKEN_FILE);
         let credential = device_code_flow(&http)?;
         save_credential(&token_path, &credential);
         Ok(Self { token_path, credential, http })
@@ -439,28 +503,35 @@ impl PrTokenStore {
         self.credential.needs_refresh()
     }
 
-    /// Mid-run recovery, called either after GitHub rejects the token or when `needs_refresh`
-    /// turns proactive. Tries the refresh grant first (cheap, no browser round trip) before
-    /// falling back to a fresh device flow — GitHub rejecting the *access* token does not
-    /// necessarily mean the refresh token is bad too.
+    /// Mid-run recovery, called either after GitHub rejects the token or when `needs_refresh` turns
+    /// proactive. The refresh grant only.
+    ///
+    /// It used to fall back to a fresh device flow, which meant a browser window and a dialog could
+    /// appear unannounced hours into a session. Now that path is the user's to start: when the
+    /// refresh grant cannot help, this returns `AuthError::AuthorizationRequired` and the caller
+    /// raises the exclamation and the Authenticate menu item instead.
+    ///
+    /// GitHub rejecting the *access* token does not mean the refresh token is bad too, so the grant
+    /// is always worth trying first — it recovers silently in the common case.
     pub fn reauthenticate(&mut self) -> Result<(), AuthError> {
-        if let Some(refresh_token) = self.credential.refresh_token.clone() {
-            match refresh(&self.http, &refresh_token) {
-                Ok(credential) => {
-                    save_credential(&self.token_path, &credential);
-                    self.credential = credential;
-                    return Ok(());
-                }
-                Err(e) => {
-                    logln!("PR credential refresh failed ({e}) — falling back to a fresh sign-in");
-                }
+        let Some(refresh_token) = self.credential.refresh_token.clone() else {
+            return Err(AuthError::AuthorizationRequired);
+        };
+
+        match refresh(&self.http, &refresh_token) {
+            Ok(credential) => {
+                save_credential(&self.token_path, &credential);
+                self.credential = credential;
+                Ok(())
+            }
+            // Passed through unchanged, not converted: a network error must not cost the user a
+            // click, so the caller retries next cycle rather than demanding authorization.
+            Err(e @ AuthError::Network(_)) => Err(e),
+            Err(e) => {
+                logln!("PR credential refresh was rejected ({e}) — authorization required");
+                Err(AuthError::AuthorizationRequired)
             }
         }
-
-        let credential = device_code_flow(&self.http)?;
-        save_credential(&self.token_path, &credential);
-        self.credential = credential;
-        Ok(())
     }
 }
 
@@ -563,6 +634,74 @@ mod tests {
     fn an_absent_file_reads_as_no_saved_credential() {
         let path = std::env::temp_dir().join("gh-app-token-definitely-does-not-exist.txt");
         assert!(read_credential(&path).is_none());
+    }
+
+    /// The behaviour the whole deferred-authorization design rests on: with nothing saved,
+    /// `load_saved` must answer "nobody is authorized" *without* touching the network or opening a
+    /// browser, so startup can put the tray icon up and wait for a click.
+    ///
+    /// If this ever regressed to running the device flow, the test would hang for GitHub's
+    /// fifteen-minute device-code lifetime rather than fail — which is itself the signal.
+    #[test]
+    fn load_saved_reports_needing_authorization_without_running_a_device_flow() {
+        let dir = std::env::temp_dir().join(format!("gh-app-load-saved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+
+        let outcome = PrTokenStore::load_saved(&dir).expect("building an HTTP client must succeed");
+        assert!(outcome.is_none(), "an empty asset directory must mean authorization is needed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A saved, non-expiring credential is reused as-is: no refresh grant, no device flow, no
+    /// network at all. This is the ordinary startup path, and it has to stay silent.
+    #[test]
+    fn load_saved_reuses_a_credential_that_is_not_expiring() {
+        let dir = std::env::temp_dir().join(format!("gh-app-load-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+
+        save_credential(
+            &dir.join(PR_TOKEN_FILE),
+            &Credential {
+                access_token: "ghu_still_good".to_string(),
+                expires_at: None,
+                refresh_token: None,
+            },
+        );
+
+        let store = PrTokenStore::load_saved(&dir)
+            .expect("building an HTTP client must succeed")
+            .expect("a healthy saved credential must be reused");
+        assert_eq!(store.token(), "ghu_still_good");
+        assert!(!store.needs_refresh());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An expired credential with no refresh token cannot be renewed silently, so it must report
+    /// needing authorization rather than falling through to a device flow.
+    #[test]
+    fn load_saved_reports_needing_authorization_for_an_unrenewable_credential() {
+        let dir = std::env::temp_dir().join(format!("gh-app-load-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+
+        save_credential(
+            &dir.join(PR_TOKEN_FILE),
+            &Credential {
+                access_token: "ghu_expired".to_string(),
+                // Well in the past, and no refresh token to trade in.
+                expires_at: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                refresh_token: None,
+            },
+        );
+
+        let outcome = PrTokenStore::load_saved(&dir).expect("building an HTTP client must succeed");
+        assert!(outcome.is_none(), "an unrenewable credential must mean authorization is needed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Not setting the env var here: mutating global process environment from a test risks

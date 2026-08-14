@@ -16,21 +16,31 @@ mod state;
 
 const NOTIFICATIONS_URL: &str = "https://github.com/notifications";
 
-/// Loads the shared PR-status credential (the `github_app` Device Flow) and confirms it can
-/// actually see something.
+/// Brings up the shared PR-status credential (the `github_app` Device Flow) as far as it can go
+/// *without involving the user*, and confirms it can actually see something.
 ///
-/// Returns the credential and, when there is none (sign-in failed, or it signed in fine but the
-/// GitHub App is not installed anywhere yet), a short reason for the tooltip.
+/// Deliberately never opens a browser and never blocks on a human. A saved credential is reused, and
+/// refreshed silently if it is expiring, but when a full sign-in is needed this returns
+/// `PrStatus::NeedsAuth` and startup carries on: the tray icon appears wearing a red exclamation
+/// with an `Authenticate` entry on its menu, and the user starts the flow when it suits them. That is
+/// the whole point — a tray app that opens a browser window before its icon has even appeared is
+/// indistinguishable from something that has gone wrong.
 ///
-/// Never fatal. Notifications are a separate, optional feature (see `config`) that does not care
-/// whether this succeeds. It does have to be *said*, though: a dark dot that means "nobody could
-/// ask" looks exactly like a dark dot that means "nothing to review", and that confusion is the
-/// bug this whole codebase is shaped around avoiding.
-fn load_pr_credential(app_asset_path: &std::path::Path) -> (Option<github_app::PrTokenStore>, Option<String>) {
-    let store = match github_app::PrTokenStore::load(app_asset_path) {
-        Ok(store) => store,
+/// Never fatal either way. Notifications are a separate, optional feature (see `config`) that does
+/// not care whether this succeeds. The outcome does have to be *said*, though: a dark dot that means
+/// "nobody could ask" looks exactly like a dark dot that means "nothing to review", and that
+/// confusion is the bug this whole codebase is shaped around avoiding.
+fn load_pr_credential(app_asset_path: &std::path::Path) -> github_app::PrStatus {
+    let store = match github_app::PrTokenStore::load_saved(app_asset_path) {
+        Ok(Some(store)) => store,
+        // Nothing usable on disk. Not an error and not worth a dialog: it is the expected state on a
+        // first run, and the icon and menu now say it plainly without interrupting anyone.
+        Ok(None) => return github_app::PrStatus::NeedsAuth,
+        // No HTTP client could be built at all, which is a broken TLS stack rather than a missing
+        // credential. Clicking `Authenticate` would fail the same way, so this is `Off`, not
+        // `NeedsAuth`.
         Err(e) => {
-            let msg = format!("Could not authenticate with GitHub for PR status: {e}");
+            let msg = format!("Could not set up GitHub access for PR status: {e}");
             logln!("PR status disabled: {msg}");
 
             // On Windows there is no console (`windows_subsystem = "windows"`) and on macOS the app
@@ -44,23 +54,22 @@ fn load_pr_credential(app_asset_path: &std::path::Path) -> (Option<github_app::P
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             eprintln!("\ngit-system-tray: PR status disabled\n\n{msg}\n");
 
-            return (None, Some("PR status off: sign-in failed".to_string()));
+            return github_app::PrStatus::Off("PR status off: setup failed".to_string());
         }
     };
 
     match store.installation_count() {
         Ok(0) => {
-            let reason = "PR status off: install the GitHub App to see your PRs".to_string();
-            logln!("{reason}");
-            (None, Some(reason))
+            logln!("{}", github_app::PR_NOT_INSTALLED);
+            github_app::PrStatus::Off(github_app::PR_NOT_INSTALLED.to_string())
         }
-        Ok(_) => (Some(store), None),
+        Ok(_) => github_app::PrStatus::Ready(store),
         // Could not confirm installations — start anyway rather than refuse over a question we
         // could not even ask. Same "unreachable is not the same as invalid" reasoning
         // `access_token`'s saved-token check already uses.
         Err(e) => {
             logln!("could not confirm GitHub App installations ({e}) — continuing anyway");
-            (Some(store), None)
+            github_app::PrStatus::Ready(store)
         }
     }
 }
@@ -116,7 +125,7 @@ fn main() {
         None
     };
 
-    let (pr, pr_off) = load_pr_credential(&app_asset_path);
+    let pr = load_pr_credential(&app_asset_path);
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
@@ -166,8 +175,19 @@ fn main() {
         let _ = changes_requested_wake_tx.send(scheduler::Wake::Refresh);
     });
 
+    // Placed first so it is the obvious thing to click when the icon is wearing an exclamation and
+    // every other entry is hidden. The click only *asks*: the device flow itself runs on the poll
+    // thread (see `scheduler::Wake::Authenticate`), because it blocks for as long as the user takes
+    // and doing that here would freeze the entire GTK main loop, tray icon and all.
+    let authenticate_item = MenuItem::with_label(state::AUTHENTICATE_MENU_LABEL);
+    let authenticate_wake_tx = wake_tx.clone();
+    authenticate_item.connect_activate(move |_| {
+        let _ = authenticate_wake_tx.send(scheduler::Wake::Authenticate);
+    });
+
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
+    menu.append(&authenticate_item);
     menu.append(&item);
     menu.append(&reviews_item);
     menu.append(&ready_to_merge_item);
@@ -199,10 +219,11 @@ fn main() {
             reviews: reviews_item.clone(),
             ready_to_merge: ready_to_merge_item.clone(),
             changes_requested: changes_requested_item.clone(),
+            authenticate: authenticate_item.clone(),
         },
         tokens,
         pr,
-        pr_off,
+        app_asset_path.clone(),
         wake_rx,
     );
 
@@ -287,7 +308,7 @@ fn main() {
         None
     };
 
-    let (pr, pr_off) = load_pr_credential(&app_asset_path);
+    let pr = load_pr_credential(&app_asset_path);
 
     // ── Tray ─────────────────────────────────────────────────────────────────
 
@@ -312,18 +333,25 @@ fn main() {
         ready_to_merge_item_id: tray_icon::menu::MenuId,
         changes_requested_item: tray_icon::menu::MenuItem,
         changes_requested_item_id: tray_icon::menu::MenuId,
+        /// Offered only while PR status is waiting to be authorized.
+        authenticate_item: tray_icon::menu::MenuItem,
+        authenticate_item_id: tray_icon::menu::MenuId,
         quit_item: tray_icon::menu::MenuItem,
         quit_item_id: tray_icon::menu::MenuId,
         /// Which image the tray is actually showing, as `[notifications, review_requested,
         /// ready_to_merge, changes_requested]`, as far as we know. `None` means "unproven", which
         /// forces the next update to re-apply rather than assume.
         applied: Option<[bool; 4]>,
+        /// Whether the icon currently shows the needs-authorization variant. Separate from `applied`
+        /// because it is not one of the four signals but a replacement for all of them.
+        applied_needs_auth: Option<bool>,
         /// Likewise for the three PR menu items' text, indexed by `PrAxis::index`, so an
         /// unchanged count does not rewrite the item.
         applied_labels: [Option<String>; 3],
-        /// And for which entries the menu currently holds. Tracked separately from `applied`
-        /// because a failed `set_icon` must not also suppress the menu update.
-        applied_menu: Option<[bool; 4]>,
+        /// And for which entries the menu currently holds — the four signals plus whether the
+        /// Authenticate entry is in. Tracked separately from `applied` because a failed `set_icon`
+        /// must not also suppress the menu update.
+        applied_menu: Option<([bool; 4], bool)>,
     }
 
     /// Decodes the icons, builds the menu, and creates the tray icon.
@@ -351,9 +379,16 @@ fn main() {
         let changes_requested_item =
             MenuItem::new(state::PrAxis::ChangesRequested.menu_label(), true, None);
         let changes_requested_item_id = changes_requested_item.id().clone();
+        let authenticate_item = MenuItem::new(state::AUTHENTICATE_MENU_LABEL, true, None);
+        let authenticate_item_id = authenticate_item.id().clone();
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_item_id = quit_item.id().clone();
         let menu = Menu::new();
+        // Authenticate is the one entry that starts *absent*, unlike the four above. They start
+        // present because nothing has been polled yet and an empty menu would offer no way to reach
+        // GitHub in the app's first moments; this one starts absent because offering to authorize
+        // something that may already be authorized is the misleading direction. The first update
+        // arrives within a second and puts it in if it is needed.
         for (item, what) in [
             (&open_item, "open"),
             (&reviews_item, "reviews"),
@@ -386,15 +421,18 @@ fn main() {
             ready_to_merge_item_id,
             changes_requested_item,
             changes_requested_item_id,
+            authenticate_item,
+            authenticate_item_id,
             quit_item,
             quit_item_id,
             // The builder set the plain icon above, but treat that as unproven so the first
             // confirmed poll always writes the image it wants.
             applied: None,
+            applied_needs_auth: None,
             applied_labels: [None, None, None],
-            // The menu was built with every entry present, and that much we did do, so it is
-            // recorded as such. Only a confirmed empty answer will take one out.
-            applied_menu: Some([true; 4]),
+            // The menu was built with the four signal entries present and Authenticate absent, and
+            // that much we did do, so it is recorded as such. Only a confirmed answer changes it.
+            applied_menu: Some(([true; 4], false)),
         })
     }
 
@@ -468,7 +506,7 @@ fn main() {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
 
     // Launch the polling thread; it communicates back via the proxy.
-    scheduler::start_notification_scheduler(tokens, pr, pr_off, wake_rx, proxy);
+    scheduler::start_notification_scheduler(tokens, pr, app_asset_path.clone(), wake_rx, proxy);
 
     // ── Application handler ──────────────────────────────────────────────────
 
@@ -517,6 +555,11 @@ fn main() {
                     logln!("failed to open browser: {e}");
                 }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
+            } else if *id == tray.authenticate_item_id {
+                // Only asks. The device flow runs on the poll thread (see
+                // `scheduler::Wake::Authenticate`), because it blocks for as long as the user takes
+                // and doing that here would freeze the event loop and the tray with it.
+                let _ = self.wake_tx.send(scheduler::Wake::Authenticate);
             } else if *id == tray.quit_item_id {
                 event_loop.exit();
             }
@@ -540,14 +583,22 @@ fn main() {
         ///
         /// Only called when the set actually changes, which is rare. It can still land while the
         /// user has the menu open, since nothing tells us whether it is showing.
-        fn rebuild_menu(&self, wanted: [bool; 4]) {
+        fn rebuild_menu(&self, wanted: [bool; 4], needs_auth: bool) {
             while self.menu.remove_at(0).is_some() {}
 
             for (item, wanted, what) in [
+                // First, so it is the obvious thing to click when the icon is wearing an
+                // exclamation and the three PR entries are gone.
+                (&self.authenticate_item, needs_auth, "authenticate"),
+                // Notifications is *not* gated on `needs_auth`: it is a separate credential that may
+                // be working perfectly, and hiding a working entry because a different one needs
+                // attention would take away a feature that still functions.
                 (&self.open_item, wanted[0], "notifications"),
-                (&self.reviews_item, wanted[1], "review-requested"),
-                (&self.ready_to_merge_item, wanted[2], "ready-to-merge"),
-                (&self.changes_requested_item, wanted[3], "changes-requested"),
+                // The three PR entries share the credential that is missing, so none of them can
+                // have anything behind them until it is obtained.
+                (&self.reviews_item, !needs_auth && wanted[1], "review-requested"),
+                (&self.ready_to_merge_item, !needs_auth && wanted[2], "ready-to-merge"),
+                (&self.changes_requested_item, !needs_auth && wanted[3], "changes-requested"),
                 // Quit is unconditional: a tray icon with no way out is a bug, not a tidy menu.
                 (&self.quit_item, true, "quit"),
             ] {
@@ -572,12 +623,25 @@ fn main() {
                 update.icon.changes_requested.as_confirmed().unwrap_or(current[3]),
             ];
 
-            if self.applied != Some(wanted) {
-                let icon = self.icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).clone();
+            let needs_auth = update.icon.needs_auth;
+
+            if self.applied != Some(wanted) || self.applied_needs_auth != Some(needs_auth) {
+                // The override is checked first because with no credential there is nothing to draw
+                // a dot from. `wanted` is still recorded either way, so the moment authorization
+                // succeeds the icon goes straight back to the right variant rather than waiting for
+                // one of the four signals to change.
+                let icon = if needs_auth {
+                    self.icons.needs_auth().clone()
+                } else {
+                    self.icons.get(wanted[0], wanted[1], wanted[2], wanted[3]).clone()
+                };
                 match self.tray_icon.set_icon(Some(icon)) {
-                    // Only record success. A failed update leaves this `None` so the next
+                    // Only record success. A failed update leaves these `None` so the next
                     // poll retries instead of believing the icon is already correct.
-                    Ok(()) => self.applied = Some(wanted),
+                    Ok(()) => {
+                        self.applied = Some(wanted);
+                        self.applied_needs_auth = Some(needs_auth);
+                    }
                     Err(e) => logln!("failed to update tray icon: {e}"),
                 }
             }
@@ -611,9 +675,9 @@ fn main() {
             // Note this inherits `wanted`'s treatment of `Unknown`: an axis we have lost track of
             // keeps whatever it last had. A failed poll must not remove an entry, because "I could
             // not ask" is not the same as "there is nothing there".
-            if self.applied_menu != Some(wanted) {
-                self.rebuild_menu(wanted);
-                self.applied_menu = Some(wanted);
+            if self.applied_menu != Some((wanted, needs_auth)) {
+                self.rebuild_menu(wanted, needs_auth);
+                self.applied_menu = Some((wanted, needs_auth));
             }
         }
     }

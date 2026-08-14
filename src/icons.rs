@@ -54,8 +54,58 @@ const MERGE_DOT_COLOR: [u8; 4] = [0x1A, 0xC9, 0x4A, 0xFF];
 /// real render.
 const CHANGES_DOT_COLOR: [u8; 4] = [0xE0, 0x8A, 0x00, 0xFF];
 
+// ── Authorization mark geometry ─────────────────────────────────────────────
+// A big exclamation mark down the **right-hand side** of the icon, for the one state where the app
+// has no credential and therefore no answer to give. Deliberately unlike the corner dots: a dot says
+// "here is one more fact about your PRs", this says "none of those facts are available".
+//
+// Three layouts were built and compared at 16px and 22px before settling here, and the reasoning is
+// worth keeping because the constraint is not obvious:
+//
+//   1. Mark through the *centre* of the glyph. Legible, but it cut the octocat in half.
+//   2. Mark on its own strip beside the glyph, on a widened canvas. The octocat stayed pristine, but
+//      a tray slot is a fixed square. Panels letterbox a non-square pixmap back into it, so the
+//      octocat came out visibly shrunk — verified on a real GNOME panel, not assumed.
+//   3. This: the canvas stays exactly square, so nothing is ever letterboxed or scaled down, and the
+//      mark moves to the right edge where it overlaps the glyph rather than bisecting it.
+//
+// So the octocat keeps its **full size** and sits *behind* the mark. It gives up its right-hand
+// sliver, which is the cheapest part of it to lose — far cheaper than either shrinking the whole
+// glyph or splitting it down the middle.
+//
+// The erase ring is therefore back: the mark is over the glyph again, and the ring is what keeps it
+// readable against the octocat's bright white face and against any taskbar colour.
+//
+// All ratios are of icon *width*, except the vertical extents which are of height, so the mark
+// survives the source assets being resized the same way the dots do.
+
+/// The mark's colour. Deliberately the same red as the review dot, which was already tuned to hold
+/// contrast on light and dark taskbars. The two can never be on screen together — a missing
+/// credential means there is no review answer to draw — so there is nothing to confuse.
+const AUTH_MARK_COLOR: [u8; 4] = REVIEW_DOT_COLOR;
+/// Width of the mark, as a fraction of icon width. One value doing two jobs: the stem's width and
+/// the dot's diameter, as a real exclamation mark has.
+const AUTH_MARK_BAND_RATIO: f32 = 0.26;
+/// Gap between the mark's right edge and the icon's right edge, as a fraction of icon width. Small,
+/// but non-zero: flush against the edge looks like a rendering accident rather than a decision.
+const AUTH_MARK_RIGHT_MARGIN_RATIO: f32 = 0.03;
+/// Lower edge of the stem, as a fraction of icon height. The stem's *upper* edge is always y = 0:
+/// the mark spans the full height of the icon, which is what makes it dominate rather than decorate.
+const AUTH_MARK_STEM_BOTTOM_RATIO: f32 = 0.66;
+/// Centre of the dot beneath the stem, as a fraction of icon height. Placed so the dot's lower edge
+/// lands just inside the bottom of the icon.
+const AUTH_MARK_DOT_CENTRE_RATIO: f32 = 0.867;
+/// The mark's erase ring, wider and with a longer fade than the corner dots'.
+///
+/// Full erasure only reaches `RING - FADE` from a shape, so this pair has to cover half the gap
+/// between stem and dot or that gap stops being fully transparent, the octocat's white face shows
+/// through it, and at 16px the two halves blur into one solid red bar. That regression happened twice
+/// during development; `the_gap_keeps_stem_and_dot_apart` is what now catches it.
+const AUTH_MARK_RING_PX: f32 = 5.5;
+const AUTH_MARK_RING_FADE_PX: f32 = 1.5;
+
 /// Which corner a dot is drawn in.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Corner {
     TopRight,
     BottomRight,
@@ -110,6 +160,65 @@ fn with_dot(src: &RgbaImage, color: [u8; 4], corner: Corner) -> RgbaImage {
     out
 }
 
+/// Returns a copy of `src` with a big red exclamation mark down its right-hand side.
+///
+/// Dimensions are preserved, deliberately: the canvas stays square so no tray panel ever letterboxes
+/// it and scales the octocat down. The glyph keeps its full size and sits behind the mark, giving up
+/// only its right-hand sliver. See the geometry block above for the two layouts rejected first.
+///
+/// Same visual language as `with_dot` — solid shape, then a fully-erased ring with a soft outer fade
+/// — so the mark stays legible against the glyph beneath it and against any taskbar colour. The
+/// difference is the shape, so the arithmetic is expressed as a *signed* distance (negative inside,
+/// positive outside) rather than `with_dot`'s distance-to-a-centre: that is what lets one pass cover
+/// a stem and a dot at once by taking the nearer of the two.
+///
+/// The stem is a capsule rather than a rectangle. Round ends match the dot below it, which is what
+/// makes the two read as one mark rather than a bar sitting above an unrelated circle.
+fn with_exclamation(src: &RgbaImage) -> RgbaImage {
+    let (width, height) = src.dimensions();
+    let mut out = src.clone();
+
+    let w = width as f32;
+    let h = height as f32;
+    // `.max(1.0)` so a pathologically small source cannot produce a zero radius and draw nothing.
+    let radius = (w * AUTH_MARK_BAND_RATIO).round().max(1.0) / 2.0;
+    // Measured in from the right edge, so the mark hugs that side rather than the centre.
+    let centre_x = w - (w * AUTH_MARK_RIGHT_MARGIN_RATIO) - radius;
+    // The stem's outer edge sits at y = 0, so its capsule centre starts one radius down.
+    let stem_top = radius;
+    let stem_bottom = h * AUTH_MARK_STEM_BOTTOM_RATIO - radius;
+    let dot_centre_y = h * AUTH_MARK_DOT_CENTRE_RATIO;
+
+    for y in 0..height {
+        for x in 0..width {
+            // Sample at the pixel centre so the anti-aliasing is symmetric, as in `with_dot`.
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+
+            // Distance to a vertical segment: clamping y to the segment's extent is what turns the
+            // point-to-point distance into point-to-capsule.
+            let stem = (px - centre_x).hypot(py - py.clamp(stem_top, stem_bottom)) - radius;
+            let dot = (px - centre_x).hypot(py - dot_centre_y) - radius;
+            let distance = stem.min(dot);
+
+            // The two branches are disjoint, so the erase can never eat mark pixels this same pass
+            // has just drawn.
+            if distance <= 0.5 {
+                let coverage = (0.5 - distance).clamp(0.0, 1.0);
+                let pixel = out.get_pixel_mut(x, y);
+                *pixel = over(AUTH_MARK_COLOR, *pixel, coverage);
+            } else if distance <= AUTH_MARK_RING_PX {
+                let erase =
+                    ((AUTH_MARK_RING_PX - distance) / AUTH_MARK_RING_FADE_PX).clamp(0.0, 1.0);
+                let pixel = out.get_pixel_mut(x, y);
+                pixel[3] = (f32::from(pixel[3]) * (1.0 - erase)).round() as u8;
+            }
+        }
+    }
+
+    out
+}
+
 /// Source-over composite of `src` (at `coverage` alpha) onto `dst`, un-premultiplied throughout.
 fn over(src: [u8; 4], dst: Rgba<u8>, coverage: f32) -> Rgba<u8> {
     let src_a = f32::from(src[3]) / 255.0 * coverage;
@@ -137,9 +246,17 @@ fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
 }
 
 /// The sixteen icon variants, indexed by a packed 4-bit key: bit 3 is the unread-notifications
-/// tint, bit 2 the review dot, bit 1 the ready-to-merge dot, bit 0 the changes-requested dot.
+/// tint, bit 2 the review dot, bit 1 the ready-to-merge dot, bit 0 the changes-requested dot —
+/// plus one extra, `needs_auth`, which is not part of that space at all.
+///
+/// `needs_auth` is a separate field rather than a seventeenth array slot on purpose: the four
+/// signals are combinable, and this one is not. It replaces the whole picture rather than adding to
+/// it, because it means "there is no credential, so none of those four questions could even be
+/// asked" — drawing dots alongside it would assert answers the app does not have. Keeping it out of
+/// the array means the 4-bit index can never reach it by accident.
 pub struct IconSet<T> {
     variants: [T; 16],
+    needs_auth: T,
 }
 
 impl<T> IconSet<T> {
@@ -152,6 +269,12 @@ impl<T> IconSet<T> {
 
     pub fn get(&self, unread: bool, review: bool, merge: bool, changes: bool) -> &T {
         &self.variants[Self::index(unread, review, merge, changes)]
+    }
+
+    /// The variant shown while a credential is waiting on the user: base glyph, big red
+    /// exclamation, no dots. Takes no arguments precisely because it overrides all four signals.
+    pub fn needs_auth(&self) -> &T {
+        &self.needs_auth
     }
 }
 
@@ -184,8 +307,15 @@ fn build_variants() -> Result<IconSet<RgbaImage>, String> {
         img
     });
 
-    Ok(IconSet { variants })
+    // Built from the plain glyph, never the blue one: the blue tint means "unread notifications",
+    // which is exactly the kind of claim this variant exists to withhold.
+    Ok(IconSet { variants, needs_auth: with_exclamation(&plain) })
 }
+
+/// Filename of the needs-authorization variant. A fixed name rather than something
+/// `variant_filename` could produce, because it is not addressed by the 4-bit key.
+#[cfg(target_os = "linux")]
+const NEEDS_AUTH_FILENAME: &str = "github_needs_auth.png";
 
 /// Filename for variant `i`, built from which bits are set rather than a hand-written 16-entry
 /// table — the table would just be this function's output written out by hand, with all the same
@@ -239,7 +369,7 @@ fn write_icon_if_changed(bytes: &[u8], path: &Path) {
     }
 }
 
-/// Creates all sixteen icon files in the asset directory and returns their paths.
+/// Creates all seventeen icon files in the asset directory and returns their paths.
 /// Used on Linux by libappindicator, which requires file-system paths.
 #[cfg(target_os = "linux")]
 pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
@@ -258,7 +388,12 @@ pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
     let variants: [String; 16] = paths
         .try_into()
         .map_err(|_| "internal error: expected exactly 16 icon variants".to_string())?;
-    Ok(IconSet { variants })
+
+    let needs_auth_path = app_asset_path.join(NEEDS_AUTH_FILENAME);
+    write_icon_if_changed(&encode_png(&images.needs_auth)?, &needs_auth_path);
+    let needs_auth = needs_auth_path.to_string_lossy().into_owned();
+
+    Ok(IconSet { variants, needs_auth })
 }
 
 // ─── Windows and macOS ────────────────────────────────────────────────────────
@@ -286,7 +421,8 @@ pub fn load_tray_icons() -> Result<IconSet<tray_icon::Icon>, String> {
     let variants: [tray_icon::Icon; 16] = icons
         .try_into()
         .map_err(|_| "internal error: expected exactly 16 icon variants".to_string())?;
-    Ok(IconSet { variants })
+    let needs_auth = to_icon(&images.needs_auth)?;
+    Ok(IconSet { variants, needs_auth })
 }
 
 #[cfg(test)]
@@ -403,6 +539,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The mark's centre column, and the Y coordinates of its interesting bands, for a 98×96 source:
+    /// the middle of the stem, the middle of the dot, and the middle of the gap between them.
+    fn auth_mark_probes() -> (u32, u32, u32, u32) {
+        let radius = (98.0 * AUTH_MARK_BAND_RATIO).round() / 2.0;
+        let centre_x = 98.0 - (98.0 * AUTH_MARK_RIGHT_MARGIN_RATIO) - radius;
+        let stem_bottom = 96.0 * AUTH_MARK_STEM_BOTTOM_RATIO - radius;
+        let dot_centre = 96.0 * AUTH_MARK_DOT_CENTRE_RATIO;
+        (
+            centre_x as u32,
+            ((radius + stem_bottom) / 2.0) as u32,
+            dot_centre as u32,
+            // Halfway between the stem's lower edge and the dot's upper edge.
+            (((stem_bottom + radius) + (dot_centre - radius)) / 2.0) as u32,
+        )
+    }
+
+    /// The canvas must stay exactly square. This is the whole reason the mark moved to the right edge
+    /// instead of getting its own strip: a non-square pixmap gets letterboxed into the tray's square
+    /// slot, which scales the octocat down. Widen this and that regression comes back.
+    #[test]
+    fn exclamation_preserves_dimensions() {
+        let src = base();
+        assert_eq!(with_exclamation(&src).dimensions(), src.dimensions());
+    }
+
+    /// The octocat keeps its full size, so the majority of it must come through untouched — the mark
+    /// takes only the right-hand sliver. Checks every pixel left of the mark and its erase ring.
+    #[test]
+    fn the_mark_only_touches_the_right_hand_sliver_of_the_glyph() {
+        let src = base();
+        let out = with_exclamation(&src);
+        let (centre_x, ..) = auth_mark_probes();
+        let radius = (98.0 * AUTH_MARK_BAND_RATIO).round() / 2.0;
+        let untouched_until = (centre_x as f32 - radius - AUTH_MARK_RING_PX) as u32;
+
+        assert!(
+            untouched_until > src.width() / 2,
+            "more than half the glyph must survive, only {untouched_until} of {} columns do",
+            src.width()
+        );
+        for y in 0..src.height() {
+            for x in 0..untouched_until {
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    src.get_pixel(x, y).0,
+                    "the glyph must be byte-identical at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// Both halves of the mark must actually be drawn, opaque and red. A stem alone, or a dot alone,
+    /// would still look like *something* on screen, so this checks each separately rather than
+    /// trusting one probe.
+    #[test]
+    fn both_halves_of_the_exclamation_are_opaque_red() {
+        let out = with_exclamation(&base());
+        let (centre_x, stem_y, dot_y, _) = auth_mark_probes();
+        for (label, y) in [("stem", stem_y), ("dot", dot_y)] {
+            let px = out.get_pixel(centre_x, y);
+            assert_eq!(px[3], 255, "{label} must be fully opaque, got {px:?}");
+            assert!(px[0] > 200, "{label} must be dominated by red, got {px:?}");
+            assert!(px[1] < 100 && px[2] < 100, "{label} must not be washed out, got {px:?}");
+        }
+    }
+
+    /// The gap is what makes this read as an exclamation mark rather than a solid bar once the icon
+    /// is scaled down, and it only does that if it is *fully* transparent.
+    ///
+    /// This is the assertion that pins `AUTH_MARK_RING_PX`/`AUTH_MARK_RING_FADE_PX` to the gap width.
+    /// Twice during development the ring was too narrow, the middle of the gap came out only partly
+    /// erased, the octocat's white face showed through, and the mark read as one solid bar at 16px.
+    #[test]
+    fn the_gap_keeps_stem_and_dot_apart() {
+        let out = with_exclamation(&base());
+        let (centre_x, .., gap_y) = auth_mark_probes();
+        let px = out.get_pixel(centre_x, gap_y);
+        assert_eq!(px[3], 0, "the middle of the gap must be fully transparent, got {px:?}");
+    }
+
+    /// The mark hugs the right edge but must not be flush against it, which would read as a
+    /// rendering accident. Checks there is still clear canvas to its right.
+    #[test]
+    fn the_mark_leaves_a_margin_at_the_right_edge() {
+        let out = with_exclamation(&base());
+        let (.., stem_y, _, _) = auth_mark_probes();
+        let px = out.get_pixel(out.width() - 1, stem_y);
+        assert_eq!(px[3], 0, "the right edge must stay clear of the mark, got {px:?}");
+    }
+
+    /// The needs-auth variant is reachable only through its own accessor, and is not a duplicate
+    /// of any of the sixteen — otherwise the one state that means "no answers available" would be
+    /// indistinguishable from a state that claims answers.
+    #[test]
+    fn needs_auth_is_distinct_from_every_dotted_variant() {
+        let set = build_variants().expect("variants must build");
+        assert_eq!(set.needs_auth().as_raw(), set.needs_auth.as_raw());
+        for i in 0..16 {
+            assert_ne!(
+                set.needs_auth.as_raw(),
+                set.variants[i].as_raw(),
+                "needs_auth must be distinguishable from variant {i:#06b}"
+            );
+        }
+    }
+
+    /// Renders the needs-auth variant to a PNG for eyeballing. No assertion can judge whether a
+    /// mark still reads as an exclamation once a taskbar has scaled it to 16px, and several colour
+    /// and geometry choices in this file carry a "sanity check on a real render" caveat for exactly
+    /// that reason. `#[ignore]`d because its only output is a picture for a human. Run with
+    /// `cargo test -- --ignored render_needs_auth --nocapture`.
+    #[test]
+    #[ignore = "writes a PNG for a human to look at"]
+    fn render_needs_auth_for_inspection() {
+        let set = build_variants().expect("variants must build");
+        let path = std::env::temp_dir().join("github_needs_auth_preview.png");
+        set.needs_auth.save(&path).expect("must be able to save the preview");
+        println!("wrote {}", path.display());
     }
 
     #[test]
