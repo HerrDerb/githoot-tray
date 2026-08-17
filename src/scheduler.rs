@@ -146,6 +146,12 @@ pub enum Wake {
     /// 15-minute device-code lifetime. Running it on the UI thread would freeze the tray for all of
     /// it, which on Linux means the whole GTK main loop.
     Authenticate,
+    /// The user picked the Settings item, which has already opened `config.txt` in whatever handles it.
+    ///
+    /// Routed through here rather than started in the click handler because the watcher needs the same
+    /// `restart` closure the update thread uses, and that lives on this side. Handling it only *spawns*
+    /// a thread, so polling is not delayed by the fifteen minutes the watch may run for.
+    SettingsOpened,
 }
 
 /// One rendering instruction for the UI thread.
@@ -502,6 +508,16 @@ fn run_poll_loop(
                         } else {
                             logln!("install requested, but no update is pending");
                         }
+                    }
+                    // Opening settings says nothing about GitHub, so this is the one wake that does not
+                    // want a poll at all — hence `skip_etag` going back down. All it does is arm the
+                    // watcher, which then lives on its own thread.
+                    Wake::SettingsOpened => {
+                        skip_etag = false;
+                        crate::settings_watch::spawn(
+                            crate::config::config_path(&app_asset_path),
+                            restart.clone(),
+                        );
                     }
                     // Blocks this thread for as long as the user takes, which is exactly why it is
                     // here and not in the click handler: the tray stays responsive throughout, and

@@ -122,6 +122,12 @@ const PR_NEEDS_AUTH_TOOLTIP: &str = "PR status: not authorized yet. Use the menu
 /// icon can only say *that* something is available, so the number goes where there is room for it.
 pub const UPDATE_MENU_LABEL: &str = "Install update";
 
+/// Text of the tray menu item that opens `config.txt`.
+///
+/// Always present, unlike every other entry here: it needs no credential, no poll and no available
+/// update, and it is the one thing that still works when everything else is switched off.
+pub const SETTINGS_MENU_LABEL: &str = "Open Settings";
+
 /// One of the three independent PR-search signals.
 ///
 /// All three share one credential and one query string apiece, and all three land in the same

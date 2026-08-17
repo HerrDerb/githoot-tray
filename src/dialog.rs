@@ -305,6 +305,16 @@ pub fn confirm_install(title: &str, msg: &str) -> bool {
     confirm(title, msg, "Install and restart", "Not now", false)
 }
 
+/// Asks whether to restart now so edited settings take effect.
+///
+/// `on_unavailable: false`, for the same reason the installer passes `false`: settings are only read at
+/// startup, so a restart is the *point* here — but making a tray icon vanish and come back on the
+/// strength of a prompt nobody saw is the wrong way to be helpful. With no dialog, the edits simply
+/// apply on the next start.
+pub fn confirm_restart(title: &str, msg: &str) -> bool {
+    confirm(title, msg, "Restart now", "Later", false)
+}
+
 /// Reports an update outcome the user should see, without ever blocking on stdin.
 ///
 /// `dialog::message`'s Linux arm waits on `stdin().read_line`, which on a machine launched from a
@@ -402,9 +412,12 @@ mod confirm_tests {
 
         let accepted = confirm("headless", "no display here", "accept", "decline", true);
         let declined = !confirm("headless", "no display here", "accept", "decline", false);
-        // The wrapper the updater actually calls, checked through its real entry point rather than by
-        // trusting that it passes `false` down.
+        // The wrappers the updater and the settings watcher actually call, checked through their real
+        // entry points rather than by trusting that they pass `false` down. Both must refuse: nobody
+        // should have a binary replaced, or a tray icon vanish and come back, because of a prompt that
+        // was never on screen.
         let install_declined = !confirm_install("headless", "no display here");
+        let restart_declined = !confirm_restart("headless", "no display here");
 
         unsafe {
             if let Some(v) = display {
@@ -419,6 +432,10 @@ mod confirm_tests {
         assert!(
             install_declined,
             "confirm_install must never read an unaskable prompt as consent to replace the binary"
+        );
+        assert!(
+            restart_declined,
+            "confirm_restart must never read an unaskable prompt as consent to restart the app"
         );
     }
 }

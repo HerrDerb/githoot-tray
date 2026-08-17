@@ -716,6 +716,27 @@ pub fn install(available: &Available) -> Result<RestartPlan, UpdateError> {
     install_verified(&payload, &target, available)
 }
 
+/// What to launch to restart this same build in place, with nothing replaced.
+///
+/// Used by the settings watcher, which restarts the app so edited settings are read. Two deliberate
+/// differences from the install path:
+///
+/// * `std::env::current_exe` directly, **not** `resolve_current_exe`. That function refuses anything
+///   inside `target/` to stop the updater overwriting a local build — a protection that does not apply
+///   when nothing is being written. Refusing to restart a dev build would only make this feature
+///   untestable during development.
+/// * On macOS a missing `.app` bundle is not an error. `install_target` must fail there because there is
+///   nothing to replace; here the bare executable is a perfectly good thing to start again.
+pub fn restart_target() -> Result<RestartPlan, String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("could not locate this executable: {e}"))?;
+    let target = install_target(&exe).unwrap_or(exe);
+
+    // No backup: nothing was moved aside, so there is no previous version to fall back to. `exec_into`
+    // and `spawn_successor` both guard on this being `None`.
+    Ok(RestartPlan { target, backup: None })
+}
+
 /// The path that gets replaced: the executable itself, or on macOS the `.app` bundle around it.
 fn install_target(exe: &Path) -> Result<PathBuf, UpdateError> {
     #[cfg(target_os = "macos")]
@@ -1121,6 +1142,27 @@ mod tests {
         assert!(
             verify_with(FIXTURE_KEY, FIXTURE_SUMS, FIXTURE_SIG).is_ok(),
             "minisign-verify must accept a prehashed rsign2 signature"
+        );
+    }
+
+    /// `restart_target` must accept what `resolve_current_exe` refuses.
+    ///
+    /// This test binary lives in `target/debug/`, which is exactly the shape the installer rejects to
+    /// avoid overwriting a local build. Nothing is overwritten by a restart, so refusing here would
+    /// make the settings watcher impossible to exercise during development — the two functions
+    /// disagreeing is the point, and this pins it in both directions.
+    #[test]
+    fn restart_target_accepts_a_local_build_that_the_installer_refuses() {
+        assert!(
+            resolve_current_exe().is_err(),
+            "this test only means something while running from target/"
+        );
+
+        let plan = restart_target().expect("a restart must be possible from a local build");
+        assert!(plan.target.exists(), "the restart target must be something that exists");
+        assert!(
+            plan.backup.is_none(),
+            "nothing was moved aside, so offering a backup would be a lie"
         );
     }
 

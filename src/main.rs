@@ -12,6 +12,7 @@ mod github_app;
 mod icons;
 mod log;
 mod scheduler;
+mod settings_watch;
 mod state;
 mod update;
 mod version;
@@ -301,6 +302,19 @@ fn main() {
         let _ = update_wake_tx.send(scheduler::Wake::UpdateNow);
     });
 
+    // Opens the file and hands off to the poll thread, which arms the watcher that offers a restart once
+    // the edits settle. The open happens here because it is instant; the fifteen-minute watch does not.
+    let settings_item = MenuItem::with_label(state::SETTINGS_MENU_LABEL);
+    let settings_path = config::config_path(&app_asset_path);
+    let settings_wake_tx = wake_tx.clone();
+    settings_item.connect_activate(move |_| {
+        // Only arm the watch if a window is actually coming — a failed open would otherwise leave a
+        // thread reading a file nobody is editing.
+        if settings_watch::open_for_editing(&settings_path) {
+            let _ = settings_wake_tx.send(scheduler::Wake::SettingsOpened);
+        }
+    });
+
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
     menu.append(&update_item);
@@ -309,6 +323,7 @@ fn main() {
     menu.append(&reviews_item);
     menu.append(&ready_to_merge_item);
     menu.append(&changes_requested_item);
+    menu.append(&settings_item);
     menu.append(&quit_item);
     menu.show_all();
     // After `show_all`, which shows everything it is given. The poll loop turns this on the moment a
@@ -522,6 +537,11 @@ fn main() {
         ready_to_merge_item_id: tray_icon::menu::MenuId,
         changes_requested_item: tray_icon::menu::MenuItem,
         changes_requested_item_id: tray_icon::menu::MenuId,
+        /// Always present, so unlike the conditional entries it is never taken out or put back. Held
+        /// only to keep it alive alongside the menu; the id is what the click dispatch matches on.
+        #[allow(dead_code)]
+        settings_item: tray_icon::menu::MenuItem,
+        settings_item_id: tray_icon::menu::MenuId,
         /// Offered only while PR status is waiting to be authorized.
         authenticate_item: tray_icon::menu::MenuItem,
         authenticate_item_id: tray_icon::menu::MenuId,
@@ -580,6 +600,8 @@ fn main() {
         let authenticate_item_id = authenticate_item.id().clone();
         let update_item = MenuItem::new(state::UPDATE_MENU_LABEL, true, None);
         let update_item_id = update_item.id().clone();
+        let settings_item = MenuItem::new(state::SETTINGS_MENU_LABEL, true, None);
+        let settings_item_id = settings_item.id().clone();
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_item_id = quit_item.id().clone();
         let menu = Menu::new();
@@ -593,6 +615,7 @@ fn main() {
             (&reviews_item, "reviews"),
             (&ready_to_merge_item, "ready to merge"),
             (&changes_requested_item, "changes requested"),
+            (&settings_item, "settings"),
             (&quit_item, "quit"),
         ] {
             menu.append(item)
@@ -620,6 +643,8 @@ fn main() {
             ready_to_merge_item_id,
             changes_requested_item,
             changes_requested_item_id,
+            settings_item,
+            settings_item_id,
             authenticate_item,
             authenticate_item_id,
             update_item,
@@ -736,6 +761,9 @@ fn main() {
         /// visibly wrong for a whole poll interval.
         pending: Option<Update>,
         wake_tx: std::sync::mpsc::Sender<scheduler::Wake>,
+        /// Resolved once rather than rebuilt per click, and held here for the same reason the Linux
+        /// closure captures it: the click handler has no access to `app_asset_path`.
+        settings_path: std::path::PathBuf,
     }
 
     impl App {
@@ -780,6 +808,12 @@ fn main() {
                 // Only asks. The download, verification and swap all happen on the update thread —
                 // see `scheduler::Wake::UpdateNow`.
                 let _ = self.wake_tx.send(scheduler::Wake::UpdateNow);
+            } else if *id == tray.settings_item_id {
+                // Opening is instant; the watch that follows is not, which is why only the open happens
+                // here and the fifteen-minute watch is armed on the poll thread.
+                if settings_watch::open_for_editing(&self.settings_path) {
+                    let _ = self.wake_tx.send(scheduler::Wake::SettingsOpened);
+                }
             } else if *id == tray.quit_item_id {
                 event_loop.exit();
             }
@@ -1105,7 +1139,12 @@ fn main() {
         }
     }
 
-    let mut app = App { tray, pending: None, wake_tx };
+    let mut app = App {
+        tray,
+        pending: None,
+        wake_tx,
+        settings_path: config::config_path(&app_asset_path),
+    };
 
     if let Err(e) = event_loop.run_app(&mut app) {
         fatal(&format!("Event loop failed: {e}"));

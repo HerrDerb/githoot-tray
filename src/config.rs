@@ -52,13 +52,21 @@ pub struct Config {
     pr_enabled: [bool; 3],
 }
 
+/// Where the settings file lives.
+///
+/// Public because the tray's Settings entry opens this exact path and then watches it for edits
+/// (`settings_watch`). One definition, so the menu can never open a file the app does not read.
+pub fn config_path(app_asset_path: &Path) -> std::path::PathBuf {
+    app_asset_path.join(CONFIG_FILE)
+}
+
 impl Config {
     /// Reads `config.txt`, writing a default one first if there is none.
     ///
     /// Never fails. A file that cannot be written is logged and ignored; a file that cannot be read
     /// leaves every setting at its default.
     pub fn load(app_asset_path: &Path) -> Self {
-        let path = app_asset_path.join(CONFIG_FILE);
+        let path = config_path(app_asset_path);
         write_default_if_absent(&path);
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
