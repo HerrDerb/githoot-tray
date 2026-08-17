@@ -88,6 +88,24 @@ pub struct IconState {
     /// It doubles as the "show the Authenticate menu item" signal, so the icon and the menu cannot
     /// disagree about whether a click is being waited on.
     pub needs_auth: bool,
+    /// GitHub says it is having a major or critical incident.
+    ///
+    /// Draws the **same** exclamation as `needs_auth` — a deliberate choice, not an oversight. The two
+    /// are indistinguishable on the icon and separated only by the tooltip and the menu entry, which is
+    /// the trade accepted for not spending another mark on the right-hand side.
+    ///
+    /// Kept as its own field rather than folded into `needs_auth` because the two drive *different*
+    /// menu entries: an outage must never offer to re-authorize a credential that is working, and a
+    /// missing credential must never point at the status page. [`IconState::shows_exclamation`] is
+    /// where the two come back together.
+    pub status_degraded: bool,
+    /// A signal we asked about and could not get an answer for.
+    ///
+    /// **Not** simply "some `Presence` is `Unknown`". A freshly built `Track` is `Unknown` too, because
+    /// nothing has been polled yet — reading the mark off `Presence` alone put a red exclamation on the
+    /// icon for the first second of every launch. This is `Unknown` *and* a failure recorded against it,
+    /// which is the difference between "it went wrong" and "we have not asked".
+    pub signals_unsure: bool,
     /// A newer release exists, so the up-arrow is drawn in the top-left corner.
     ///
     /// Independent of every other field here, including `needs_auth`: an available update says nothing
@@ -99,6 +117,32 @@ pub struct IconState {
     pub review_requested: Presence,
     pub ready_to_merge: Presence,
     pub changes_requested: Presence,
+}
+
+impl IconState {
+    /// Whether the exclamation replaces the bars.
+    ///
+    /// The one definition of that, because both platforms pick the icon independently and a copy each
+    /// would eventually disagree — which on screen means an icon that says everything is fine while the
+    /// menu says GitHub is down.
+    ///
+    /// **Three causes, one mark.** No credential, GitHub having an incident, or an answer we could not
+    /// get. They are separate fields because they drive different menu entries, and they collapse here
+    /// because the icon has one exclamation to give — see the module docs on `icons` for why there is no
+    /// room for a second.
+    ///
+    /// The third cause costs the bars, and that is the deliberate trade: one failed notifications poll
+    /// hides three PR bars whose own polls succeeded. It buys the thing a per-platform label could not —
+    /// the same visible signal on Linux, Windows and macOS, since only the composited image reaches all
+    /// three.
+    pub fn shows_exclamation(&self) -> bool {
+        self.needs_auth || self.status_degraded || self.any_unsure()
+    }
+
+    /// Whether any signal was asked about and could not be answered.
+    pub fn any_unsure(&self) -> bool {
+        self.signals_unsure
+    }
 }
 
 /// Base text of the tray menu item that opens the review list.
@@ -121,6 +165,13 @@ const PR_NEEDS_AUTH_TOOLTIP: &str = "PR status: not authorized yet. Use the menu
 /// The version is appended by `update_menu_label`, the same way `pr_menu_label` appends a count: the
 /// icon can only say *that* something is available, so the number goes where there is room for it.
 pub const UPDATE_MENU_LABEL: &str = "Install update";
+
+/// Text of the tray menu item that opens GitHub's status page.
+///
+/// Shown only while `PollState::status_degraded` holds. The wording is the author's, and it is doing a
+/// job: the icon shows the same exclamation as a missing credential, so this entry is what tells the two
+/// apart at a glance.
+pub const STATUS_MENU_LABEL: &str = "GitHub is githubing again, check status";
 
 /// Text of the tray menu item that opens `config.txt`.
 ///
@@ -307,6 +358,16 @@ pub struct PollState {
     /// A `String` rather than a parsed version because its only consumers are a menu label and a
     /// tooltip line, and it should be shown exactly as the release names itself.
     update_available: Option<String>,
+    /// GitHub's own description of a major or critical incident, when there is one.
+    ///
+    /// `None` covers both "GitHub is fine" and "we have not been able to ask", and that conflation is
+    /// deliberate: see `github_status`, where a failed check is documented as changing nothing. The
+    /// alternative — a third state that shows the mark — would raise an outage warning on the strength
+    /// of the user's own connection dropping.
+    ///
+    /// A `String` for the same reason `update_available` is one: its only consumers are a tooltip line
+    /// and a menu entry, and it should quote the words GitHub used.
+    status_degraded: Option<String>,
     /// Most recent `x-poll-interval`, once GitHub has told us one.
     server_interval: Option<Duration>,
     /// A wait GitHub explicitly demanded; overrides normal pacing for one cycle.
@@ -331,6 +392,9 @@ impl PollState {
             pr_off: [None, None, None],
             pr_needs_auth: false,
             update_available: None,
+            // Starts clear: assuming an outage before asking would put an exclamation on the icon for
+            // the first few seconds of every launch.
+            status_degraded: None,
             server_interval: None,
             forced_delay: None,
         }
@@ -441,6 +505,14 @@ impl PollState {
         self.update_available = version;
     }
 
+    /// Records what GitHub says about itself.
+    ///
+    /// Only called with a verdict we actually got. A failed check does not call this at all, which is
+    /// what leaves the last known answer standing rather than clearing an outage we can no longer see.
+    pub fn set_status_degraded(&mut self, description: Option<String>) {
+        self.status_degraded = description;
+    }
+
     /// Text for the tray menu item that installs the update, or `None` when there is none.
     ///
     /// Carries the version for the same reason `pr_menu_label` carries a count: the icon can only say
@@ -505,12 +577,26 @@ impl PollState {
         // to find out, there is simply nothing configured to ask with.
         IconState {
             needs_auth: self.pr_needs_auth,
+            status_degraded: self.status_degraded.is_some(),
+            signals_unsure: self.any_track_failing(),
             update_available: self.update_available.is_some(),
             notifications: self.notifications.as_ref().map_or(Presence::No, |t| t.value),
             review_requested: self.pr_value(PrAxis::ReviewRequested),
             ready_to_merge: self.pr_value(PrAxis::ReadyToMerge),
             changes_requested: self.pr_value(PrAxis::ChangesRequested),
         }
+    }
+
+    /// Whether any track has given up on an answer, as opposed to not having asked yet.
+    ///
+    /// `Presence::Unknown` alone is not enough — see `IconState::signals_unsure`. A track only reaches
+    /// `Unknown` with failures against it after `FAILURES_BEFORE_UNKNOWN` transient errors, or
+    /// immediately on an unauthorized reply, so a single blip cannot raise the mark.
+    fn any_track_failing(&self) -> bool {
+        std::iter::once(self.notifications.as_ref())
+            .chain(self.pr.iter().map(Option::as_ref))
+            .flatten()
+            .any(|track| track.value == Presence::Unknown && track.failures > 0)
     }
 
     fn pr_value(&self, axis: PrAxis) -> Presence {
@@ -614,6 +700,12 @@ impl PollState {
     /// belongs here rather than only in the log.
     pub fn tooltip(&self) -> String {
         let mut lines = Vec::new();
+
+        // First, because it reframes everything below it: during an outage a stale count or an
+        // "unknown" axis has an explanation, and the user should read that before the numbers.
+        if let Some(description) = self.status_degraded.as_deref() {
+            lines.push(format!("GitHub: {description}"));
+        }
 
         // Unlike a disabled PR axis, notifications being off is never a failure worth explaining
         // — it is either a deliberate config choice or there is nothing configured yet, so the
@@ -1495,5 +1587,138 @@ mod tests {
             Duration::from_secs(240),
             "backoff must key off the worst axis even when it is not review-requested"
         );
+    }
+
+    // ── GitHub's own health ─────────────────────────────────────────────────
+
+    /// The whole reason `status_degraded` is a separate field: the icon merges the two causes, the menu
+    /// must not. An outage offering to re-authorize a working credential would send the user through a
+    /// browser round trip for nothing.
+    #[test]
+    fn an_outage_shows_the_exclamation_without_claiming_a_credential_is_missing() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.set_status_degraded(Some("Partially Degraded Service".to_string()));
+
+        let icon = state.icon();
+        assert!(icon.status_degraded, "the outage bit must be set");
+        assert!(!icon.needs_auth, "an outage must not read as a missing credential");
+        assert!(icon.shows_exclamation(), "the mark is shown all the same");
+    }
+
+    /// And the mirror: a missing credential must not point at GitHub's status page.
+    #[test]
+    fn a_missing_credential_does_not_claim_an_outage() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.require_pr_auth();
+
+        let icon = state.icon();
+        assert!(icon.needs_auth);
+        assert!(!icon.status_degraded, "a missing credential is not GitHub being down");
+        assert!(icon.shows_exclamation());
+    }
+
+    /// Both at once is one exclamation and two menu entries.
+    #[test]
+    fn both_causes_at_once_still_show_one_exclamation() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.require_pr_auth();
+        state.set_status_degraded(Some("Major Service Outage".to_string()));
+
+        let icon = state.icon();
+        assert!(icon.needs_auth && icon.status_degraded);
+        assert!(icon.shows_exclamation());
+    }
+
+    #[test]
+    fn a_healthy_github_shows_no_mark() {
+        let state = PollState::new(false, [true; 3]);
+        let icon = state.icon();
+        assert!(!icon.status_degraded);
+        assert!(!icon.shows_exclamation(), "nothing is wrong, so nothing is marked");
+    }
+
+    /// Clearing has to work, or the mark would stay up for the life of the process once an incident
+    /// ended — the failure mode that would make the whole signal untrustworthy.
+    #[test]
+    fn a_resolved_incident_clears_the_mark() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.set_status_degraded(Some("Major Service Outage".to_string()));
+        assert!(state.icon().shows_exclamation());
+
+        state.set_status_degraded(None);
+        assert!(!state.icon().shows_exclamation(), "a resolved incident must take the mark down");
+        assert!(!state.tooltip().contains("Major Service Outage"));
+    }
+
+    /// The tooltip is the only thing that distinguishes the two exclamation causes at a glance, and it
+    /// quotes GitHub's own wording rather than paraphrasing it.
+    #[test]
+    fn the_tooltip_quotes_githubs_own_words_first() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.set_status_degraded(Some("Partially Degraded Service".to_string()));
+
+        let tooltip = state.tooltip();
+        assert!(tooltip.contains("Partially Degraded Service"), "got {tooltip:?}");
+        assert!(
+            tooltip.lines().next().unwrap().contains("Partially Degraded Service"),
+            "the outage explains the lines under it, so it goes first: {tooltip:?}"
+        );
+    }
+
+    /// An outage must not disturb the PR answers themselves. The icon hides the bars because it has one
+    /// exclamation to give, but the counts are still the last known good ones and the menu still opens
+    /// the lists.
+    #[test]
+    fn an_outage_leaves_the_pr_answers_intact() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(3));
+        state.set_status_degraded(Some("Major Service Outage".to_string()));
+
+        assert!(state.pr_in_play(PrAxis::ReviewRequested), "the axis is still being polled");
+        assert_eq!(state.icon().review_requested, Presence::Yes, "the answer is untouched");
+        assert!(
+            state.pr_menu_label(PrAxis::ReviewRequested).contains('3'),
+            "the count is still offered: {}",
+            state.pr_menu_label(PrAxis::ReviewRequested)
+        );
+    }
+
+    /// The startup false alarm this distinction exists to prevent: nothing polled yet means every track
+    /// is `Unknown`, and a mark there would flash red on every single launch.
+    #[test]
+    fn a_freshly_started_app_shows_no_mark() {
+        let state = PollState::new(true, [true; 3]);
+        assert!(!state.icon().any_unsure(), "not asked yet is not the same as failed");
+        assert!(!state.icon().shows_exclamation());
+    }
+
+    /// And the case it must catch: a poll that actually failed.
+    #[test]
+    fn a_failed_poll_raises_the_mark() {
+        let mut state = PollState::new(true, [true; 3]);
+        // Unauthorized goes to Unknown at once, so one is enough.
+        state.apply_notifications(respond(PollResult::Unauthorized));
+        assert!(state.icon().any_unsure(), "a rejected credential is a failure we must admit");
+        assert!(state.icon().shows_exclamation());
+    }
+
+    /// A blip must not raise it, which is what the existing failure tolerance is for.
+    #[test]
+    fn a_single_transient_blip_does_not_raise_the_mark() {
+        let mut state = PollState::new(true, [true; 3]);
+        state.apply_notifications(fresh(true));
+        state.apply_notifications(respond(PollResult::Transient("hiccup".into())));
+        assert!(!state.icon().shows_exclamation(), "one blip holds the last known value");
+    }
+
+    /// And recovery clears it, or the mark would stick for the life of the process.
+    #[test]
+    fn a_recovered_poll_clears_the_mark() {
+        let mut state = PollState::new(true, [true; 3]);
+        state.apply_notifications(respond(PollResult::Unauthorized));
+        assert!(state.icon().shows_exclamation());
+
+        state.apply_notifications(fresh(false));
+        assert!(!state.icon().shows_exclamation(), "a recovered poll must take the mark down");
     }
 }

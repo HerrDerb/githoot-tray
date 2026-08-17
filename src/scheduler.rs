@@ -33,6 +33,15 @@ const MIN_REAUTH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// just launched the app is most likely to be looking at it.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How often GitHub is asked how it is doing.
+///
+/// Far shorter than the update interval, because the two answer different kinds of question: a release
+/// from yesterday is still there tomorrow, while an incident that started five minutes ago is worth
+/// knowing about now and an incident that ended should clear promptly. Not every poll, though — this is
+/// a third-party status page and 219 bytes a minute for the life of the process buys nothing, since
+/// incidents are declared by humans on a scale of minutes.
+const STATUS_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// Guards against two overlapping installs.
 ///
 /// A `static` rather than a loop local because the install runs on a detached thread that outlives the
@@ -259,6 +268,7 @@ fn run_poll_loop(
     let mut last_pr_reauth: Option<Instant> = None;
     // `None` means "never checked", which is what makes the first check happen immediately.
     let mut last_update_check: Option<Instant> = None;
+    let mut last_status_check: Option<Instant> = None;
     // The release the last check found, held so the menu click has something to install without
     // re-asking GitHub. Cleared when a check finds nothing newer.
     let mut pending_update: Option<Available> = None;
@@ -309,6 +319,25 @@ fn run_poll_loop(
                 let response = poll_pr(&client, store.token(), axis);
                 pr_kinds.push((axis, response.result.kind()));
                 state.apply_pr(axis, response);
+            }
+        }
+
+        // Placed *before* `emit`, unlike the update check below, and for the opposite reason. An
+        // available release is equally true a minute later, so that check is allowed to miss the cycle
+        // it runs in. An outage is the explanation for whatever else this cycle just found — stale
+        // counts, unknown axes, a failed poll — so showing the icon first and the reason second gets
+        // the order backwards. The cost is that a hanging status page can hold the icon back for the
+        // client's 10s cap; the request is 219 bytes, so that is a remote worst case.
+        //
+        // A failed check deliberately does **not** clear a known outage: see `github_status`.
+        if last_status_check.is_none_or(|at| at.elapsed() >= STATUS_CHECK_INTERVAL) {
+            last_status_check = Some(Instant::now());
+            match crate::github_status::check(&client) {
+                Ok(crate::github_status::Health::Degraded { description }) => {
+                    state.set_status_degraded(Some(description));
+                }
+                Ok(crate::github_status::Health::Fine) => state.set_status_degraded(None),
+                Err(e) => logln!("could not read GitHub's status page: {e}"),
             }
         }
 
@@ -628,6 +657,13 @@ pub struct MenuItems {
     /// Shown only while a newer release exists. Its label carries the version, so it is relabelled as
     /// well as shown and hidden.
     pub update: gtk::MenuItem,
+    /// Shown only while GitHub reports an incident. Sibling of `authenticate` in every way except what
+    /// it means: both are conditional, both are the counterpart of a mark on the icon, and because
+    /// that mark is the *same* exclamation for both, this entry is what tells the two states apart.
+    pub status: gtk::MenuItem,
+    /// The rule above the body of the menu. Shown only while something sits above it — see the append
+    /// order in `main`, and `applied_top_group` below for why its visibility is tracked separately.
+    pub top_separator: gtk::SeparatorMenuItem,
 }
 
 #[cfg(target_os = "linux")]
@@ -688,6 +724,11 @@ pub fn start_notification_scheduler(
     // Tracked separately from `applied` because it is not one of the four signals but a replacement
     // for all of them, and because it drives a menu item the four do not.
     let mut applied_needs_auth: Option<bool> = None;
+    let mut applied_status: Option<bool> = None;
+    // Whether anything is currently in the top group. Its own memo rather than derived on the fly,
+    // because the separator must be written only when it changes — some panels rebuild the whole menu
+    // when any item does, which would fight a user who has it open.
+    let mut applied_top_group: Option<bool> = None;
     // Likewise separate: an available update is a fifth independent signal drawn in a corner the other
     // four never touch, and it drives its own menu entry.
     let mut applied_update: Option<bool> = None;
@@ -707,6 +748,8 @@ pub fn start_notification_scheduler(
             ];
             let needs_auth = update.icon.needs_auth;
             let update_available = update.icon.update_available;
+            let status_degraded = update.icon.status_degraded;
+            let exclamation = update.icon.shows_exclamation();
 
             // Checked before the four signals, because it overrides them: with no credential there
             // is nothing to draw a dot from. `wanted` is still computed and stored above, so the
@@ -720,6 +763,29 @@ pub fn start_notification_scheduler(
                 applied = None;
             }
 
+            // Its own memo rather than riding on `applied_needs_auth`, because the two are independent:
+            // GitHub can be down while the credential is fine, and vice versa.
+            if applied_status != Some(status_degraded) {
+                menu_items.status.set_visible(status_degraded);
+                applied_status = Some(status_degraded);
+                // Same reason as above: this bit is part of which variant the icon shows.
+                applied = None;
+            }
+
+            // A separator needs something on **both** sides. Above it is the top group; below it is the
+            // body — Authenticate, notifications, and the PR entries. With either side empty the rule is
+            // a stray line, which reads as a rendering fault rather than a grouping.
+            //
+            // `needs_auth` counts as body content even though it hides the three PR entries: it is itself
+            // an entry sitting below the rule, so there is still something to separate.
+            let top_group = status_degraded || update_available;
+            let body_group = needs_auth || wanted.iter().any(|&on| on);
+            let separate = top_group && body_group;
+            if applied_top_group != Some(separate) {
+                menu_items.top_separator.set_visible(separate);
+                applied_top_group = Some(separate);
+            }
+
             if applied_update != Some(update_available) {
                 menu_items.update.set_visible(update_available);
                 applied_update = Some(update_available);
@@ -729,18 +795,20 @@ pub fn start_notification_scheduler(
             }
 
             if applied != Some(wanted) {
-                // The arrow rides along with both branches, because it is orthogonal to whether a
-                // credential is missing: an update is worth showing either way, and the two marks sit
-                // in opposite corners.
-                if needs_auth {
-                    indicator.set_icon(icons.needs_auth(update_available).as_str());
-                } else {
-                    indicator.set_icon(
-                        icons
-                            .get(wanted[0], wanted[1], wanted[2], wanted[3], update_available)
-                            .as_str(),
-                    );
-                }
+                // One call, no branch. The exclamation used to select a whole separate icon because it
+                // replaced the bars; now it is just another bit, so every mark composes with every other.
+                indicator.set_icon(
+                    icons
+                        .get(
+                            wanted[0],
+                            wanted[1],
+                            wanted[2],
+                            wanted[3],
+                            update_available,
+                            exclamation,
+                        )
+                        .as_str(),
+                );
 
                 // An entry that opens an empty list is a dead end, so it is hidden. `wanted` says
                 // it directly: the icon carries a signal exactly when that entry has somewhere to
@@ -757,6 +825,10 @@ pub fn start_notification_scheduler(
                 // dance the Windows side needs. `show_all` is called once during setup and never
                 // again, so nothing undoes these.
                 menu_items.notifications.set_visible(wanted[0]);
+                // `needs_auth`, deliberately not `exclamation`: an outage hides the *bars* because the
+                // icon has only one exclamation to give, but the counts behind these entries are the
+                // last known good ones and the lists still open. Hiding them would take away working
+                // links to punish GitHub for being slow.
                 for (item, &visible) in menu_items.pr_items().into_iter().zip(&wanted[1..]) {
                     item.set_visible(!needs_auth && visible);
                 }
@@ -785,13 +857,12 @@ pub fn start_notification_scheduler(
             }
 
             indicator.set_title(&update.tooltip);
-            // A label is the only part of an indicator visible without hovering, so an unknown
-            // state gets a marker the user can actually notice.
-            let unsure = update.icon.notifications == crate::state::Presence::Unknown
-                || update.icon.review_requested == crate::state::Presence::Unknown
-                || update.icon.ready_to_merge == crate::state::Presence::Unknown
-                || update.icon.changes_requested == crate::state::Presence::Unknown;
-            indicator.set_label(if unsure { "!" } else { "" }, "");
+            // No `set_label`. It used to put a "!" beside the icon whenever a signal was `Unknown`,
+            // which worked — but only here: `set_label` is a StatusNotifierItem property, and neither
+            // Windows' `Shell_NotifyIcon` nor macOS' `NSStatusItem` has anywhere to put it. So the one
+            // platform with a panel label was the only platform that showed a failed poll without
+            // hovering. That signal is now the exclamation in the composited icon, which reaches all
+            // three — see `IconState::shows_exclamation`.
         }
         glib::ControlFlow::Continue
     });

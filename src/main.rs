@@ -9,6 +9,7 @@ mod config;
 mod dialog;
 mod github;
 mod github_app;
+mod github_status;
 mod icons;
 mod log;
 mod scheduler;
@@ -233,7 +234,7 @@ fn main() {
 
     let mut indicator = AppIndicator::new("github_notifications", "");
     indicator.set_status(AppIndicatorStatus::Active);
-    indicator.set_icon(icons.get(false, false, false, false, false).as_str());
+    indicator.set_icon(icons.get(false, false, false, false, false, false).as_str());
 
     // The poll loop waits on this channel, so a menu click can pull the next poll forward.
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<scheduler::Wake>();
@@ -315,20 +316,44 @@ fn main() {
         }
     });
 
+    // Sibling of the Authenticate entry: conditional, and the counterpart of a mark on the icon. Since
+    // that mark is the *same* exclamation for both, this entry is what tells the two states apart.
+    let status_item = MenuItem::with_label(state::STATUS_MENU_LABEL);
+    status_item.connect_activate(move |_| {
+        if let Err(e) = open::that(github_status::STATUS_PAGE_URL) {
+            logln!("failed to open the GitHub status page: {e}");
+        }
+    });
+
     let quit_item = MenuItem::with_label("Quit");
     quit_item.connect_activate(|_| gtk::main_quit());
+    // Two groups above the list, and one below it. Update and GitHub's own health go first because they
+    // are about the app and the service rather than about your pull requests, and because when the icon
+    // is wearing a mark they are two of the three things that explain it.
+    //
+    // The upper separator is only drawn when something is above it: a separator with nothing on one side
+    // is a stray line, which reads as a rendering fault rather than a grouping.
+    let top_separator = gtk::SeparatorMenuItem::new();
+    let bottom_separator = gtk::SeparatorMenuItem::new();
+
     menu.append(&update_item);
+    menu.append(&status_item);
+    menu.append(&top_separator);
     menu.append(&authenticate_item);
     menu.append(&item);
     menu.append(&reviews_item);
     menu.append(&ready_to_merge_item);
     menu.append(&changes_requested_item);
+    menu.append(&bottom_separator);
     menu.append(&settings_item);
     menu.append(&quit_item);
     menu.show_all();
-    // After `show_all`, which shows everything it is given. The poll loop turns this on the moment a
-    // check finds a newer release.
+    // After `show_all`, which shows everything it is given. The poll loop turns these on the moment a
+    // check finds a newer release, or finds GitHub having a bad day — and the separator with them, since
+    // it has nothing to separate until one of them is up.
     update_item.set_visible(false);
+    status_item.set_visible(false);
+    top_separator.set_visible(false);
 
     // The closest Linux equivalent of clicking the icon: the menu being popped up. Connected after
     // `show_all` so the initial layout pass is not mistaken for a click.
@@ -354,6 +379,8 @@ fn main() {
             reviews: reviews_item.clone(),
             ready_to_merge: ready_to_merge_item.clone(),
             changes_requested: changes_requested_item.clone(),
+            status: status_item.clone(),
+            top_separator: top_separator.clone(),
             authenticate: authenticate_item.clone(),
             update: update_item.clone(),
         },
@@ -537,11 +564,13 @@ fn main() {
         ready_to_merge_item_id: tray_icon::menu::MenuId,
         changes_requested_item: tray_icon::menu::MenuItem,
         changes_requested_item_id: tray_icon::menu::MenuId,
-        /// Always present, so unlike the conditional entries it is never taken out or put back. Held
-        /// only to keep it alive alongside the menu; the id is what the click dispatch matches on.
-        #[allow(dead_code)]
+        /// Always present, so unlike the conditional entries it is never taken out or put back — but it
+        /// still has to be re-appended by every `rebuild_menu`, which is exactly what it was missing.
         settings_item: tray_icon::menu::MenuItem,
         settings_item_id: tray_icon::menu::MenuId,
+        /// Shown only while GitHub reports an incident.
+        status_item: tray_icon::menu::MenuItem,
+        status_item_id: tray_icon::menu::MenuId,
         /// Offered only while PR status is waiting to be authorized.
         authenticate_item: tray_icon::menu::MenuItem,
         authenticate_item_id: tray_icon::menu::MenuId,
@@ -565,10 +594,24 @@ fn main() {
         /// Likewise for the three PR menu items' text, indexed by `PrAxis::index`, so an
         /// unchanged count does not rewrite the item.
         applied_labels: [Option<String>; 3],
-        /// And for which entries the menu currently holds — the four signals plus whether the
-        /// Authenticate entry is in. Tracked separately from `applied` because a failed `set_icon`
-        /// must not also suppress the menu update.
-        applied_menu: Option<([bool; 4], bool, bool)>,
+        /// And for which entries the menu currently holds. Tracked separately from `applied` because a
+        /// failed `set_icon` must not also suppress the menu update.
+        applied_menu: Option<MenuShape>,
+    }
+
+    /// Which entries the menu should hold.
+    ///
+    /// A named struct rather than the `([bool; 4], bool, bool, …)` tuple this grew out of. Once there
+    /// were three independent flags beside the signal array, a positional tuple was one transposition
+    /// away from a menu that offers a sign-in during an outage — and it would compile, type-check, and
+    /// be visible only by right-clicking the tray. The same reasoning as `config::Config::pr_enabled`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct MenuShape {
+        /// The four signals, indexed as `[notifications, then PrAxis::index + 1]`.
+        wanted: [bool; 4],
+        needs_auth: bool,
+        status_degraded: bool,
+        update: bool,
     }
 
     /// Decodes the icons, builds the menu, and creates the tray icon.
@@ -602,6 +645,8 @@ fn main() {
         let update_item_id = update_item.id().clone();
         let settings_item = MenuItem::new(state::SETTINGS_MENU_LABEL, true, None);
         let settings_item_id = settings_item.id().clone();
+        let status_item = MenuItem::new(state::STATUS_MENU_LABEL, true, None);
+        let status_item_id = status_item.id().clone();
         let quit_item = MenuItem::new("Quit", true, None);
         let quit_item_id = quit_item.id().clone();
         let menu = Menu::new();
@@ -624,7 +669,7 @@ fn main() {
 
         let tray_icon = TrayIconBuilder::new()
             .with_tooltip("GitHub Notifications")
-            .with_icon(icons.get(false, false, false, false, false).clone())
+            .with_icon(icons.get(false, false, false, false, false, false).clone())
             // Cloned rather than moved: `Menu` is a reference-counted handle, and the app keeps one
             // so it can take entries out later. The tray gets the same underlying menu.
             .with_menu(Box::new(menu.clone()))
@@ -645,6 +690,8 @@ fn main() {
             changes_requested_item_id,
             settings_item,
             settings_item_id,
+            status_item,
+            status_item_id,
             authenticate_item,
             authenticate_item_id,
             update_item,
@@ -658,9 +705,14 @@ fn main() {
             applied_update: None,
             applied_update_label: None,
             applied_labels: [None, None, None],
-            // The menu was built with the four signal entries present and both conditional entries
+            // The menu was built with the four signal entries present and every conditional entry
             // absent, and that much we did do, so it is recorded as such.
-            applied_menu: Some(([true; 4], false, false)),
+            applied_menu: Some(MenuShape {
+                wanted: [true; 4],
+                needs_auth: false,
+                status_degraded: false,
+                update: false,
+            }),
         })
     }
 
@@ -814,6 +866,10 @@ fn main() {
                 if settings_watch::open_for_editing(&self.settings_path) {
                     let _ = self.wake_tx.send(scheduler::Wake::SettingsOpened);
                 }
+            } else if *id == tray.status_item_id {
+                if let Err(e) = open::that(github_status::STATUS_PAGE_URL) {
+                    logln!("failed to open the GitHub status page: {e}");
+                }
             } else if *id == tray.quit_item_id {
                 event_loop.exit();
             }
@@ -927,26 +983,49 @@ fn main() {
         ///
         /// Only called when the set actually changes, which is rare. It can still land while the
         /// user has the menu open, since nothing tells us whether it is showing.
-        fn rebuild_menu(&self, wanted: [bool; 4], needs_auth: bool, update: bool) {
+        fn rebuild_menu(&self, shape: MenuShape) {
             while self.menu.remove_at(0).is_some() {}
 
-            for (item, wanted, what) in [
-                // The two conditional entries first, so whatever mark the icon is wearing, the thing
-                // that clears it is the first entry under the cursor.
+            let MenuShape { wanted, needs_auth, status_degraded, update } = shape;
+            // A separator is only worth drawing when something sits above it; with nothing there it is a
+            // stray line that reads as a rendering fault. Created fresh each rebuild rather than held on
+            // `Tray`, because the whole menu is emptied first anyway and a separator carries no state.
+            let top_separator = tray_icon::menu::PredefinedMenuItem::separator();
+            let bottom_separator = tray_icon::menu::PredefinedMenuItem::separator();
+            // Both sides have to be non-empty, or the rule has nothing to separate — see the Linux
+            // equivalent in `scheduler` for the reasoning, which is deliberately identical.
+            let top_group = update || status_degraded;
+            let body_group = needs_auth || wanted.iter().any(|&on| on);
+            let separate = top_group && body_group;
+
+            let entries: [(&dyn tray_icon::menu::IsMenuItem, bool, &str); 11] = [
+                // The top group: the app's own state and the service's, rather than anything about your
+                // pull requests. First because when the icon is wearing a mark, two of the three things
+                // that explain it are here.
                 (&self.update_item, update, "update"),
+                (&self.status_item, status_degraded, "github-status"),
+                (&top_separator, separate, "top-separator"),
                 (&self.authenticate_item, needs_auth, "authenticate"),
                 // Notifications is *not* gated on `needs_auth`: it is a separate credential that may
                 // be working perfectly, and hiding a working entry because a different one needs
                 // attention would take away a feature that still functions.
                 (&self.open_item, wanted[0], "notifications"),
                 // The three PR entries share the credential that is missing, so none of them can
-                // have anything behind them until it is obtained.
+                // have anything behind them until it is obtained. Gated on `needs_auth` only, *not* on
+                // the outage bit: an outage hides the bars because the icon has one exclamation to
+                // give, but these counts are the last known good ones and the lists still open.
                 (&self.reviews_item, !needs_auth && wanted[1], "review-requested"),
                 (&self.ready_to_merge_item, !needs_auth && wanted[2], "ready-to-merge"),
                 (&self.changes_requested_item, !needs_auth && wanted[3], "changes-requested"),
-                // Quit is unconditional: a tray icon with no way out is a bug, not a tidy menu.
+                // Unconditional, all three. Settings was missing from this list until now, which
+                // silently deleted it on the first rebuild — the hazard a full rebuild trades for not
+                // having to compute insert positions, and the reason every entry must be listed here.
+                (&bottom_separator, true, "bottom-separator"),
+                (&self.settings_item, true, "settings"),
                 (&self.quit_item, true, "quit"),
-            ] {
+            ];
+
+            for (item, wanted, what) in entries {
                 if !wanted {
                     continue;
                 }
@@ -970,30 +1049,40 @@ fn main() {
 
             let needs_auth = update.icon.needs_auth;
             let update_available = update.icon.update_available;
+            let exclamation = update.icon.shows_exclamation();
+            let shape = MenuShape {
+                wanted,
+                needs_auth,
+                status_degraded: update.icon.status_degraded,
+                update: update_available,
+            };
 
             if self.applied != Some(wanted)
-                || self.applied_needs_auth != Some(needs_auth)
+                || self.applied_needs_auth != Some(exclamation)
                 || self.applied_update != Some(update_available)
             {
-                // The override is checked first because with no credential there is nothing to draw
-                // a dot from. `wanted` is still recorded either way, so the moment authorization
-                // succeeds the icon goes straight back to the right variant rather than waiting for
-                // one of the four signals to change.
-                // The arrow rides along with either branch: an available update is orthogonal to
-                // whether a credential is missing, and the two marks sit in opposite corners.
-                let icon = if needs_auth {
-                    self.icons.needs_auth(update_available).clone()
-                } else {
-                    self.icons
-                        .get(wanted[0], wanted[1], wanted[2], wanted[3], update_available)
-                        .clone()
-                };
+                // One lookup, no override. The exclamation is a bit like any other now that it sits in
+                // the bottom-left, so a missing credential, an incident or a failed poll all show the
+                // mark *and* whatever counts are still known.
+                let icon = self
+                    .icons
+                    .get(
+                        wanted[0],
+                        wanted[1],
+                        wanted[2],
+                        wanted[3],
+                        update_available,
+                        exclamation,
+                    )
+                    .clone();
                 match self.tray_icon.set_icon(Some(icon)) {
                     // Only record success. A failed update leaves these `None` so the next
                     // poll retries instead of believing the icon is already correct.
                     Ok(()) => {
                         self.applied = Some(wanted);
-                        self.applied_needs_auth = Some(needs_auth);
+                        // The *exclamation*, not `needs_auth`: this memo exists to decide whether the
+                        // image on screen is still right, and an outage changes that image too.
+                        self.applied_needs_auth = Some(exclamation);
                         self.applied_update = Some(update_available);
                     }
                     Err(e) => logln!("failed to update tray icon: {e}"),
@@ -1038,9 +1127,9 @@ fn main() {
                 self.applied_update_label = Some(label.to_string());
             }
 
-            if self.applied_menu != Some((wanted, needs_auth, update_available)) {
-                self.rebuild_menu(wanted, needs_auth, update_available);
-                self.applied_menu = Some((wanted, needs_auth, update_available));
+            if self.applied_menu != Some(shape) {
+                self.rebuild_menu(shape);
+                self.applied_menu = Some(shape);
             }
         }
     }

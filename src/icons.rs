@@ -160,30 +160,42 @@ const ARROW_BORDER_PX: f32 = BAR_BORDER_PX;
 // All ratios are of icon *width*, except the vertical extents which are of height, so the mark
 // survives the source assets being resized the same way the dots do.
 
-/// The mark's colour. Deliberately the same red as the review dot, which was already tuned to hold
-/// contrast on light and dark taskbars. The two can never be on screen together — a missing
-/// credential means there is no review answer to draw — so there is nothing to confuse.
-const AUTH_MARK_COLOR: [u8; 4] = REVIEW_DOT_COLOR;
-/// Width of the mark, as a fraction of icon width. One value doing two jobs: the stem's width and
-/// the dot's diameter, as a real exclamation mark has.
-const AUTH_MARK_BAND_RATIO: f32 = 0.26;
-/// Gap between the mark's right edge and the icon's right edge, as a fraction of icon width. Small,
-/// but non-zero: flush against the edge looks like a rendering accident rather than a decision.
-const AUTH_MARK_RIGHT_MARGIN_RATIO: f32 = 0.03;
-/// Lower edge of the stem, as a fraction of icon height. The stem's *upper* edge is always y = 0:
-/// the mark spans the full height of the icon, which is what makes it dominate rather than decorate.
-const AUTH_MARK_STEM_BOTTOM_RATIO: f32 = 0.66;
+/// The mark's colour. Deliberately the same red as the review bar.
+///
+/// The two *can* now be on screen together, which they never could while the mark replaced the bars. That
+/// is tolerable because position already separates them — the mark is bottom-left, the bars are the right
+/// column — and because both mean "look at this". Giving the mark its own hue would mean a fourth colour
+/// competing at 16px.
+const MARK_COLOR: [u8; 4] = REVIEW_DOT_COLOR;
+/// Width of the mark, as a fraction of icon width. One value doing two jobs: the stem's width and the
+/// dot's diameter, as a real exclamation mark has.
+const MARK_BAND_RATIO: f32 = 0.26;
+/// Left edge of the mark, as a fraction of icon width.
+///
+/// Measured from the *left*, which is the change that let the mark stop replacing the bars: the
+/// right-hand column is theirs, and the mark used to sit directly on top of it. Small but non-zero —
+/// flush against the edge looks like a rendering accident rather than a decision.
+const MARK_LEFT_MARGIN_RATIO: f32 = 0.03;
+/// Top of the stem, as a fraction of icon height.
+///
+/// Zero: the mark spans the full height of the icon, which is what makes it dominate rather than
+/// decorate. It can afford to, now that the update arrow has moved to the top *middle* and is drawn
+/// last — the two no longer compete for the same corner.
+const MARK_STEM_TOP_RATIO: f32 = 0.0;
+/// Lower edge of the stem, as a fraction of icon height.
+const MARK_STEM_BOTTOM_RATIO: f32 = 0.66;
 /// Centre of the dot beneath the stem, as a fraction of icon height. Placed so the dot's lower edge
 /// lands just inside the bottom of the icon.
-const AUTH_MARK_DOT_CENTRE_RATIO: f32 = 0.867;
-/// The mark's erase ring, wider and with a longer fade than the corner dots'.
+const MARK_DOT_CENTRE_RATIO: f32 = 0.867;
+/// Transparent border carved around the mark, in source pixels.
 ///
-/// Full erasure only reaches `RING - FADE` from a shape, so this pair has to cover half the gap
-/// between stem and dot or that gap stops being fully transparent, the octocat's white face shows
-/// through it, and at 16px the two halves blur into one solid red bar. That regression happened twice
-/// during development; `the_gap_keeps_stem_and_dot_apart` is what now catches it.
-const AUTH_MARK_RING_PX: f32 = 5.5;
-const AUTH_MARK_RING_FADE_PX: f32 = 1.5;
+/// A hard carve in a separate pass, like `BAR_BORDER_PX`, rather than the soft fading ring the
+/// full-height mark used. Two reasons: it matches the bars, so the icon has one visual idiom instead of
+/// two; and a hard edge is what keeps the gap between stem and dot genuinely transparent, which at 16px
+/// is the only thing stopping the two halves blurring into one red blob.
+///
+/// Smaller than the bars' 10px because the mark is smaller — the same ratio of border to shape.
+const MARK_CARVE_PX: f32 = 8.0;
 
 /// One indicator bar: where it sits and what colour it is.
 #[derive(Clone, Copy, Debug)]
@@ -244,12 +256,14 @@ fn triangle_sd(px: f32, py: f32, tri: [(f32, f32); 3]) -> f32 {
 /// true signed distance means "one border-width outside the shape" is just `d <= BORDER`. Same visual
 /// result, considerably less arithmetic to get wrong.
 fn arrow_sd(px: f32, py: f32, width: f32, height: f32) -> f32 {
-    let margin_x = width * ARROW_MARGIN_RATIO;
     let margin_y = width * ARROW_MARGIN_RATIO;
     let arrow_w = width * ARROW_WIDTH_RATIO;
     let arrow_h = height * ARROW_HEIGHT_RATIO;
 
-    let left = margin_x;
+    // Centred horizontally, not tucked into the left corner. It is drawn last and allowed to overlap
+    // whatever is beneath it — the mark on the left, the top bar on the right — which is why it no longer
+    // needs a corner of its own to keep clear of them.
+    let left = (width - arrow_w) / 2.0;
     let top = margin_y;
     let centre_x = left + arrow_w / 2.0;
     let split_y = top + arrow_h * ARROW_HEAD_SPLIT;
@@ -430,37 +444,38 @@ fn with_exclamation(src: &RgbaImage) -> RgbaImage {
     let w = width as f32;
     let h = height as f32;
     // `.max(1.0)` so a pathologically small source cannot produce a zero radius and draw nothing.
-    let radius = (w * AUTH_MARK_BAND_RATIO).round().max(1.0) / 2.0;
-    // Measured in from the right edge, so the mark hugs that side rather than the centre.
-    let centre_x = w - (w * AUTH_MARK_RIGHT_MARGIN_RATIO) - radius;
-    // The stem's outer edge sits at y = 0, so its capsule centre starts one radius down.
-    let stem_top = radius;
-    let stem_bottom = h * AUTH_MARK_STEM_BOTTOM_RATIO - radius;
-    let dot_centre_y = h * AUTH_MARK_DOT_CENTRE_RATIO;
+    let radius = (w * MARK_BAND_RATIO).round().max(1.0) / 2.0;
+    let centre_x = w * MARK_LEFT_MARGIN_RATIO + radius;
+    let stem_top = h * MARK_STEM_TOP_RATIO + radius;
+    let stem_bottom = h * MARK_STEM_BOTTOM_RATIO - radius;
+    let dot_centre_y = h * MARK_DOT_CENTRE_RATIO;
 
+    let distance_to_mark = |px: f32, py: f32| {
+        // Distance to a vertical segment: clamping y to the segment's extent is what turns the
+        // point-to-point distance into point-to-capsule.
+        let stem = (px - centre_x).hypot(py - py.clamp(stem_top, stem_bottom)) - radius;
+        let dot = (px - centre_x).hypot(py - dot_centre_y) - radius;
+        stem.min(dot)
+    };
+
+    // Two passes, exactly as `with_indicator_bars` does and for the same reason: carving and painting in
+    // one pass lets the carve eat colour the same pass has already laid down. Here it matters more than
+    // ever, because this runs *after* the bars and the arrow — a single-pass version would erase parts of
+    // marks that were already correct.
     for y in 0..height {
         for x in 0..width {
-            // Sample at the pixel centre so the anti-aliasing is symmetric, as in `with_dot`.
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-
-            // Distance to a vertical segment: clamping y to the segment's extent is what turns the
-            // point-to-point distance into point-to-capsule.
-            let stem = (px - centre_x).hypot(py - py.clamp(stem_top, stem_bottom)) - radius;
-            let dot = (px - centre_x).hypot(py - dot_centre_y) - radius;
-            let distance = stem.min(dot);
-
-            // The two branches are disjoint, so the erase can never eat mark pixels this same pass
-            // has just drawn.
+            if distance_to_mark(x as f32 + 0.5, y as f32 + 0.5) <= MARK_CARVE_PX {
+                out.get_pixel_mut(x, y)[3] = 0;
+            }
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let distance = distance_to_mark(x as f32 + 0.5, y as f32 + 0.5);
             if distance <= 0.5 {
                 let coverage = (0.5 - distance).clamp(0.0, 1.0);
                 let pixel = out.get_pixel_mut(x, y);
-                *pixel = over(AUTH_MARK_COLOR, *pixel, coverage);
-            } else if distance <= AUTH_MARK_RING_PX {
-                let erase =
-                    ((AUTH_MARK_RING_PX - distance) / AUTH_MARK_RING_FADE_PX).clamp(0.0, 1.0);
-                let pixel = out.get_pixel_mut(x, y);
-                pixel[3] = (f32::from(pixel[3]) * (1.0 - erase)).round() as u8;
+                *pixel = over(MARK_COLOR, *pixel, coverage);
             }
         }
     }
@@ -494,43 +509,57 @@ fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
         .map(|img| img.into_rgba8())
 }
 
-/// The sixteen icon variants, indexed by a packed 4-bit key: bit 3 is the unread-notifications
-/// tint, bit 2 the review dot, bit 1 the ready-to-merge dot, bit 0 the changes-requested dot —
-/// plus one extra, `needs_auth`, which is not part of that space at all.
+/// The sixty-four icon variants, indexed by a packed 6-bit key: bit 5 is the exclamation, bit 4 the
+/// update arrow, bit 3 the unread-notifications tint, bit 2 the review bar, bit 1 ready-to-merge, bit 0
+/// changes-requested.
 ///
-/// `needs_auth` is a separate field rather than a seventeenth array slot on purpose: the four
-/// signals are combinable, and this one is not. It replaces the whole picture rather than adding to
-/// it, because it means "there is no credential, so none of those four questions could even be
-/// asked" — drawing dots alongside it would assert answers the app does not have. Keeping it out of
-/// the array means the 4-bit index can never reach it by accident.
+/// **Six combinable signals, one array.** There used to be a separate `needs_auth` pair outside this
+/// space, because the exclamation *replaced* the bars: it meant "there is no credential, so none of those
+/// questions could be asked", and drawing bars beside it would have asserted answers the app did not have.
+///
+/// That stopped being true when the mark moved to the bottom-left. It now has three causes — no
+/// credential, GitHub having an incident, or a poll that failed — and two of those three leave the counts
+/// perfectly valid. A mark that hid them was throwing away good data to describe a problem. So it became
+/// an ordinary bit, and the old override disappeared along with the special case.
+///
+/// The cost is exactly the doubling that shape implies: 32 variants became 64, measured at ~14ms to
+/// generate and ~300KB on disk.
 pub struct IconSet<T> {
-    variants: [T; 32],
-    /// Indexed by whether an update is available, for the same reason the array grew: needing
-    /// authorization and having an update pending are independent facts, so all four combinations of
-    /// "waiting to authorize" and "update available" have to be drawable.
-    needs_auth: [T; 2],
+    variants: [T; 64],
 }
 
 impl<T> IconSet<T> {
-    fn index(unread: bool, review: bool, merge: bool, changes: bool, update: bool) -> usize {
-        (usize::from(update) << 4)
+    fn index(
+        unread: bool,
+        review: bool,
+        merge: bool,
+        changes: bool,
+        update: bool,
+        mark: bool,
+    ) -> usize {
+        (usize::from(mark) << 5)
+            | (usize::from(update) << 4)
             | (usize::from(unread) << 3)
             | (usize::from(review) << 2)
             | (usize::from(merge) << 1)
             | usize::from(changes)
     }
 
-    pub fn get(&self, unread: bool, review: bool, merge: bool, changes: bool, update: bool) -> &T {
-        &self.variants[Self::index(unread, review, merge, changes, update)]
+    /// The variant for one complete state. `mark` is the exclamation, which since it moved to the
+    /// bottom-left is a sixth *independent* signal rather than an override — every combination of the
+    /// other five can be shown alongside it.
+    pub fn get(
+        &self,
+        unread: bool,
+        review: bool,
+        merge: bool,
+        changes: bool,
+        update: bool,
+        mark: bool,
+    ) -> &T {
+        &self.variants[Self::index(unread, review, merge, changes, update, mark)]
     }
 
-    /// The variant shown while a credential is waiting on the user: base glyph, big red exclamation, no
-    /// bars. Takes only `update`, because the authorization mark overrides all four PR/notification
-    /// signals but *not* the update arrow — an update is still worth showing while you are unauthorized,
-    /// and the two live in opposite corners so they never collide.
-    pub fn needs_auth(&self, update: bool) -> &T {
-        &self.needs_auth[usize::from(update)]
-    }
 }
 
 /// Builds all sixteen variants from the two embedded base icons.
@@ -543,35 +572,32 @@ fn build_variants() -> Result<IconSet<RgbaImage>, String> {
     let plain = decode(GITHUB_ICON)?;
     let blue = decode(GITHUB_BLUE_ICON)?;
 
-    let variants: [RgbaImage; 32] = std::array::from_fn(|i| {
-        let unread = i & 0b01000 != 0;
+    let variants: [RgbaImage; 64] = std::array::from_fn(|i| {
+        let unread = i & 0b001000 != 0;
         // One call for all three, unlike the per-corner discs this replaced: the bars share a carve
         // pass, and carving them one at a time would let each bar's border bite into the last bar's
         // colour. See `with_indicator_bars`.
-        let lit = [i & 0b00100 != 0, i & 0b00010 != 0, i & 0b00001 != 0];
+        let lit = [i & 0b000100 != 0, i & 0b000010 != 0, i & 0b000001 != 0];
         let base = if unread { &blue } else { &plain };
         let img = with_indicator_bars(base, lit);
-        // Applied last and independently, in the opposite corner from everything else, so it composes
-        // with any combination of the four signals below it.
-        if i & 0b10000 != 0 { with_update_arrow(&img) } else { img }
+        // Arrow next, in the top-left, which nothing else claims.
+        let img = if i & 0b010000 != 0 { with_update_arrow(&img) } else { img };
+        // The mark last, in the bottom-left. Order matters: each of these carves a transparent border,
+        // and carving after the others means this one's border cannot be painted over by them. It sits in
+        // the one band free of both — x 0..54, y 39..95 — so its carve cannot reach the bars or the
+        // arrow either. `the_mark_never_touches_the_bars_or_the_arrow` is what holds that.
+        if i & 0b100000 != 0 { with_exclamation(&img) } else { img }
     });
 
-    // Built from the plain glyph, never the blue one: the blue tint means "unread notifications",
-    // which is exactly the kind of claim this variant exists to withhold.
-    let needs_auth_plain = with_exclamation(&plain);
-    let needs_auth_update = with_update_arrow(&needs_auth_plain);
-
-    Ok(IconSet { variants, needs_auth: [needs_auth_plain, needs_auth_update] })
+    Ok(IconSet { variants })
 }
 
-/// Filename of the needs-authorization variant. A fixed name rather than something
-/// `variant_filename` could produce, because it is not addressed by the 4-bit key.
+
+/// Subdirectory of the asset directory holding the generated PNGs.
+///
+/// Linux only — it is the only platform that needs icons as files at all.
 #[cfg(target_os = "linux")]
-const NEEDS_AUTH_FILENAME: &str = "github_needs_auth.png";
-/// Same, with the update arrow. A fixed name for the same reason: neither is addressed by the packed
-/// key.
-#[cfg(target_os = "linux")]
-const NEEDS_AUTH_UPDATE_FILENAME: &str = "github_needs_auth_update.png";
+const ICON_SUBDIR: &str = "icons";
 
 /// Filename for variant `i`, built from which bits are set rather than a hand-written 16-entry
 /// table — the table would just be this function's output written out by hand, with all the same
@@ -579,24 +605,29 @@ const NEEDS_AUTH_UPDATE_FILENAME: &str = "github_needs_auth_update.png";
 #[cfg(target_os = "linux")]
 fn variant_filename(i: usize) -> String {
     let mut name = String::from("github");
-    if i & 0b1000 != 0 {
+    if i & 0b001000 != 0 {
         name.push_str("_blue");
     }
-    if i & 0b0100 != 0 {
+    if i & 0b000100 != 0 {
         name.push_str("_review");
     }
-    if i & 0b0010 != 0 {
+    if i & 0b000010 != 0 {
         name.push_str("_merge");
     }
-    if i & 0b00001 != 0 {
+    if i & 0b000001 != 0 {
         name.push_str("_changes");
     }
     // Appended last even though it is the *high* bit, so that adding the update arrow did not rename
     // any of the sixteen files that already existed in users' asset directories. Cosmetic, but it keeps
     // `write_icon_if_changed`'s mtime-stability promise intact across the upgrade instead of rewriting
     // every icon once.
-    if i & 0b10000 != 0 {
+    if i & 0b010000 != 0 {
         name.push_str("_update");
+    }
+    // Appended after `_update`, for the same reason `_update` came after the original four: adding a
+    // signal must not rename files that already exist in users' asset directories.
+    if i & 0b100000 != 0 {
+        name.push_str("_alert");
     }
     name.push_str(".png");
     name
@@ -632,40 +663,35 @@ fn write_icon_if_changed(bytes: &[u8], path: &Path) {
     }
 }
 
-/// Creates all thirty-four icon files in the asset directory and returns their paths.
+/// Creates all thirty-four icon files in `<app_asset_path>/icons` and returns their paths.
 /// Used on Linux by libappindicator, which requires file-system paths.
+///
+/// A subdirectory rather than the asset root, so the thirty-four generated PNGs stop sitting between the
+/// four files a person might actually want to open — `config.txt`, `log.txt` and the two credentials.
+/// Generated output and hand-edited input in one directory made the interesting files hard to find.
+///
+/// Windows and macOS never call this: `tray_icon` takes an `Icon` built from RGBA bytes, so on those two
+/// no icon ever reaches the filesystem.
 #[cfg(target_os = "linux")]
 pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
-    if let Err(e) = std::fs::create_dir_all(app_asset_path) {
-        logln!("failed to create assets directory: {e}");
+    let icon_dir = app_asset_path.join(ICON_SUBDIR);
+    if let Err(e) = std::fs::create_dir_all(&icon_dir) {
+        logln!("failed to create the icons directory: {e}");
     }
 
     let images = build_variants()?;
-    let mut paths = Vec::with_capacity(32);
+    let mut paths = Vec::with_capacity(64);
     for (i, image) in images.variants.iter().enumerate() {
-        let path = app_asset_path.join(variant_filename(i));
+        let path = icon_dir.join(variant_filename(i));
         write_icon_if_changed(&encode_png(image)?, &path);
         paths.push(path.to_string_lossy().into_owned());
     }
 
-    let variants: [String; 32] = paths
+    let variants: [String; 64] = paths
         .try_into()
-        .map_err(|_| "internal error: expected exactly 32 icon variants".to_string())?;
+        .map_err(|_| "internal error: expected exactly 64 icon variants".to_string())?;
 
-    // The two needs-authorization variants, which are not addressed by the packed key and so have fixed
-    // names rather than generated ones. Indexed by whether the update arrow is drawn.
-    let needs_auth_names = [NEEDS_AUTH_FILENAME, NEEDS_AUTH_UPDATE_FILENAME];
-    let mut needs_auth_paths: Vec<String> = Vec::with_capacity(2);
-    for (image, name) in images.needs_auth.iter().zip(needs_auth_names) {
-        let path = app_asset_path.join(name);
-        write_icon_if_changed(&encode_png(image)?, &path);
-        needs_auth_paths.push(path.to_string_lossy().into_owned());
-    }
-    let needs_auth: [String; 2] = needs_auth_paths
-        .try_into()
-        .map_err(|_| "internal error: expected exactly 2 needs-auth variants".to_string())?;
-
-    Ok(IconSet { variants, needs_auth })
+Ok(IconSet { variants })
 }
 
 // ─── Windows and macOS ────────────────────────────────────────────────────────
@@ -690,11 +716,10 @@ pub fn load_tray_icons() -> Result<IconSet<tray_icon::Icon>, String> {
         icons.push(to_icon(image)?);
     }
 
-    let variants: [tray_icon::Icon; 32] = icons
+    let variants: [tray_icon::Icon; 64] = icons
         .try_into()
         .map_err(|_| "internal error: expected exactly 32 icon variants".to_string())?;
-    let needs_auth = [to_icon(&images.needs_auth[0])?, to_icon(&images.needs_auth[1])?];
-    Ok(IconSet { variants, needs_auth })
+    Ok(IconSet { variants })
 }
 
 #[cfg(test)]
@@ -840,10 +865,10 @@ mod tests {
     }
 
     #[test]
-    fn all_thirty_two_variants_build_and_are_pairwise_distinct() {
+    fn all_sixty_four_variants_build_and_are_pairwise_distinct() {
         let set = build_variants().expect("variants must build");
-        for i in 0..32 {
-            for j in (i + 1)..32 {
+        for i in 0..64 {
+            for j in (i + 1)..64 {
                 assert_ne!(
                     set.variants[i].as_raw(),
                     set.variants[j].as_raw(),
@@ -856,52 +881,102 @@ mod tests {
     /// The mark's centre column, and the Y coordinates of its interesting bands, for a 98×96 source:
     /// the middle of the stem, the middle of the dot, and the middle of the gap between them.
     fn auth_mark_probes() -> (u32, u32, u32, u32) {
-        let radius = (98.0 * AUTH_MARK_BAND_RATIO).round() / 2.0;
-        let centre_x = 98.0 - (98.0 * AUTH_MARK_RIGHT_MARGIN_RATIO) - radius;
-        let stem_bottom = 96.0 * AUTH_MARK_STEM_BOTTOM_RATIO - radius;
-        let dot_centre = 96.0 * AUTH_MARK_DOT_CENTRE_RATIO;
+        let radius = (98.0 * MARK_BAND_RATIO).round() / 2.0;
+        let centre_x = 98.0 * MARK_LEFT_MARGIN_RATIO + radius;
+        let stem_top = 96.0 * MARK_STEM_TOP_RATIO + radius;
+        let stem_bottom = 96.0 * MARK_STEM_BOTTOM_RATIO - radius;
+        let dot_centre = 96.0 * MARK_DOT_CENTRE_RATIO;
         (
             centre_x as u32,
-            ((radius + stem_bottom) / 2.0) as u32,
+            ((stem_top + stem_bottom) / 2.0) as u32,
             dot_centre as u32,
             // Halfway between the stem's lower edge and the dot's upper edge.
             (((stem_bottom + radius) + (dot_centre - radius)) / 2.0) as u32,
         )
     }
 
-    /// The canvas must stay exactly square. This is the whole reason the mark moved to the right edge
-    /// instead of getting its own strip: a non-square pixmap gets letterboxed into the tray's square
-    /// slot, which scales the octocat down. Widen this and that regression comes back.
+    /// The canvas must not grow. A non-square-ish pixmap gets letterboxed into the tray's slot, which
+    /// scales the octocat down — the reason the mark was fitted into space the icon already had rather
+    /// than given a strip of its own.
     #[test]
     fn exclamation_preserves_dimensions() {
         let src = base();
         assert_eq!(with_exclamation(&src).dimensions(), src.dimensions());
     }
 
-    /// The octocat keeps its full size, so the majority of it must come through untouched — the mark
-    /// takes only the right-hand sliver. Checks every pixel left of the mark and its erase ring.
+    /// The mark is full height on the **left**; the bars own the right-hand column. Nothing the mark
+    /// does, painted or carved, may reach them — that separation is the entire reason it stopped
+    /// replacing them, so if it creeps right the counts are lost again and the redesign is undone.
     #[test]
-    fn the_mark_only_touches_the_right_hand_sliver_of_the_glyph() {
+    fn the_mark_never_reaches_the_bar_column() {
         let src = base();
         let out = with_exclamation(&src);
-        let (centre_x, ..) = auth_mark_probes();
-        let radius = (98.0 * AUTH_MARK_BAND_RATIO).round() / 2.0;
-        let untouched_until = (centre_x as f32 - radius - AUTH_MARK_RING_PX) as u32;
 
-        assert!(
-            untouched_until > src.width() / 2,
-            "more than half the glyph must survive, only {untouched_until} of {} columns do",
-            src.width()
-        );
-        for y in 0..src.height() {
-            for x in 0..untouched_until {
-                assert_eq!(
-                    out.get_pixel(x, y).0,
-                    src.get_pixel(x, y).0,
-                    "the glyph must be byte-identical at ({x}, {y})"
-                );
-            }
+        // Everything the mark touched, whether painted or carved.
+        let touched: Vec<(u32, u32)> = (0..src.height())
+            .flat_map(|y| (0..src.width()).map(move |x| (x, y)))
+            .filter(|&(x, y)| out.get_pixel(x, y).0 != src.get_pixel(x, y).0)
+            .collect();
+        assert!(!touched.is_empty(), "the mark must actually draw something");
+
+        let max_x = touched.iter().map(|&(x, _)| x).max().unwrap();
+        assert!(max_x < 55, "the mark reaches x {max_x}, into the bar column at x 55");
+
+        // …and end to end: with all three bars lit, every bar centre survives the mark.
+        let bars = with_indicator_bars(&base(), [true, true, true]);
+        let both = with_exclamation(&bars);
+        for i in 0..3 {
+            let (cx, cy) = slot_centre(i);
+            assert_eq!(
+                both.get_pixel(cx, cy).0,
+                bars.get_pixel(cx, cy).0,
+                "the mark must not disturb indicator slot {i}"
+            );
         }
+    }
+
+    /// The arrow is drawn *after* the mark and carves a 10px border, so it is the one thing that can bite
+    /// into a full-height mark. It does: centred at x 36..63, its carve grazes the mark's outer edge and
+    /// takes about 4% of it (1899px to 1823 at the time of writing).
+    ///
+    /// That graze is accepted, but the **silhouette** is not negotiable. What must hold is that the
+    /// mark's centre column comes through untouched — stem, gap, dot, in that order — because that is
+    /// what makes it read as an exclamation mark rather than a clipped blob. A carve that cut through the
+    /// middle would still leave 90% of the pixels while destroying the shape, which is exactly why this
+    /// asserts continuity rather than a count.
+    #[test]
+    fn the_arrow_grazes_the_mark_but_never_breaks_its_silhouette() {
+        let mark_only = with_exclamation(&base());
+        let with_arrow = with_update_arrow(&mark_only);
+
+        let count_mark = |img: &RgbaImage| {
+            img.pixels().filter(|p| p[3] > 200 && p.0[..3] == MARK_COLOR[..3]).count()
+        };
+        let before = count_mark(&mark_only);
+        let after = count_mark(&with_arrow);
+        assert!(
+            after * 100 >= before * 95,
+            "the arrow may graze the mark, not eat it: {after} of {before} px left"
+        );
+
+        // The centre column, which is the shape itself: two unbroken runs with a gap between them.
+        let (centre_x, ..) = auth_mark_probes();
+        let runs = |img: &RgbaImage| {
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            for y in 0..img.height() {
+                let px = img.get_pixel(centre_x, y);
+                if px[3] > 200 && px.0[..3] == MARK_COLOR[..3] {
+                    match runs.last_mut() {
+                        Some(last) if last.1 + 1 == y => last.1 = y,
+                        _ => runs.push((y, y)),
+                    }
+                } 
+            }
+            runs
+        };
+        let expected = runs(&mark_only);
+        assert_eq!(expected.len(), 2, "stem and dot, separated by a gap, got {expected:?}");
+        assert_eq!(runs(&with_arrow), expected, "the arrow must not cut the mark's centre column");
     }
 
     /// Both halves of the mark must actually be drawn, opaque and red. A stem alone, or a dot alone,
@@ -922,7 +997,7 @@ mod tests {
     /// The gap is what makes this read as an exclamation mark rather than a solid bar once the icon
     /// is scaled down, and it only does that if it is *fully* transparent.
     ///
-    /// This is the assertion that pins `AUTH_MARK_RING_PX`/`AUTH_MARK_RING_FADE_PX` to the gap width.
+    /// This is the assertion that pins `MARK_CARVE_PX` to the gap width.
     /// Twice during development the ring was too narrow, the middle of the gap came out only partly
     /// erased, the octocat's white face showed through, and the mark read as one solid bar at 16px.
     #[test]
@@ -933,35 +1008,49 @@ mod tests {
         assert_eq!(px[3], 0, "the middle of the gap must be fully transparent, got {px:?}");
     }
 
-    /// The mark hugs the right edge but must not be flush against it, which would read as a
-    /// rendering accident. Checks there is still clear canvas to its right.
+    /// The mark sits near the left edge but must not be flush against it, which would read as a
+    /// rendering accident. Checks there is still canvas to its left that the mark did not paint.
     #[test]
-    fn the_mark_leaves_a_margin_at_the_right_edge() {
+    fn the_mark_leaves_a_margin_at_the_left_edge() {
         let out = with_exclamation(&base());
         let (.., stem_y, _, _) = auth_mark_probes();
-        let px = out.get_pixel(out.width() - 1, stem_y);
-        assert_eq!(px[3], 0, "the right edge must stay clear of the mark, got {px:?}");
+        let px = out.get_pixel(0, stem_y);
+        assert_ne!(
+            (px[0], px[1], px[2]),
+            (MARK_COLOR[0], MARK_COLOR[1], MARK_COLOR[2]),
+            "the left edge must not be painted with the mark, got {px:?}"
+        );
     }
 
-    /// The needs-auth variants are reachable only through their own accessor, and are duplicates of
-    /// nothing in the array — otherwise the one state that means "no answers available" would be
-    /// indistinguishable from a state that claims answers.
+    /// The point of the redesign: the mark no longer replaces anything, so every variant must have a
+    /// mark-bearing twin that still carries all five other signals.
     #[test]
-    fn needs_auth_is_distinct_from_every_indicator_variant() {
+    fn every_variant_has_a_mark_bearing_twin() {
         let set = build_variants().expect("variants must build");
-        for update in [false, true] {
-            let via_accessor = set.needs_auth(update).as_raw();
-            assert_eq!(via_accessor, set.needs_auth[usize::from(update)].as_raw());
-            for i in 0..32 {
-                assert_ne!(
-                    via_accessor,
-                    set.variants[i].as_raw(),
-                    "needs_auth(update={update}) must differ from variant {i:#07b}"
-                );
-            }
+        for i in 0..32 {
+            assert_ne!(
+                set.variants[i].as_raw(),
+                set.variants[i | 0b100000].as_raw(),
+                "variant {i:#08b} must differ from its marked twin"
+            );
         }
-        // And the two must differ from each other, or the arrow would be invisible in this state.
-        assert_ne!(set.needs_auth(false).as_raw(), set.needs_auth(true).as_raw());
+    }
+
+    /// And the counts really do survive it — the whole reason the mark moved. Lighting all three bars
+    /// and then adding the mark must leave all three bar colours on the canvas.
+    #[test]
+    fn the_mark_leaves_the_bar_colours_intact() {
+        let set = build_variants().expect("variants must build");
+        let all_bars_and_mark = set.get(false, true, true, true, false, true);
+        for (name, colour) in
+            [("review", REVIEW_DOT_COLOR), ("merge", MERGE_DOT_COLOR), ("changes", CHANGES_DOT_COLOR)]
+        {
+            let count = all_bars_and_mark
+                .pixels()
+                .filter(|p| p[3] > 200 && p.0[..3] == colour[..3])
+                .count();
+            assert!(count > 300, "the {name} bar must survive the mark, only {count} px left");
+        }
     }
 
     // ── The update-available arrow ──────────────────────────────────────────
@@ -970,7 +1059,7 @@ mod tests {
     fn arrow_probes() -> ((u32, u32), (u32, u32)) {
         let arrow_w = 98.0 * ARROW_WIDTH_RATIO;
         let arrow_h = 96.0 * ARROW_HEIGHT_RATIO;
-        let left = 98.0 * ARROW_MARGIN_RATIO;
+        let left = (98.0 - arrow_w) / 2.0;
         let top = 98.0 * ARROW_MARGIN_RATIO;
         let centre_x = left + arrow_w / 2.0;
         let split = top + arrow_h * ARROW_HEAD_SPLIT;
@@ -1001,10 +1090,15 @@ mod tests {
         }
     }
 
-    /// The arrow is in the top-left; the indicator bars are in the right-hand column. They must not
-    /// touch, or two independent signals would be corrupting each other's pixels.
+    /// The arrow sits in the top middle and is drawn last, so it *does* overlap the top of the bar
+    /// column — deliberately. What must survive is each bar's **centre**: clip a bar's end and it still
+    /// reads as a bar, but reach its middle and it stops being one.
+    ///
+    /// Measured cost of that overlap at the time of writing: the review bar keeps 528 of 842 px and
+    /// ready-to-merge 723 of 842. Both still read; if a future arrow grows, this test is what catches the
+    /// point where they stop.
     #[test]
-    fn the_arrow_never_reaches_the_indicator_column() {
+    fn the_arrow_never_reaches_a_bar_centre() {
         let with_bars = with_indicator_bars(&base(), [true, true, true]);
         let with_both = with_update_arrow(&with_bars);
 
@@ -1099,16 +1193,16 @@ mod tests {
     #[test]
     fn get_indexes_by_the_matching_bit_pattern() {
         let set = build_variants().expect("variants must build");
-        assert_eq!(
-            set.get(false, false, false, false, false).as_raw(),
-            set.variants[0b0000].as_raw()
-        );
-        assert_eq!(set.get(true, false, false, false, false).as_raw(), set.variants[0b01000].as_raw());
-        assert_eq!(set.get(false, true, false, false, false).as_raw(), set.variants[0b00100].as_raw());
-        assert_eq!(set.get(false, false, true, false, false).as_raw(), set.variants[0b00010].as_raw());
-        assert_eq!(set.get(false, false, false, true, false).as_raw(), set.variants[0b00001].as_raw());
-        assert_eq!(set.get(false, false, false, false, true).as_raw(), set.variants[0b10000].as_raw());
-        assert_eq!(set.get(true, true, true, true, true).as_raw(), set.variants[0b11111].as_raw());
+        let raw = |i: usize| set.variants[i].as_raw();
+        assert_eq!(set.get(false, false, false, false, false, false).as_raw(), raw(0b000000));
+        assert_eq!(set.get(true, false, false, false, false, false).as_raw(), raw(0b001000));
+        assert_eq!(set.get(false, true, false, false, false, false).as_raw(), raw(0b000100));
+        assert_eq!(set.get(false, false, true, false, false, false).as_raw(), raw(0b000010));
+        assert_eq!(set.get(false, false, false, true, false, false).as_raw(), raw(0b000001));
+        assert_eq!(set.get(false, false, false, false, true, false).as_raw(), raw(0b010000));
+        // The bit that moved the mark into the combinable space.
+        assert_eq!(set.get(false, false, false, false, false, true).as_raw(), raw(0b100000));
+        assert_eq!(set.get(true, true, true, true, true, true).as_raw(), raw(0b111111));
     }
 
     /// Geometric proof, independent of the rendered-pixel tests above, that the column fits.
@@ -1193,8 +1287,6 @@ mod render_dump {
         for (i, img) in set.variants.iter().enumerate() {
             img.save(dir.join(variant_filename(i))).expect("save");
         }
-        set.needs_auth[0].save(dir.join(NEEDS_AUTH_FILENAME)).expect("save");
-        set.needs_auth[1].save(dir.join(NEEDS_AUTH_UPDATE_FILENAME)).expect("save");
-        println!("dumped 34 variants to {}", dir.display());
+        println!("dumped {} variants to {}", set.variants.len(), dir.display());
     }
 }

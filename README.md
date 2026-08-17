@@ -24,8 +24,8 @@ The base glyph is dark, or blue when notifications are on and something is unrea
 | 🔴 bar | Right column, slot 1 | A PR is waiting on your review |
 | 🟢 bar | Right column, slot 2 | One of your PRs is approved and passing |
 | 🟠 bar | Right column, slot 3 | A reviewer asked for changes on your PR |
-| 🟢 up-arrow | Top-left | A newer release is available |
-| 🔴 exclamation | Right-hand side | PR status is not authorized yet |
+| 🟢 up-arrow | Top middle | A newer release is available |
+| 🔴 exclamation | Left-hand side, full height | Something needs saying — see below |
 
 The three PR bars stack in one column, so there is one place to look rather than three corners, and they
 fill nearly the whole height — 92 of 96 pixels. Positions are fixed, so a bar always means the same thing
@@ -35,8 +35,28 @@ There is deliberately no spare slot. One was reserved for a while for a signal t
 holding it open cost a quarter of the icon's height, taken straight out of the bars that do exist. Adding a
 fourth signal later means re-tuning the geometry, which is the right way round.
 
-Everything combines freely except one case: the exclamation *replaces* the bars, because with no
-credential there are no answers to draw. The arrow still shows beside it.
+**Everything combines.** All six marks are independent, so any state can be drawn — bars, arrow and
+exclamation together if that is the truth. The exclamation used to *replace* the bars, because it sat on top
+of their column; moving it to the left is what freed the counts to stay visible while something is wrong.
+
+The arrow sits in the top middle and is drawn last, so it overlaps whatever is beneath it. Each bar's
+**centre** survives that: clip a bar's end and it still reads as a bar, reach its middle and it stops being
+one. That is asserted, not hoped for.
+
+**The exclamation has three causes, and only the tooltip and menu say which:**
+
+| Cause | What the menu offers |
+|---|---|
+| PR status is not authorized | **Authenticate GitHub PR Status** |
+| GitHub reports an incident | **GitHub is githubing again, check status** |
+| A poll failed, so a signal is unknown | nothing to click — the tooltip names the axis |
+
+One mark for three causes is a deliberate trade: a second mark would need somewhere to live on an icon that
+has no free space left. The causes stay separate internally, so an incident never offers a sign-in and a
+missing credential never points at the status page.
+
+"A poll failed" means exactly that — asked and not answered. A freshly started app has answered nothing yet
+and shows no mark, and a single transient blip holds the last known value rather than raising one.
 
 ---
 
@@ -49,7 +69,7 @@ cargo build --release          # -> target/release/git-system-tray
 On macOS the bare binary takes a Dock icon and an app menu, because `LSUIElement` needs a bundle:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 1.5.0
+scripts/bundle-macos.sh target/release/git-system-tray dist 1.6.0
 open dist/git-system-tray.app
 ```
 
@@ -74,13 +94,22 @@ be **installed** on that org — see [PR status](#pr-status).
 | Item | Shown when | Does |
 |---|---|---|
 | **Install update: X.Y.Z** | A newer release exists | Shows what changed, then verifies, installs and restarts |
+| **GitHub is githubing again, check status** | GitHub reports an incident | Opens [githubstatus.com](https://www.githubstatus.com) |
+| *— separator —* | Something above **and** below it | |
 | **Authenticate GitHub PR Status** | PR status has no usable credential | Starts the sign-in flow |
 | **Open GitHub Notifications** | Notifications on and something unread | Opens them, then re-checks a few seconds later |
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
 | **Open Ready to Merge (N)** | One of yours is approved and passing | Opens exactly what the green bar counts |
 | **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
+| *— separator —* | Always | |
 | **Open Settings** | Always | Opens `config.txt`, then offers a restart once your edits settle (see below) |
 | **Quit** | Always | Exits |
+
+The update and GitHub-status entries come first: they are about the app and the service rather than about
+your pull requests, and when the icon is wearing a mark two of its three causes are explained up there.
+
+The upper separator appears only when there is something on **both** sides of it. A rule with nothing above
+or nothing below is a stray line, which reads as a rendering fault rather than a grouping.
 
 The requested-reviews and ready-to-merge URLs are generated from the same query their bar counts, so
 those pages cannot disagree with the icon. Labels carry the exact count, unbounded.
@@ -208,6 +237,10 @@ The tooltip always states what the app currently believes, including *why* it is
 appended to `~/.github-trayicon/log.txt` — the only way to see errors on Windows and macOS, where there is
 no console. The log never contains a token.
 
+That directory holds the four files worth opening — `config.txt`, `log.txt` and the two credentials — plus
+an `icons/` subdirectory with the 64 generated PNGs. Linux only: Windows and macOS build their icons in
+memory and never write one to disk.
+
 | Tooltip | Meaning |
 |---|---|
 | `N PR(s) awaiting your review` / `No reviews requested` | Confirmed by a successful search |
@@ -218,7 +251,8 @@ no console. The log never contains a token.
 | `PR status off: install the GitHub App to see your PRs` | Authorized, but installed nowhere |
 | `PR status off: setup failed` | No HTTP client could be built; clicking will not help |
 | `PR status off in config.txt` | All three signals switched off |
-| `... state unknown` | Several polls failed; that signal is no longer trustworthy |
+| `... state unknown` | Several polls failed; that signal is no longer trustworthy, and the exclamation is up |
+| `GitHub: <description>` | GitHub reports an incident; quotes its own wording, and comes first in the tooltip |
 | `Update available: X.Y.Z` | A newer release exists |
 
 A bar that is simply absent, with no message, means you genuinely have nothing pending. That distinction
