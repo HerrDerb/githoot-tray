@@ -532,22 +532,29 @@ fn sha256_file(path: &Path) -> Result<String, UpdateError> {
 /// with the right bytes. What it does catch cheaply is the common accident — a GitHub HTML error page
 /// served with a 200, or an asset built for the wrong architecture.
 fn check_magic(path: &Path) -> Result<(), UpdateError> {
+    // Exactly 64 bytes, and `read_exact` rather than `read`: the Windows branch needs the four bytes at
+    // 0x3C, so "we got fewer bytes than that" has to be its own error rather than something a length
+    // guard silently reports as the wrong kind of file. `MIN_ASSET_BYTES` already makes a real asset
+    // this small impossible.
     let mut head = [0u8; 64];
     let mut file = std::fs::File::open(path)
         .map_err(|e| UpdateError::Local(format!("could not read the download: {e}")))?;
-    let read = file.read(&mut head).map_err(|e| UpdateError::Local(e.to_string()))?;
-    let head = &head[..read];
+    file.read_exact(&mut head)
+        .map_err(|e| UpdateError::Integrity(format!("the download is too short to identify: {e}")))?;
 
+    // Every branch below asks only "what do the bytes say". The buffer is a fixed 64 bytes and
+    // `read_exact` has already guaranteed it is full, so there are deliberately no length guards here.
+    // An earlier `head.len() > 0x40` on the Windows arm could never be true and rejected every single
+    // Windows update.
     let ok = if cfg!(target_os = "linux") {
         // ELF, 64-bit, little-endian, x86-64.
-        head.len() > 19
-            && head[..4] == [0x7f, b'E', b'L', b'F']
+        head[..4] == [0x7f, b'E', b'L', b'F']
             && head[4] == 2
             && head[5] == 1
             && u16::from_le_bytes([head[18], head[19]]) == 0x3E
     } else if cfg!(target_os = "windows") {
         // MZ, then the PE header at the offset stored at 0x3C, then the machine type.
-        head.len() > 0x40 && &head[..2] == b"MZ" && {
+        &head[..2] == b"MZ" && {
             let at = u32::from_le_bytes([head[0x3C], head[0x3D], head[0x3E], head[0x3F]]) as usize;
             // Only the offset is in the first 64 bytes; the rest needs a seek, so re-read from there.
             let mut pe = [0u8; 6];
@@ -559,7 +566,7 @@ fn check_magic(path: &Path) -> Result<(), UpdateError> {
         }
     } else {
         // macOS ships a zip of the .app bundle.
-        head.len() > 4 && head[..4] == [0x50, 0x4B, 0x03, 0x04]
+        head[..4] == [0x50, 0x4B, 0x03, 0x04]
     };
 
     if ok {
@@ -1289,5 +1296,105 @@ mod tests {
             _ => None,
         };
         assert_eq!(ASSET, expected);
+    }
+
+    // ── Artefact shape ─────────────────────────────────────────────────────
+    //
+    // `check_magic` had no test of its own until it shipped broken: the Windows arm demanded
+    // `head.len() > 0x40` from a buffer that is exactly 0x40 long, so it rejected every valid `.exe`.
+    // Only `verifies_the_live_release` touched it, and that one is `#[ignore]`d behind the network.
+    // These fixtures are a few dozen bytes and run everywhere.
+
+    fn fixture(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gst-magic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("the fixture must be writable");
+        path
+    }
+
+    /// A structurally real PE header: `MZ`, the PE offset at 0x3C, and `PE\0\0` plus a machine type
+    /// where that offset points. Byte 2 is `0x90`, so the first eight bytes read `4d5a900000000000`,
+    /// near enough the `4d5a900003000000` from the bug report to be recognisable.
+    fn pe_bytes(machine: u16) -> Vec<u8> {
+        let mut v = vec![0u8; 0x90];
+        v[..2].copy_from_slice(b"MZ");
+        v[2] = 0x90;
+        v[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        v[0x80..0x84].copy_from_slice(b"PE\0\0");
+        v[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        v
+    }
+
+    /// 64-bit little-endian ELF with the given `e_machine`.
+    fn elf_bytes(machine: u16) -> Vec<u8> {
+        let mut v = vec![0u8; 64];
+        v[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        v[4] = 2;
+        v[5] = 1;
+        v[18..20].copy_from_slice(&machine.to_le_bytes());
+        v
+    }
+
+    fn zip_bytes() -> Vec<u8> {
+        let mut v = vec![0u8; 64];
+        v[..4].copy_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
+        v
+    }
+
+    /// The header of whatever CI publishes for the platform the tests are running on.
+    ///
+    /// Chosen by `cfg!` to mirror `check_magic` itself, so this asserts something real on all three
+    /// platforms rather than passing vacuously on two of them.
+    fn this_platforms_asset(good: bool) -> Vec<u8> {
+        if cfg!(target_os = "windows") {
+            // 0xAA64 is arm64: a valid PE, wrong machine.
+            pe_bytes(if good { 0x8664 } else { 0xAA64 })
+        } else if cfg!(target_os = "linux") {
+            // 0xB7 is aarch64.
+            elf_bytes(if good { 0x3E } else { 0xB7 })
+        } else if good {
+            zip_bytes()
+        } else {
+            // The macOS asset is a zip, which carries no architecture of its own; a bare Mach-O
+            // uploaded in its place is the equivalent accident.
+            let mut v = vec![0u8; 64];
+            v[..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]);
+            v
+        }
+    }
+
+    /// The regression, stated directly: the artefact this platform actually publishes must pass.
+    #[test]
+    fn the_asset_this_platform_publishes_is_accepted() {
+        let path = fixture("good", &this_platforms_asset(true));
+        let result = check_magic(&path);
+        assert!(result.is_ok(), "a valid asset must pass, got {:?}", result.err().map(|e| e.to_string()));
+    }
+
+    /// An asset built for another architecture, which is the mistake the machine-type check exists for.
+    #[test]
+    fn an_asset_for_the_wrong_architecture_is_refused() {
+        let path = fixture("wrong-arch", &this_platforms_asset(false));
+        assert!(check_magic(&path).is_err(), "the wrong architecture must not install over this one");
+    }
+
+    /// A GitHub error page served with a 200. Wrong on every platform, so no `cfg` needed.
+    #[test]
+    fn an_html_error_page_is_refused() {
+        let mut html = b"<!DOCTYPE html><html><head><title>Not Found</title>".to_vec();
+        html.resize(64, b' ');
+        let path = fixture("page.html", &html);
+        let err = check_magic(&path).expect_err("HTML must never pass for a binary");
+        assert!(format!("{err}").contains("not the expected kind of file"), "got {err}");
+    }
+
+    /// Shorter than the header itself: a clean refusal, never a panic on the slice. This is the case
+    /// `read_exact` exists for, and the one a `read` plus length guard used to get wrong.
+    #[test]
+    fn a_truncated_download_is_refused_rather_than_panicking() {
+        let path = fixture("truncated", b"MZ");
+        let err = check_magic(&path).expect_err("two bytes cannot be a release build");
+        assert!(format!("{err}").contains("too short"), "got {err}");
     }
 }
