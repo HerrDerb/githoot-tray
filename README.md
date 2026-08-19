@@ -24,7 +24,7 @@ blue when notifications are on and something is unread
 | Icon | Mark | Means |
 |:---:|---|---|
 | <img src="docs/icons/github_review.png" alt="review bar" height="28"> | red bar | A PR is waiting on your review |
-| <img src="docs/icons/github_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved and passing |
+| <img src="docs/icons/github_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved |
 | <img src="docs/icons/github_changes.png" alt="changes bar" height="28"> | amber bar | A reviewer asked for changes on your PR |
 | <img src="docs/icons/github_update.png" alt="update arrow" height="28"> | green up-arrow | A newer release is available |
 | <img src="docs/icons/github_alert.png" alt="exclamation" height="28"> | red exclamation | Something needs saying, see below |
@@ -111,7 +111,7 @@ be **installed** on that org — see [PR status](#pr-status).
 | **Authenticate GitHub PR Status** | PR status has no usable credential | Starts the sign-in flow |
 | **Open GitHub Notifications** | Notifications on and something unread | Opens them, then re-checks a few seconds later |
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
-| **Open Ready to Merge (N)** | One of yours is approved and passing | Opens exactly what the green bar counts |
+| **Open Ready to Merge (N)** | One of yours is approved | Opens exactly what the green bar counts |
 | **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
 | *— separator —* | Always | |
 | **Open Settings** | Always | Opens `config.txt`, then offers a restart once your edits settle (see below) |
@@ -185,12 +185,14 @@ Three independent signals, each a GitHub Search query against your own pull requ
 | Bar | Query |
 |---|---|
 | 🔴 | `is:pr review-requested:@me state:open archived:false -label:dependencies -author:app/dependabot -author:app/renovate` |
-| 🟢 | `is:pr author:@me review:approved status:success state:open draft:false archived:false` |
+| 🟢 | `is:pr author:@me review:approved state:open draft:false archived:false` |
 | 🟠 | `is:pr author:@me review:changes_requested state:open archived:false` |
 
 "Ready to merge" is an approximation — Search has no single "mergeable" qualifier — so it can read wrong
-where branch protection needs multiple approvals, named reviewers, or checks the combined commit status
-does not reflect.
+where branch protection needs multiple approvals or named reviewers. It deliberately does not filter on
+CI status: the `status:` qualifier reads only the legacy combined commit status, which is empty for repos
+whose checks are all GitHub Actions / check runs, so `status:success` there matched nothing and hid every
+mergeable PR. The trade is that a PR with red checks can still light the green bar.
 
 **Changes requested does one thing more than its query.** Re-requesting a review does not dismiss the
 reviewer's earlier verdict, so `review:changes_requested` keeps matching a pull request you have already

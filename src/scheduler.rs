@@ -61,13 +61,15 @@ static UPDATE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open archived:false \
                             -label:dependencies -author:app/dependabot -author:app/renovate";
 
-/// Search query for the user's own pull requests that are approved and passing checks.
+/// Search query for the user's own pull requests that are approved.
 ///
-/// GitHub's search API has no single "mergeable" qualifier, so this is an accepted approximation:
-/// it can read wrong for branch-protection setups needing more than one approval, required
-/// reviewers by name, or required status checks not reflected in the combined commit status.
-const MERGE_QUERY: &str = "is:pr author:@me review:approved status:success state:open \
-                           draft:false archived:false";
+/// GitHub's search API has no single "mergeable" qualifier, so this is an accepted approximation.
+/// It deliberately does *not* filter on CI status: the `status:` qualifier reads only the legacy
+/// combined commit status, which is empty for repos whose checks are all GitHub Actions / check
+/// runs — there `status:success` matches nothing and hides every genuinely mergeable PR. Approval
+/// is the closest signal the Search API can give on its own. It still can't see branch-protection
+/// rules needing more than one approval or named reviewers, and won't catch a PR whose checks are red.
+const MERGE_QUERY: &str = "is:pr author:@me review:approved state:open draft:false archived:false";
 
 /// Search query for the user's own pull requests where a reviewer requested changes.
 const CHANGES_QUERY: &str = "is:pr author:@me review:changes_requested state:open archived:false";
@@ -1034,7 +1036,6 @@ mod tests {
         for qualifier in [
             "author%3A%40me",
             "review%3Aapproved",
-            "status%3Asuccess",
             "state%3Aopen",
             "draft%3Afalse",
             "archived%3Afalse",
