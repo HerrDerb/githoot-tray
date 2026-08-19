@@ -24,7 +24,7 @@ blue when notifications are on and something is unread
 | Icon | Mark | Means |
 |:---:|---|---|
 | <img src="docs/icons/github_review.png" alt="review bar" height="28"> | red bar | A PR is waiting on your review |
-| <img src="docs/icons/github_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved |
+| <img src="docs/icons/github_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved and its checks pass |
 | <img src="docs/icons/github_changes.png" alt="changes bar" height="28"> | amber bar | A reviewer asked for changes on your PR |
 | <img src="docs/icons/github_update.png" alt="update arrow" height="28"> | green up-arrow | A newer release is available |
 | <img src="docs/icons/github_alert.png" alt="exclamation" height="28"> | red exclamation | Something needs saying, see below |
@@ -111,7 +111,7 @@ be **installed** on that org — see [PR status](#pr-status).
 | **Authenticate GitHub PR Status** | PR status has no usable credential | Starts the sign-in flow |
 | **Open GitHub Notifications** | Notifications on and something unread | Opens them, then re-checks a few seconds later |
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
-| **Open Ready to Merge (N)** | One of yours is approved | Opens exactly what the green bar counts |
+| **Open Ready to Merge (N)** | One of yours is approved and its checks pass | Opens exactly what the green bar counts |
 | **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
 | *— separator —* | Always | |
 | **Open Settings** | Always | Opens `config.txt`, then offers a restart once your edits settle (see below) |
@@ -123,14 +123,15 @@ your pull requests, and when the icon is wearing a mark two of its three causes 
 The upper separator appears only when there is something on **both** sides of it. A rule with nothing above
 or nothing below is a stray line, which reads as a rendering fault rather than a grouping.
 
-The requested-reviews and ready-to-merge URLs are generated from the same query their bar counts, so
-those pages cannot disagree with the icon. Labels carry the exact count, unbounded.
+The requested-reviews URL is generated from the same query its bar counts, so that page cannot disagree
+with the icon. Labels carry the exact count, unbounded.
 
-**Changes requested is the one exception.** Its bar counts pull requests where a reviewer asked for
-changes *and no re-review is pending from that reviewer* — so once you push fixes and re-request the
-review, the bar goes dark. GitHub's web search cannot express that condition, so the menu entry opens
-the unfiltered list, which may still include a pull request you have already handed back. The bar is the
-accurate one.
+**The other two bars apply a filter GitHub's web search cannot express, so their pages can list more
+than the bar counts — the bar is the accurate one.** Ready to merge counts approved PRs whose checks
+are green (see below); the page it opens shows every approved PR, including ones with red or pending
+checks. Changes requested counts PRs where a reviewer asked for changes *and no re-review is pending
+from that reviewer* — so once you push fixes and re-request the review, the bar goes dark — but its
+page still shows every PR with changes requested, including ones you have already handed back.
 
 ---
 
@@ -188,11 +189,14 @@ Three independent signals, each a GitHub Search query against your own pull requ
 | 🟢 | `is:pr author:@me review:approved state:open draft:false archived:false` |
 | 🟠 | `is:pr author:@me review:changes_requested state:open archived:false` |
 
-"Ready to merge" is an approximation — Search has no single "mergeable" qualifier — so it can read wrong
-where branch protection needs multiple approvals or named reviewers. It deliberately does not filter on
-CI status: the `status:` qualifier reads only the legacy combined commit status, which is empty for repos
-whose checks are all GitHub Actions / check runs, so `status:success` there matched nothing and hid every
-mergeable PR. The trade is that a PR with red checks can still light the green bar.
+The green "ready to merge" query does only half the work. Search has no qualifier for check health
+(`status:success` reads only the legacy combined commit status, which is empty for repos whose checks are
+all GitHub Actions / check runs — there it matches nothing and hides every mergeable PR), so the query
+above filters on approval alone, and the check-health gate is applied per-PR afterwards: the green bar
+counts an approved PR only when its GraphQL `statusCheckRollup` is `SUCCESS`, or absent because the repo
+has no checks at all. A PR with red or still-running checks does not light it. Up to the first 100
+approved PRs are inspected. Still not checked: branch protection needing multiple approvals or named
+reviewers, and merge conflicts (`mergeable` is computed lazily and reads `UNKNOWN` on a cold poll).
 
 **Changes requested does one thing more than its query.** Re-requesting a review does not dismiss the
 reviewer's earlier verdict, so `review:changes_requested` keeps matching a pull request you have already

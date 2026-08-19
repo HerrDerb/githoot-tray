@@ -63,12 +63,12 @@ const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open archived:false
 
 /// Search query for the user's own pull requests that are approved.
 ///
-/// GitHub's search API has no single "mergeable" qualifier, so this is an accepted approximation.
-/// It deliberately does *not* filter on CI status: the `status:` qualifier reads only the legacy
-/// combined commit status, which is empty for repos whose checks are all GitHub Actions / check
-/// runs — there `status:success` matches nothing and hides every genuinely mergeable PR. Approval
-/// is the closest signal the Search API can give on its own. It still can't see branch-protection
-/// rules needing more than one approval or named reviewers, and won't catch a PR whose checks are red.
+/// This is only the *server-side* half of the "ready to merge" test: approval, open, not-draft. It
+/// carries no CI-status qualifier on purpose — `status:success` reads only the legacy combined commit
+/// status, which is empty for repos whose checks are all GitHub Actions / check runs, so it matches
+/// nothing there and hides every genuinely mergeable PR. Check health is gated client-side instead,
+/// in `github::poll_merge_ready` via the GraphQL `statusCheckRollup`. What is still not checked:
+/// branch-protection rules needing more than one approval or named reviewers.
 const MERGE_QUERY: &str = "is:pr author:@me review:approved state:open draft:false archived:false";
 
 /// Search query for the user's own pull requests where a reviewer requested changes.
@@ -90,15 +90,17 @@ fn pr_query(axis: PrAxis) -> &'static str {
 
 /// Issues `axis`'s poll.
 ///
-/// Two axes are a `total_count` read off the Search API. `ChangesRequested` is not, because the query
-/// alone cannot tell "still on me" from "handed back to the reviewer" — see
-/// `github::poll_changes_requested`. Both take the same query string; they differ only in which endpoint
-/// answers it and how much of the answer has to be read.
+/// Only `ReviewRequested` is a plain `total_count` read off the Search API. `ChangesRequested` and
+/// `ReadyToMerge` are not: the Search query alone cannot tell "still on me" from "handed back", nor
+/// an approved PR with green checks from one with red — see `github::poll_changes_requested` and
+/// `github::poll_merge_ready`. All three take the same query string; they differ only in which
+/// endpoint answers it and how much of the answer has to be read.
 fn poll_pr(client: &reqwest::blocking::Client, token: &str, axis: PrAxis) -> github::PollResponse {
     let query = pr_query(axis);
     match axis {
         PrAxis::ChangesRequested => github::poll_changes_requested(client, token, query),
-        PrAxis::ReviewRequested | PrAxis::ReadyToMerge => github::poll_reviews(client, token, query),
+        PrAxis::ReadyToMerge => github::poll_merge_ready(client, token, query),
+        PrAxis::ReviewRequested => github::poll_reviews(client, token, query),
     }
 }
 

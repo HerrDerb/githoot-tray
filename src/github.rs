@@ -16,15 +16,19 @@ const SEARCH_URL: &str = "https://api.github.com/search/issues";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const AGENT: &str = "git-system-tray";
 
-/// How many search hits the changes-requested query inspects, and how many reviews and pending
-/// requests it reads per hit.
+/// How many search hits a GraphQL poll inspects (shared by the changes-requested and merge-ready
+/// axes).
 ///
-/// Both are caps rather than pagination, and both undercount rather than overcount: past 100
-/// matching pull requests the extras are simply not seen, and a pull request with more than 20
-/// opinionated reviews or 20 pending review requests could be judged on a partial list. Neither
-/// figure is reachable by the inbox this app exists for, and paginating would trade a real
-/// increase in complexity for a case nobody has.
-const CHANGES_HITS_CAP: u32 = 100;
+/// A cap rather than pagination, and it undercounts rather than overcounts: past 100 matching pull
+/// requests the extras are simply not seen. Not reachable by the inbox this app exists for, and
+/// paginating would trade a real increase in complexity for a case nobody has.
+const SEARCH_HITS_CAP: u32 = 100;
+
+/// How many opinionated reviews and pending requests the changes-requested query reads per hit.
+///
+/// Same undercount-not-overcount trade as `SEARCH_HITS_CAP`: a pull request with more than 20
+/// opinionated reviews or 20 pending review requests could be judged on a partial list, which is
+/// unreachable by this app's inbox.
 const CHANGES_REVIEWS_CAP: u32 = 20;
 
 /// Kept well under the 60s poll floor so a stalled request cannot delay the next one.
@@ -168,11 +172,43 @@ query($q:String!,$hits:Int!,$reviews:Int!){\
 pub fn poll_changes_requested(client: &Client, token: &str, query: &str) -> PollResponse {
     let body = serde_json::json!({
         "query": CHANGES_REQUESTED_DOCUMENT,
-        "variables": { "q": query, "hits": CHANGES_HITS_CAP, "reviews": CHANGES_REVIEWS_CAP },
+        "variables": { "q": query, "hits": SEARCH_HITS_CAP, "reviews": CHANGES_REVIEWS_CAP },
     });
     let request = client.post(GRAPHQL_URL).json(&body);
 
     send(request, token, None, parse_changes_requested)
+}
+
+/// The "ready to merge" query cannot be a plain `total_count` read either.
+///
+/// The Search API has no qualifier for check health: `status:success` reads only GitHub's *legacy*
+/// combined commit status, which is empty for repos whose CI is entirely check runs (GitHub Actions
+/// and friends) — there it matches nothing and hides every genuinely mergeable pull request. GraphQL
+/// exposes the real signal via `statusCheckRollup.state`, which aggregates check runs *and* legacy
+/// statuses. So the same server-side search string is handed to GraphQL, and the check-health gate is
+/// applied client-side in `checks_ready` — the same split the changes-requested axis already uses.
+const MERGE_READY_DOCUMENT: &str = "\
+query($q:String!,$hits:Int!){\
+  search(query:$q,type:ISSUE,first:$hits){\
+    nodes{...on PullRequest{\
+      commits(last:1){nodes{commit{statusCheckRollup{state}}}}\
+    }}\
+  }\
+}";
+
+/// Polls the user's own pull requests that are approved *and* whose checks are healthy.
+///
+/// `query` is the same Search query string the other axes use (approval, open, not-draft handled
+/// server-side); the check-health filter is client-side, so it works for check-run-only repos where
+/// the Search `status:` qualifier reads empty. No `If-None-Match`: GraphQL is a POST and does not 304.
+pub fn poll_merge_ready(client: &Client, token: &str, query: &str) -> PollResponse {
+    let body = serde_json::json!({
+        "query": MERGE_READY_DOCUMENT,
+        "variables": { "q": query, "hits": SEARCH_HITS_CAP },
+    });
+    let request = client.post(GRAPHQL_URL).json(&body);
+
+    send(request, token, None, parse_merge_ready)
 }
 
 /// Shared request/response plumbing for both endpoints.
@@ -270,6 +306,8 @@ struct SearchConnection {
 struct PullRequestNode {
     latest_opinionated_reviews: Option<ReviewConnection>,
     review_requests: Option<RequestConnection>,
+    /// Only requested by the merge-ready query; absent (`None`) in changes-requested responses.
+    commits: Option<CommitConnection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +344,62 @@ struct RequestedReviewer {
     typename: String,
     /// Present for a `User`; absent for a `Team`, which is the whole reason `typename` is read.
     login: Option<String>,
+}
+
+// ─── The merge-ready payload ──────────────────────────────────────────────────
+//
+// Every level is optional, for the same reason as the changes-requested structs: GraphQL can answer
+// with partial data, and a repo with no checks at all returns a null `statusCheckRollup`. See
+// `checks_ready` for how an absent rollup is read.
+
+#[derive(Debug, Deserialize)]
+struct CommitConnection {
+    nodes: Vec<Option<CommitNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitNode {
+    commit: Option<Commit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Commit {
+    /// `None` when the repo has no checks configured at all — GitHub returns a null rollup, not an
+    /// empty one.
+    status_check_rollup: Option<StatusCheckRollup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusCheckRollup {
+    /// One of `SUCCESS`, `PENDING`, `FAILURE`, `ERROR`, `EXPECTED`.
+    state: String,
+}
+
+/// Whether this pull request's checks are healthy enough to call it ready to merge.
+///
+/// Ready means the rollup is `SUCCESS`, or there is no rollup at all — a repo with no checks
+/// configured has nothing that can fail, and because the search is scoped to `author:@me` an absent
+/// rollup means "no checks", never "not allowed to see them". Everything else (`FAILURE`, `ERROR`,
+/// a still-running `PENDING`/`EXPECTED`, or any state we do not recognise) is not ready.
+///
+/// The safe direction here is the *opposite* of `still_on_you`. A green bar that should be dark
+/// claims a pull request is mergeable while its checks are red — the exact false signal this axis
+/// exists to kill — so anything short of a clear success is dropped.
+fn checks_ready(pr: &PullRequestNode) -> bool {
+    let rollup_state = pr
+        .commits
+        .as_ref()
+        .and_then(|c| c.nodes.iter().flatten().next())
+        .and_then(|node| node.commit.as_ref())
+        .and_then(|commit| commit.status_check_rollup.as_ref())
+        .map(|rollup| rollup.state.as_str());
+
+    match rollup_state {
+        None => true,             // no checks configured: nothing to fail
+        Some("SUCCESS") => true,
+        Some(_) => false,
+    }
 }
 
 /// Whether this pull request is still waiting on *you* rather than on a reviewer.
@@ -369,6 +463,31 @@ fn parse_changes_requested(body: &str) -> Result<(bool, Option<u32>), String> {
         .search;
 
     let count = search.nodes.iter().flatten().filter(|pr| still_on_you(pr)).count() as u32;
+    Ok((count > 0, Some(count)))
+}
+
+/// Success-body parser for the merge-ready GraphQL query.
+///
+/// Same shape as `parse_changes_requested`, and for the same reason: GraphQL reports failure with a
+/// `200 OK` and an `errors` array, so errors are checked before `data`. A parser reading only `data`
+/// would turn a broken request into a confident **zero**, darkening the bar for a PR that is actually
+/// ready. Only the client-side filter differs — `checks_ready` instead of `still_on_you`.
+fn parse_merge_ready(body: &str) -> Result<(bool, Option<u32>), String> {
+    let response: GraphQlResponse = serde_json::from_str(body)
+        .map_err(|e| format!("unparseable merge-ready payload: {e}"))?;
+
+    if !response.errors.is_empty() {
+        let joined =
+            response.errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("; ");
+        return Err(format!("GraphQL reported an error: {joined}"));
+    }
+
+    let search = response
+        .data
+        .ok_or_else(|| "GraphQL answered with neither data nor errors".to_string())?
+        .search;
+
+    let count = search.nodes.iter().flatten().filter(|pr| checks_ready(pr)).count() as u32;
     Ok((count > 0, Some(count)))
 }
 
@@ -690,6 +809,122 @@ mod tests {
         for var in ["$q", "$hits", "$reviews"] {
             assert!(
                 CHANGES_REQUESTED_DOCUMENT.matches(var).count() >= 2,
+                "{var} should be both declared and used"
+            );
+        }
+    }
+
+    // ── Merge-ready body parsing ──────────────────────────────────────────────
+
+    /// Shorthand: classify a MERGE-READY (GraphQL) response.
+    fn merge(status: StatusCode, h: &HeaderMap, body: &str, now: u64) -> PollResult {
+        classify_with(status, h, body, now, parse_merge_ready)
+    }
+
+    /// A single merge-ready search hit whose head commit carries `state` as its check rollup.
+    /// `None` renders a null rollup — GitHub's answer for a repo with no checks configured.
+    fn mrhit(state: Option<&str>) -> String {
+        let rollup = match state {
+            Some(s) => format!(r#"{{"state":"{s}"}}"#),
+            None => "null".to_string(),
+        };
+        format!(r#"{{"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}"#)
+    }
+
+    fn merge_count(body: &str) -> u32 {
+        match merge(StatusCode::OK, &headers(&[]), body, 0) {
+            PollResult::Fresh { count: Some(n), .. } => n,
+            other => panic!("expected Fresh with a count, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_success_rollup_is_ready() {
+        assert_eq!(merge_count(&payload(&[mrhit(Some("SUCCESS"))])), 1);
+    }
+
+    /// A repo with no checks has nothing that can fail, so an approved PR there is ready.
+    #[test]
+    fn an_absent_rollup_is_ready() {
+        assert_eq!(merge_count(&payload(&[mrhit(None)])), 1, "null rollup: no checks configured");
+        assert_eq!(merge_count(&payload(&[r#"{}"#.to_string()])), 1, "no commits field at all");
+    }
+
+    #[test]
+    fn a_failing_rollup_is_not_ready() {
+        for state in ["FAILURE", "ERROR"] {
+            assert_eq!(merge_count(&payload(&[mrhit(Some(state))])), 0, "{state} is not ready");
+        }
+    }
+
+    /// Still-running checks are not "ready to merge" yet — only a clear success counts.
+    #[test]
+    fn an_unfinished_rollup_is_not_ready() {
+        for state in ["PENDING", "EXPECTED"] {
+            assert_eq!(merge_count(&payload(&[mrhit(Some(state))])), 0, "{state} is not ready");
+        }
+    }
+
+    #[test]
+    fn a_mixed_page_counts_only_the_healthy_ones() {
+        let body = payload(&[
+            mrhit(Some("SUCCESS")), // ready
+            mrhit(Some("FAILURE")), // red
+            mrhit(None),            // no checks: ready
+            mrhit(Some("PENDING")), // still running
+        ]);
+        assert_eq!(merge_count(&body), 2);
+    }
+
+    #[test]
+    fn an_empty_merge_page_is_a_clean_zero() {
+        match merge(StatusCode::OK, &headers(&[]), &payload(&[]), 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(!present);
+                assert_eq!(count, Some(0));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// GraphQL reports failure as `200 OK` + an `errors` array; reading only `data` would count a
+    /// broken page as a confident zero, darkening the bar for a PR that may well be ready.
+    #[test]
+    fn a_merge_graphql_error_at_status_200_is_transient_not_zero() {
+        let body = r#"{"data":null,"errors":[{"message":"Something went wrong"}]}"#;
+        match merge(StatusCode::OK, &headers(&[]), body, 0) {
+            PollResult::Transient(why) => assert!(why.contains("Something went wrong")),
+            other => panic!("expected Transient, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn merge_errors_win_even_when_data_is_present() {
+        let body = format!(
+            r#"{{"data":{{"search":{{"nodes":[{}]}}}},"errors":[{{"message":"partial"}}]}}"#,
+            mrhit(Some("SUCCESS"))
+        );
+        assert!(matches!(merge(StatusCode::OK, &headers(&[]), &body, 0), PollResult::Transient(_)));
+    }
+
+    #[test]
+    fn a_merge_response_with_neither_data_nor_errors_is_transient() {
+        assert!(matches!(merge(StatusCode::OK, &headers(&[]), "{}", 0), PollResult::Transient(_)));
+    }
+
+    #[test]
+    fn a_malformed_merge_body_is_transient() {
+        assert!(matches!(
+            merge(StatusCode::OK, &headers(&[]), "not json at all", 0),
+            PollResult::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn the_merge_document_declares_the_variables_it_sends() {
+        for var in ["$q", "$hits"] {
+            assert!(
+                MERGE_READY_DOCUMENT.matches(var).count() >= 2,
                 "{var} should be both declared and used"
             );
         }
