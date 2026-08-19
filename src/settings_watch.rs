@@ -15,7 +15,7 @@
 //! renaming it over the target, which changes mtime and inode with no regard for whether the bytes
 //! differ. `icons::write_icon_if_changed` compares contents for the same reason.
 
-use crate::logln;
+use crate::{errorln, infoln};
 use crate::update::RestartPlan;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -118,19 +118,19 @@ pub fn open_for_editing(path: &std::path::Path) -> bool {
     if let Some(editor) = preferred_editor() {
         match open::with_detached(path, &editor) {
             Ok(()) => {
-                logln!("opened {} in {editor}", path.display());
+                infoln!("opened {} in {editor}", path.display());
                 return true;
             }
             // Not fatal: the association below may well work, and saying which step failed is the
             // difference between a fixable report and "it did nothing".
-            Err(e) => logln!("could not open {} in {editor} ({e}) — trying the desktop default", path.display()),
+            Err(e) => errorln!("could not open {} in {editor} ({e}) — trying the desktop default", path.display()),
         }
     }
 
     match open::that_detached(path) {
         Ok(()) => true,
         Err(e) => {
-            logln!("failed to open {}: {e}", path.display());
+            errorln!("failed to open {}: {e}", path.display());
             false
         }
     }
@@ -161,7 +161,7 @@ fn choose_editor(raw: Option<&str>) -> Option<String> {
         .unwrap_or(program)
         .to_ascii_lowercase();
     if TERMINAL_EDITORS.contains(&name.as_str()) {
-        logln!("$EDITOR is {name}, which needs a terminal — using the desktop default instead");
+        infoln!("$EDITOR is {name}, which needs a terminal — using the desktop default instead");
         return None;
     }
     Some(command.to_string())
@@ -184,7 +184,7 @@ pub fn spawn(path: PathBuf, restart: impl Fn(RestartPlan) + Send + 'static) {
 
     // `swap` rather than load-then-store, so two clicks in quick succession cannot both get past.
     if WATCHING.swap(true, Ordering::SeqCst) {
-        logln!("already watching {} for edits", path.display());
+        infoln!("already watching {} for edits", path.display());
         return;
     }
 
@@ -207,7 +207,7 @@ fn watch(path: &std::path::Path, restart: impl Fn(RestartPlan)) {
         std::thread::sleep(POLL_EVERY);
         let now = Instant::now();
         if now >= deadline {
-            logln!("stopped watching {} for edits — nothing changed", path.display());
+            infoln!("stopped watching {} for edits — nothing changed", path.display());
             return;
         }
 
@@ -215,13 +215,13 @@ fn watch(path: &std::path::Path, restart: impl Fn(RestartPlan)) {
             continue;
         }
 
-        logln!("settings changed — asking whether to restart");
+        infoln!("settings changed — asking whether to restart");
         let accepted = crate::dialog::confirm_restart(
             "git-system-tray: settings changed",
             "Settings are only read when the app starts.\n\nRestart now to apply them?",
         );
         if !accepted {
-            logln!("restart declined — the new settings apply at the next start");
+            infoln!("restart declined — the new settings apply at the next start");
             return;
         }
 

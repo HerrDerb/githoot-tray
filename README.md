@@ -148,9 +148,11 @@ appear in it, and the table below is the complete list.
 | `reviewRequested` | `on` | The red bar |
 | `readyToMerge` | `on` | The green bar |
 | `changesRequested` | `on` | The amber bar |
+| `logLevel` | `error` | How much `log.txt` records: `error` logs only failures, `info` adds lifecycle detail for diagnosing |
 
 Only `off`, `false`, `0` or `no` switch something off; anything else leaves the default, so a typo cannot
-silently disable a feature.
+silently disable a feature. `logLevel` is the one non-toggle: it takes `error` or `info`, and an
+unrecognised value falls back to `error`.
 
 **Restart after editing — the menu offers it.** Settings are read once at startup, so **Open Settings**
 opens the file and then watches it. Once the contents change and stay unchanged for a few seconds, a dialog

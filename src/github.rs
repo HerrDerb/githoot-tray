@@ -83,15 +83,21 @@ pub enum PollResult {
 }
 
 impl PollResult {
-    /// Short tag for the log. Without this a 200 and a 304 produce identical log lines, which
-    /// hides exactly the distinction worth watching when the icon looks wrong.
-    pub fn kind(&self) -> &'static str {
+    /// The detail worth logging when a poll did **not** go cleanly, or `None` when it did.
+    ///
+    /// `Fresh` and `NotModified` are the two expected outcomes, so they stay silent — logging
+    /// them on every cycle is what buried the one line that mattered. Every other variant names
+    /// what went wrong and carries the same message the tooltip would show, so a non-OK response
+    /// or a transport failure is never swallowed the way the GraphQL `FORBIDDEN` was: the field
+    /// error rides in on `Transient`'s string.
+    pub fn problem(&self) -> Option<String> {
         match self {
-            PollResult::Fresh { .. } => "fresh",
-            PollResult::NotModified => "not-modified",
-            PollResult::Unauthorized => "unauthorized",
-            PollResult::RateLimited { .. } => "rate-limited",
-            PollResult::Transient(_) => "transient-failure",
+            PollResult::Fresh { .. } | PollResult::NotModified => None,
+            PollResult::Unauthorized => Some("token rejected by GitHub (401)".to_string()),
+            PollResult::RateLimited { retry_after } => {
+                Some(format!("rate limited — holding for {}s", retry_after.as_secs()))
+            }
+            PollResult::Transient(detail) => Some(detail.clone()),
         }
     }
 }

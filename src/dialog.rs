@@ -229,7 +229,7 @@ fn confirm(
 fn copy_to_clipboard(text: &str) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
         Ok(()) => {}
-        Err(e) => crate::logln!("could not copy the device code to the clipboard: {e}"),
+        Err(e) => crate::errorln!("could not copy the device code to the clipboard: {e}"),
     }
 }
 
@@ -263,7 +263,7 @@ const OPEN_WEBSITE_LABEL: &str = "Copy code & open website";
 /// The details also go to the log, because this is reachable from the poll thread long after
 /// startup — and on Linux launched from a desktop entry there is no terminal to print to.
 pub fn show_device_code_prompt(subject: &str, user_code: &str, verification_uri: &str) {
-    crate::logln!("{subject}: authorization required — open {verification_uri} and enter code {user_code}");
+    crate::infoln!("{subject}: authorization required — open {verification_uri} and enter code {user_code}");
     copy_to_clipboard(user_code);
 
     let title = format!("{subject}: Authorization Required");
@@ -280,10 +280,10 @@ pub fn show_device_code_prompt(subject: &str, user_code: &str, verification_uri:
         if confirm(&title, &body, OPEN_WEBSITE_LABEL, "Close", true) {
             copy_to_clipboard(&user_code);
             if let Err(e) = open::that(&verification_uri) {
-                crate::logln!("could not open browser automatically: {e}");
+                crate::errorln!("could not open browser automatically: {e}");
             }
         } else {
-            crate::logln!(
+            crate::infoln!(
                 "{subject}: prompt dismissed. The code is on the clipboard and in this log, \
                  and polling continues until it expires"
             );
@@ -322,7 +322,7 @@ pub fn confirm_restart(title: &str, msg: &str) -> bool {
 /// thread, so it uses the graphical mechanisms and falls back to the log rather than to a terminal
 /// nobody is reading.
 pub fn report(title: &str, msg: &str) {
-    crate::logln!("{title}: {msg}");
+    crate::errorln!("{title}: {msg}");
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     message(title, msg);
@@ -343,7 +343,7 @@ pub fn report(title: &str, msg: &str) {
 /// the button click that opens the browser, which necessarily happens *before* the user authorizes
 /// anything. So there is no stale dialog to hold a handle to.
 pub fn show_auth_success(subject: &str) {
-    crate::logln!("{subject}: authorization successful");
+    crate::infoln!("{subject}: authorization successful");
 }
 
 /// Escapes a string for embedding in an AppleScript string literal.

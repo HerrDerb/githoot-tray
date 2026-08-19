@@ -26,7 +26,7 @@
 //! `--print-version` smoke test) catches corruption, truncation and wrong-artifact mistakes. Those are
 //! quality controls, not security controls, and the comments say so where they appear.
 
-use crate::logln;
+use crate::{errorln, infoln};
 use crate::version::{Version, VERSION};
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -403,7 +403,7 @@ fn download_client() -> Result<Client, UpdateError> {
             other => {
                 // Logged rather than silently refused: a redirect off the allowlist is the one failure
                 // here that is worth being able to look up afterwards.
-                logln!("update refused a redirect to an unexpected host: {other:?}");
+                errorln!("update refused a redirect to an unexpected host: {other:?}");
                 attempt.stop()
             }
         }
@@ -718,7 +718,7 @@ pub fn install(available: &Available) -> Result<RestartPlan, UpdateError> {
         )));
     }
     check_magic(&payload)?;
-    logln!("update {}: {written} bytes verified against the signed manifest", available.version);
+    infoln!("update {}: {written} bytes verified against the signed manifest", available.version);
 
     install_verified(&payload, &target, available)
 }
@@ -791,7 +791,7 @@ fn install_verified(
         Ok(()) => Some(backup),
         // Not fatal. What protects the user here is the atomicity of the rename, not the backup.
         Err(e) => {
-            logln!("could not keep a backup of the current binary ({e}) — continuing");
+            errorln!("could not keep a backup of the current binary ({e}) — continuing");
             None
         }
     };
@@ -801,7 +801,7 @@ fn install_verified(
     std::fs::rename(payload, target)
         .map_err(|e| UpdateError::Local(format!("could not replace {}: {e}", target.display())))?;
 
-    logln!("update {} installed at {}", available.version, target.display());
+    infoln!("update {} installed at {}", available.version, target.display());
     Ok(RestartPlan { target: target.to_path_buf(), backup })
 }
 
@@ -823,7 +823,7 @@ fn install_verified(
     // the backup keeps a name a human would recognise, and nothing at all happens between A and B.
     let backup = with_suffix(target, ".old");
     let _ = std::fs::remove_file(&backup);
-    logln!(
+    infoln!(
         "replacing {} — if this is interrupted, rename {} back",
         target.display(),
         backup.display()
@@ -837,7 +837,7 @@ fn install_verified(
         return Err(UpdateError::Local(format!("could not put the new binary in place: {e}")));
     }
 
-    logln!("update {} installed at {}", available.version, target.display());
+    infoln!("update {} installed at {}", available.version, target.display());
     Ok(RestartPlan { target: target.to_path_buf(), backup: Some(backup) })
 }
 
@@ -869,7 +869,7 @@ fn install_verified(
         Ok(s) => {
             return Err(UpdateError::Integrity(format!("codesign rejected the new bundle ({s})")));
         }
-        Err(e) => logln!("could not run codesign ({e}) — continuing on the signature check alone"),
+        Err(e) => errorln!("could not run codesign ({e}) — continuing on the signature check alone"),
     }
 
     let inner = extracted.join("Contents/MacOS/git-system-tray");
@@ -877,7 +877,7 @@ fn install_verified(
 
     let backup = with_suffix(target, ".old");
     let _ = std::fs::remove_dir_all(&backup);
-    logln!(
+    infoln!(
         "replacing {} — if this is interrupted, rename {} back",
         target.display(),
         backup.display()
@@ -898,7 +898,7 @@ fn install_verified(
         )));
     }
 
-    logln!("update {} installed at {}", available.version, target.display());
+    infoln!("update {} installed at {}", available.version, target.display());
     Ok(RestartPlan { target: target.to_path_buf(), backup: Some(backup) })
 }
 
@@ -963,8 +963,8 @@ pub fn clean_up_after_update() {
         // Directory on macOS (a bundle), file elsewhere. Both attempted; whichever applies succeeds.
         let removed = std::fs::remove_file(&backup).or_else(|_| std::fs::remove_dir_all(&backup));
         match removed {
-            Ok(()) => logln!("removed the previous version at {}", backup.display()),
-            Err(e) => logln!("could not remove {} ({e}) — harmless, will retry next start", backup.display()),
+            Ok(()) => infoln!("removed the previous version at {}", backup.display()),
+            Err(e) => errorln!("could not remove {} ({e}) — harmless, will retry next start", backup.display()),
         }
     }
 

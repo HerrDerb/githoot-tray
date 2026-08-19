@@ -34,7 +34,7 @@
 //! questions entirely — the token poll response is then the same simple long-lived shape the
 //! notifications credential already uses, and `refresh`/`needs_refresh` never come into play.
 
-use crate::logln;
+use crate::{errorln, infoln};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -250,7 +250,7 @@ fn save_credential(path: &Path, credential: &Credential) {
     let written = std::fs::write(path, &content);
 
     if let Err(e) = written {
-        logln!("warning: could not save PR credential to disk: {e}");
+        errorln!("warning: could not save PR credential to disk: {e}");
     }
 }
 
@@ -436,7 +436,7 @@ impl PrTokenStore {
         let token_path = app_asset_path.join(PR_TOKEN_FILE);
 
         let Some(saved) = read_credential(&token_path) else {
-            logln!("no saved PR credential — waiting for the user to authorize");
+            infoln!("no saved PR credential — waiting for the user to authorize");
             return Ok(None);
         };
 
@@ -445,7 +445,7 @@ impl PrTokenStore {
         }
 
         let Some(refresh_token) = saved.refresh_token.clone() else {
-            logln!("saved PR credential has expired and carries no refresh token");
+            infoln!("saved PR credential has expired and carries no refresh token");
             return Ok(None);
         };
 
@@ -459,11 +459,11 @@ impl PrTokenStore {
             // the stale credential and let the poll loop's own `needs_refresh` check retry every
             // cycle, rather than demanding a click for something that heals itself.
             Err(e @ AuthError::Network(_)) => {
-                logln!("could not refresh the PR credential yet ({e}) — retrying on the poll loop");
+                errorln!("could not refresh the PR credential yet ({e}) — retrying on the poll loop");
                 Ok(Some(Self { token_path, credential: saved, http }))
             }
             Err(e) => {
-                logln!("saved PR credential was rejected ({e}) — waiting for the user to authorize");
+                errorln!("saved PR credential was rejected ({e}) — waiting for the user to authorize");
                 Ok(None)
             }
         }
@@ -528,7 +528,7 @@ impl PrTokenStore {
             // click, so the caller retries next cycle rather than demanding authorization.
             Err(e @ AuthError::Network(_)) => Err(e),
             Err(e) => {
-                logln!("PR credential refresh was rejected ({e}) — authorization required");
+                errorln!("PR credential refresh was rejected ({e}) — authorization required");
                 Err(AuthError::AuthorizationRequired)
             }
         }

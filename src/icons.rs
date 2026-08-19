@@ -17,7 +17,7 @@
 use image::{Rgba, RgbaImage};
 
 #[cfg(target_os = "linux")]
-use crate::logln;
+use crate::errorln;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
@@ -659,7 +659,7 @@ fn write_icon_if_changed(bytes: &[u8], path: &Path) {
         return;
     }
     if let Err(e) = std::fs::write(path, bytes) {
-        logln!("failed to write icon file '{}': {e}", path.display());
+        errorln!("failed to write icon file '{}': {e}", path.display());
     }
 }
 
@@ -676,7 +676,7 @@ fn write_icon_if_changed(bytes: &[u8], path: &Path) {
 pub fn create_icons(app_asset_path: &Path) -> Result<IconSet<String>, String> {
     let icon_dir = app_asset_path.join(ICON_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&icon_dir) {
-        logln!("failed to create the icons directory: {e}");
+        errorln!("failed to create the icons directory: {e}");
     }
 
     let images = build_variants()?;

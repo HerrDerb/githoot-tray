@@ -128,7 +128,7 @@ fn load_pr_credential(app_asset_path: &std::path::Path) -> github_app::PrStatus 
         // `NeedsAuth`.
         Err(e) => {
             let msg = format!("Could not set up GitHub access for PR status: {e}");
-            logln!("PR status disabled: {msg}");
+            infoln!("PR status disabled: {msg}");
 
             // On Windows there is no console (`windows_subsystem = "windows"`) and on macOS the app
             // ships as an `LSUIElement` bundle whose stdout goes to unified logging, so on both a
@@ -147,7 +147,7 @@ fn load_pr_credential(app_asset_path: &std::path::Path) -> github_app::PrStatus 
 
     match store.installation_count() {
         Ok(0) => {
-            logln!("{}", github_app::PR_NOT_INSTALLED);
+            infoln!("{}", github_app::PR_NOT_INSTALLED);
             github_app::PrStatus::Off(github_app::PR_NOT_INSTALLED.to_string())
         }
         Ok(_) => github_app::PrStatus::Ready(store),
@@ -155,7 +155,7 @@ fn load_pr_credential(app_asset_path: &std::path::Path) -> github_app::PrStatus 
         // could not even ask. Same "unreachable is not the same as invalid" reasoning
         // `access_token`'s saved-token check already uses.
         Err(e) => {
-            logln!("could not confirm GitHub App installations ({e}) — continuing anyway");
+            errorln!("could not confirm GitHub App installations ({e}) — continuing anyway");
             github_app::PrStatus::Ready(store)
         }
     }
@@ -203,22 +203,26 @@ fn main() {
     let icons = match icons::create_icons(&app_asset_path) {
         Ok(icons) => icons,
         Err(e) => {
-            logln!("fatal: {e}");
+            errorln!("fatal: {e}");
             std::process::exit(1);
         }
     };
 
     let config = config::Config::load(&app_asset_path);
+    // Apply the configured verbosity before anything past startup logs. The few lines emitted
+    // earlier (icon setup, a first-run default-config write) ran at the quiet default, which is the
+    // right floor for them anyway.
+    log::set_level(config.log_level);
     let tokens = if config.notification_indication {
         match access_token::TokenStore::load(&app_asset_path) {
             Ok(tokens) => Some(tokens),
             Err(e) => {
-                logln!("fatal: {e}");
+                errorln!("fatal: {e}");
                 std::process::exit(1);
             }
         }
     } else {
-        logln!("notification indication off (enable with \"notificationIndication=on\" in config.txt)");
+        infoln!("notification indication off (enable with \"notificationIndication=on\" in config.txt)");
         None
     };
 
@@ -228,7 +232,7 @@ fn main() {
     let pr = if config.any_pr_enabled() {
         load_pr_credential(&app_asset_path)
     } else {
-        logln!("all PR signals are off in config.txt — skipping PR sign-in entirely");
+        infoln!("all PR signals are off in config.txt — skipping PR sign-in entirely");
         github_app::PrStatus::Off("PR status off in config.txt".to_string())
     };
 
@@ -247,7 +251,7 @@ fn main() {
     let open_wake_tx = wake_tx.clone();
     item.connect_activate(move |_| {
         if let Err(e) = open::that(NOTIFICATIONS_URL) {
-            logln!("failed to open browser: {e}");
+            errorln!("failed to open browser: {e}");
         }
         // Whatever the user is about to read changes the answer, so re-poll soon rather than
         // leaving a stale "unread" icon up for a whole interval.
@@ -258,7 +262,7 @@ fn main() {
     let reviews_wake_tx = wake_tx.clone();
     reviews_item.connect_activate(move |_| {
         if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReviewRequested)) {
-            logln!("failed to open browser: {e}");
+            errorln!("failed to open browser: {e}");
         }
         // Reviewing is what clears the dot, so pull the next poll forward the same way the
         // notifications item does.
@@ -269,7 +273,7 @@ fn main() {
     let ready_to_merge_wake_tx = wake_tx.clone();
     ready_to_merge_item.connect_activate(move |_| {
         if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReadyToMerge)) {
-            logln!("failed to open browser: {e}");
+            errorln!("failed to open browser: {e}");
         }
         let _ = ready_to_merge_wake_tx.send(scheduler::Wake::Refresh);
     });
@@ -278,7 +282,7 @@ fn main() {
     let changes_requested_wake_tx = wake_tx.clone();
     changes_requested_item.connect_activate(move |_| {
         if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ChangesRequested)) {
-            logln!("failed to open browser: {e}");
+            errorln!("failed to open browser: {e}");
         }
         let _ = changes_requested_wake_tx.send(scheduler::Wake::Refresh);
     });
@@ -321,7 +325,7 @@ fn main() {
     let status_item = MenuItem::with_label(state::STATUS_MENU_LABEL);
     status_item.connect_activate(move |_| {
         if let Err(e) = open::that(github_status::STATUS_PAGE_URL) {
-            logln!("failed to open the GitHub status page: {e}");
+            errorln!("failed to open the GitHub status page: {e}");
         }
     });
 
@@ -417,7 +421,7 @@ fn main() {
 fn exec_into(plan: &update::RestartPlan) -> ! {
     use std::os::unix::process::CommandExt;
 
-    logln!("restarting into {}", plan.target.display());
+    infoln!("restarting into {}", plan.target.display());
     // Args are forwarded so a launcher's own flags survive the hand-over. `current_exe`'s path is used
     // rather than argv[0], which may be relative to a working directory that has since changed.
     let error = std::process::Command::new(&plan.target)
@@ -425,7 +429,7 @@ fn exec_into(plan: &update::RestartPlan) -> ! {
         .exec();
 
     // `exec` only returns on failure. Try the binary that was working a moment ago before giving up.
-    logln!("could not start the updated binary ({error}) — falling back to the previous version");
+    errorln!("could not start the updated binary ({error}) — falling back to the previous version");
     if let Some(backup) = plan.backup.as_ref()
         && backup.exists()
     {
@@ -433,7 +437,7 @@ fn exec_into(plan: &update::RestartPlan) -> ! {
         let error = std::process::Command::new(&plan.target)
             .args(std::env::args_os().skip(1))
             .exec();
-        logln!("the previous version would not start either ({error})");
+        errorln!("the previous version would not start either ({error})");
     }
     dialog::report(
         "git-system-tray: restart failed",
@@ -454,7 +458,7 @@ fn exec_into(plan: &update::RestartPlan) -> ! {
 /// the user's side, from a tray icon that is simply wrong.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn fatal(message: &str) -> ! {
-    logln!("fatal: {message}");
+    errorln!("fatal: {message}");
     dialog::message("git-system-tray", message);
     std::process::exit(1);
 }
@@ -521,13 +525,16 @@ fn main() {
     update::clean_up_after_update();
 
     let config = config::Config::load(&app_asset_path);
+    // Apply the configured verbosity before anything past startup logs (see the other platform's
+    // entry point for the reasoning).
+    log::set_level(config.log_level);
     let tokens = if config.notification_indication {
         match access_token::TokenStore::load(&app_asset_path) {
             Ok(tokens) => Some(tokens),
             Err(e) => fatal(&format!("Could not authenticate with GitHub: {e}")),
         }
     } else {
-        logln!("notification indication off (enable with \"notificationIndication=on\" in config.txt)");
+        infoln!("notification indication off (enable with \"notificationIndication=on\" in config.txt)");
         None
     };
 
@@ -537,7 +544,7 @@ fn main() {
     let pr = if config.any_pr_enabled() {
         load_pr_credential(&app_asset_path)
     } else {
-        logln!("all PR signals are off in config.txt — skipping PR sign-in entirely");
+        infoln!("all PR signals are off in config.txt — skipping PR sign-in entirely");
         github_app::PrStatus::Off("PR status off in config.txt".to_string())
     };
 
@@ -830,25 +837,25 @@ fn main() {
 
             if *id == tray.open_item_id {
                 if let Err(e) = open::that(NOTIFICATIONS_URL) {
-                    logln!("failed to open browser: {e}");
+                    errorln!("failed to open browser: {e}");
                 }
                 // Whatever the user is about to read changes the answer, so re-poll soon rather
                 // than leaving a stale "unread" icon up for a whole interval.
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.reviews_item_id {
                 if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReviewRequested)) {
-                    logln!("failed to open browser: {e}");
+                    errorln!("failed to open browser: {e}");
                 }
                 // Reviewing is what clears the dot, so pull the next poll forward.
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.ready_to_merge_item_id {
                 if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReadyToMerge)) {
-                    logln!("failed to open browser: {e}");
+                    errorln!("failed to open browser: {e}");
                 }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.changes_requested_item_id {
                 if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ChangesRequested)) {
-                    logln!("failed to open browser: {e}");
+                    errorln!("failed to open browser: {e}");
                 }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.authenticate_item_id {
@@ -868,7 +875,7 @@ fn main() {
                 }
             } else if *id == tray.status_item_id {
                 if let Err(e) = open::that(github_status::STATUS_PAGE_URL) {
-                    logln!("failed to open the GitHub status page: {e}");
+                    errorln!("failed to open the GitHub status page: {e}");
                 }
             } else if *id == tray.quit_item_id {
                 event_loop.exit();
@@ -881,7 +888,7 @@ fn main() {
         /// properly, and it has to happen before this process goes away or the taskbar is left holding a
         /// dead one.
         fn hand_over(&mut self, plan: update::RestartPlan, event_loop: &ActiveEventLoop) {
-            logln!("restarting into {}", plan.target.display());
+            infoln!("restarting into {}", plan.target.display());
 
             // First, so the icon is gone before its owner is.
             self.tray = None;
@@ -898,7 +905,7 @@ fn main() {
                     // Roll the swap back rather than leave the user with a binary that will not start.
                     // This is only reportable *because* the check happens before exiting — otherwise the
                     // reporter has already gone.
-                    logln!("the updated binary would not start ({e}) — rolling back");
+                    errorln!("the updated binary would not start ({e}) — rolling back");
                     if let Some(backup) = plan.backup.as_ref() {
                         let _ = std::fs::remove_file(&plan.target);
                         let _ = std::fs::rename(backup, &plan.target);
@@ -1030,7 +1037,7 @@ fn main() {
                     continue;
                 }
                 if let Err(e) = self.menu.append(item) {
-                    logln!("failed to add the {what} menu item: {e}");
+                    errorln!("failed to add the {what} menu item: {e}");
                 }
             }
         }
@@ -1085,12 +1092,12 @@ fn main() {
                         self.applied_needs_auth = Some(exclamation);
                         self.applied_update = Some(update_available);
                     }
-                    Err(e) => logln!("failed to update tray icon: {e}"),
+                    Err(e) => errorln!("failed to update tray icon: {e}"),
                 }
             }
 
             if let Err(e) = self.tray_icon.set_tooltip(Some(&update.tooltip)) {
-                logln!("failed to update tray tooltip: {e}");
+                errorln!("failed to update tray tooltip: {e}");
             }
 
             // The icon can only say "something is waiting". The number goes here, where there is

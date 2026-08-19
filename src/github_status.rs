@@ -32,7 +32,7 @@
 //! cry wolf on the strength of the user's flaky wifi. So an unreadable answer changes nothing — it is
 //! logged, and whatever was last known stands.
 
-use crate::logln;
+use crate::infoln;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
@@ -108,7 +108,7 @@ fn parse(body: &str) -> Result<Health, String> {
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| indicator.clone());
-    logln!("GitHub reports {indicator}: {description}");
+    infoln!("GitHub reports {indicator}: {description}");
     Ok(Health::Degraded { description })
 }
 

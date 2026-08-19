@@ -10,7 +10,8 @@
 //! discoverable by opening it rather than only by reading the README. An existing file is never
 //! touched — not even to add a key it is missing.
 
-use crate::logln;
+use crate::log::Level;
+use crate::{errorln, infoln};
 use crate::state::PrAxis;
 use std::path::Path;
 
@@ -25,6 +26,7 @@ const KEY_NOTIFICATION_INDICATION: &str = "notificationIndication";
 const KEY_REVIEW_REQUESTED: &str = "reviewRequested";
 const KEY_READY_TO_MERGE: &str = "readyToMerge";
 const KEY_CHANGES_REQUESTED: &str = "changesRequested";
+const KEY_LOG_LEVEL: &str = "logLevel";
 
 /// Keys that used to work, paired with what replaced them.
 ///
@@ -50,6 +52,9 @@ pub struct Config {
     /// entries silently swaps which bar a setting controls — it compiles, type-checks, and is
     /// visible only by looking at the tray.
     pr_enabled: [bool; 3],
+    /// How much detail the log file carries. `Error` by default — only failures — so the file stays
+    /// quiet and readable; set `logLevel=info` to add the lifecycle narration when diagnosing.
+    pub log_level: Level,
 }
 
 /// Where the settings file lives.
@@ -93,6 +98,9 @@ impl Config {
             // Built by mapping over the axes rather than as a literal, so the axis name appears on
             // both sides of each pairing and the three cannot be written in the wrong order.
             pr_enabled: PrAxis::ALL.map(|axis| !values.get(pr_key(axis)).is_some_and(|v| is_off(v))),
+            // Unrecognised (or absent) falls back to the quiet default, the same way a typo'd bool
+            // does — see `Level::parse`.
+            log_level: values.get(KEY_LOG_LEVEL).and_then(|v| Level::parse(v)).unwrap_or(Level::Error),
         }
     }
 
@@ -146,7 +154,11 @@ fn default_config() -> String {
          # Turning one off removes its bar and its menu entry, and stops it being searched for.\n\
          {KEY_REVIEW_REQUESTED}=on\n\
          {KEY_READY_TO_MERGE}=on\n\
-         {KEY_CHANGES_REQUESTED}=on\n"
+         {KEY_CHANGES_REQUESTED}=on\n\
+         \n\
+         # How much the log file records. \"error\" (the default) logs only failures; \"info\" adds\n\
+         # the normal lifecycle detail (startup, sign-in, updates, each poll) for diagnosing.\n\
+         {KEY_LOG_LEVEL}=error\n"
     )
 }
 
@@ -159,10 +171,10 @@ fn write_default_if_absent(path: &Path) {
         return;
     }
     match std::fs::write(path, default_config()) {
-        Ok(()) => logln!("wrote a default {} — every setting at its default", CONFIG_FILE),
+        Ok(()) => infoln!("wrote a default {} — every setting at its default", CONFIG_FILE),
         // Not fatal, and not worth a dialog: the defaults still apply, so the app behaves exactly as
         // it would have. Same treatment `access_token` gives a failed `client_id.txt` write.
-        Err(e) => logln!("could not write a default {CONFIG_FILE} ({e}) — using defaults"),
+        Err(e) => errorln!("could not write a default {CONFIG_FILE} ({e}) — using defaults"),
     }
 }
 
@@ -173,7 +185,7 @@ fn write_default_if_absent(path: &Path) {
 fn warn_about_renamed_keys(values: &std::collections::HashMap<&str, &str>) {
     for (old, new) in RENAMED_KEYS {
         if values.contains_key(old) {
-            logln!(
+            errorln!(
                 "{CONFIG_FILE} uses \"{old}\", which is no longer read. Rename it to \"{new}\"."
             );
         }
@@ -281,11 +293,12 @@ mod tests {
 
         assert_eq!(values.get(KEY_UPDATE_CHECK), Some(&"on"));
         assert_eq!(values.get(KEY_NOTIFICATION_INDICATION), Some(&"off"));
+        assert_eq!(values.get(KEY_LOG_LEVEL), Some(&"error"));
         for axis in PrAxis::ALL {
             assert_eq!(values.get(pr_key(axis)), Some(&"on"), "{axis:?}");
         }
         // And nothing else, so a key added to the template without being read is caught.
-        assert_eq!(values.len(), 5, "unexpected keys in the template: {values:?}");
+        assert_eq!(values.len(), 6, "unexpected keys in the template: {values:?}");
     }
 
     /// Every key the template writes must be one `load` actually reads. A key present in the file
@@ -298,6 +311,7 @@ mod tests {
             KEY_REVIEW_REQUESTED,
             KEY_READY_TO_MERGE,
             KEY_CHANGES_REQUESTED,
+            KEY_LOG_LEVEL,
         ];
         let text = default_config();
         for key in parse(&text).keys() {
@@ -355,6 +369,7 @@ mod tests {
         let cfg = from("");
         assert!(cfg.update_check, "updateCheck defaults on");
         assert!(!cfg.notification_indication, "notificationIndication defaults off");
+        assert_eq!(cfg.log_level, Level::Error, "logLevel defaults to error");
         for axis in PrAxis::ALL {
             assert!(cfg.pr_enabled(axis), "{axis:?} defaults on");
         }
@@ -372,6 +387,7 @@ mod tests {
 
         assert_eq!(generated.update_check, defaults.update_check);
         assert_eq!(generated.notification_indication, defaults.notification_indication);
+        assert_eq!(generated.log_level, defaults.log_level);
         for axis in PrAxis::ALL {
             assert_eq!(generated.pr_enabled(axis), defaults.pr_enabled(axis), "{axis:?}");
         }

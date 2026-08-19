@@ -11,7 +11,7 @@
 //! tray icon down instead of reporting a problem. So the flow returns `Result` and lets the
 //! caller decide whether the failure is fatal.
 
-use crate::logln;
+use crate::errorln;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -132,11 +132,11 @@ impl TokenStore {
                     // launched at login, often before the network is up, and the poll loop
                     // already re-authenticates if the token turns out to be genuinely dead.
                     TokenCheck::Unreachable => {
-                        logln!("could not reach GitHub to check the saved token — using it anyway");
+                        errorln!("could not reach GitHub to check the saved token — using it anyway");
                         return Ok(Self { token_path, client_id, token, http });
                     }
                     TokenCheck::Rejected => {
-                        logln!("saved token was rejected by GitHub — re-authenticating");
+                        errorln!("saved token was rejected by GitHub — re-authenticating");
                     }
                 }
             }
@@ -154,7 +154,7 @@ impl TokenStore {
     /// Mid-run recovery after GitHub rejects the token. Returns `Err` rather than exiting so
     /// the caller can back off and keep the tray icon alive.
     pub fn reauthenticate(&mut self) -> Result<(), AuthError> {
-        logln!("re-authenticating after GitHub rejected the current token");
+        errorln!("re-authenticating after GitHub rejected the current token");
         let token = device_code_flow(&self.http, &self.client_id)?;
         save_token(&self.token_path, &token);
         self.token = token;
@@ -187,7 +187,7 @@ fn restrict_token_permissions(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            logln!("warning: could not restrict permissions on the token file: {e}");
+            errorln!("warning: could not restrict permissions on the token file: {e}");
         }
     }
     #[cfg(not(unix))]
@@ -223,7 +223,7 @@ fn save_token(path: &Path, token: &str) {
     let written = std::fs::write(path, token);
 
     if let Err(e) = written {
-        logln!("warning: could not save access token to disk: {e}");
+        errorln!("warning: could not save access token to disk: {e}");
     }
 }
 
@@ -257,13 +257,13 @@ fn prompt_for_client_id(client_id_path: &Path) -> Result<String, AuthError> {
     );
 
     if let Err(e) = std::fs::write(client_id_path, instructions) {
-        logln!("failed to create client_id.txt: {e}");
+        errorln!("failed to create client_id.txt: {e}");
         return Err(AuthError::NoClientId);
     }
 
     // Open the file in the default editor (non-blocking).
     if let Err(e) = open::that(client_id_path) {
-        logln!("could not open editor automatically: {e}");
+        errorln!("could not open editor automatically: {e}");
     }
 
     wait_for_user_confirmation(
@@ -416,11 +416,11 @@ fn check_access_token(http: &Client, token: &str) -> TokenCheck {
         Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => TokenCheck::Rejected,
         // A 5xx or a rate-limit 403 is GitHub having a bad day, not a verdict on the token.
         Ok(r) => {
-            logln!("token check returned {} — treating as inconclusive", r.status());
+            errorln!("token check returned {} — treating as inconclusive", r.status());
             TokenCheck::Unreachable
         }
         Err(e) => {
-            logln!("could not check access token: {e}");
+            errorln!("could not check access token: {e}");
             TokenCheck::Unreachable
         }
     }

@@ -12,7 +12,7 @@ use crate::access_token::TokenStore;
 use crate::github;
 use crate::github_app::{AuthError, PrStatus, PrTokenStore, PR_NOT_INSTALLED};
 use crate::update::{Available, RestartPlan};
-use crate::logln;
+use crate::{errorln, infoln};
 use crate::state::{IconState, PollState, PrAxis, MENU_BURST, REFRESH_BURST};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -218,7 +218,7 @@ fn spawn_poll_thread(
             run_poll_loop(inputs, wake_rx, emit, restart)
         }));
         if outcome.is_err() {
-            logln!("poll thread panicked — notification updates have stopped");
+            errorln!("poll thread panicked — notification updates have stopped");
         }
     });
 }
@@ -241,7 +241,7 @@ fn run_poll_loop(
     let client = match github::build_client() {
         Ok(client) => client,
         Err(e) => {
-            logln!("fatal: could not build HTTP client: {e}");
+            errorln!("fatal: could not build HTTP client: {e}");
             return;
         }
     };
@@ -291,15 +291,16 @@ fn run_poll_loop(
         } else {
             state.notifications_etag().map(str::to_string)
         };
-        let notif_kind = match tokens.as_ref() {
-            Some(store) => {
-                let response = github::poll_notifications(&client, store.token(), etag.as_deref());
-                let kind = response.result.kind();
-                state.apply_notifications(response);
-                Some(kind)
+        if let Some(store) = tokens.as_ref() {
+            let response = github::poll_notifications(&client, store.token(), etag.as_deref());
+            // A clean poll (200 or 304) says nothing; only a failure earns a line, and it carries
+            // the real reason rather than a bare tag.
+            if let Some(detail) = response.result.problem() {
+                let conditional = if etag.is_some() { "conditional" } else { "unconditional" };
+                errorln!("{conditional} notifications poll: {detail}");
             }
-            None => None,
-        };
+            state.apply_notifications(response);
+        }
 
         // ── PR axes (serial, not concurrent: GitHub asks for serial requests) ─
         // Search has its own 30-per-minute budget and returns no ETag, so this is always an
@@ -307,13 +308,11 @@ fn run_poll_loop(
         // access is granted by installing the GitHub App rather than by a scope, so there is no
         // per-poll scope check here: whether it can see anything at all is checked once, at
         // startup, in `main.rs`.
-        let mut pr_kinds: Vec<(PrAxis, &'static str)> = Vec::new();
         if let Some(store) = pr.as_ref() {
             for axis in PrAxis::ALL {
                 // Skipped before the request, not after: `apply_pr` would discard the answer for an
                 // axis that is not in play, and Search has its own 30-per-minute budget, so issuing
-                // it would be pure cost. Also keeps the log line below free of axes whose result was
-                // thrown away.
+                // it would be pure cost.
                 //
                 // An `if` rather than `.filter()` on the iterator: the adaptor would hold `&state`
                 // across a body that needs `&mut state` for `apply_pr`.
@@ -321,7 +320,11 @@ fn run_poll_loop(
                     continue;
                 }
                 let response = poll_pr(&client, store.token(), axis);
-                pr_kinds.push((axis, response.result.kind()));
+                // Only a failed axis speaks up, and it says what actually failed — this is the line
+                // that would have shown the merge-ready `statusCheckRollup` FORBIDDEN outright.
+                if let Some(detail) = response.result.problem() {
+                    errorln!("{axis:?} PR poll: {detail}");
+                }
                 state.apply_pr(axis, response);
             }
         }
@@ -341,7 +344,7 @@ fn run_poll_loop(
                     state.set_status_degraded(Some(description));
                 }
                 Ok(crate::github_status::Health::Fine) => state.set_status_degraded(None),
-                Err(e) => logln!("could not read GitHub's status page: {e}"),
+                Err(e) => errorln!("could not read GitHub's status page: {e}"),
             }
         }
 
@@ -372,7 +375,7 @@ fn run_poll_loop(
             match crate::version::Version::current() {
                 Some(current) => match crate::update::check(&client, current) {
                     Ok(Some(available)) => {
-                        logln!(
+                        infoln!(
                             "update available: {} (installed {current})",
                             available.version
                         );
@@ -385,10 +388,10 @@ fn run_poll_loop(
                         state.set_update_available(None);
                         pending_update = None;
                     }
-                    Err(e) => logln!("update check failed: {e}"),
+                    Err(e) => errorln!("update check failed: {e}"),
                 },
                 // Unreachable from a normal build; see `Version::current`.
-                None => logln!("update check skipped: this build's version is unparseable"),
+                None => errorln!("update check skipped: this build's version is unparseable"),
             }
         }
 
@@ -405,7 +408,7 @@ fn run_poll_loop(
                     state.clear_notifications_etag();
                     retry_now = true;
                 }
-                Some(Err(e)) => logln!("re-authentication failed: {e}"),
+                Some(Err(e)) => errorln!("re-authentication failed: {e}"),
                 None => {}
             }
         }
@@ -434,7 +437,7 @@ fn run_poll_loop(
                 // it to the user rather than opening a browser unannounced — the exclamation goes up
                 // and the Authenticate item appears, and `Wake::Authenticate` picks it up from there.
                 Some(Err(AuthError::AuthorizationRequired)) => {
-                    logln!("PR status needs authorization — waiting for the menu");
+                    infoln!("PR status needs authorization — waiting for the menu");
                     state.require_pr_auth();
                     pr = None;
                 }
@@ -442,7 +445,7 @@ fn run_poll_loop(
                 // down. The credential is kept and the axes are left alone, so this retries on the
                 // next cycle instead of costing the user a click it did not need. `MIN_REAUTH_INTERVAL`
                 // is what stops that becoming a hot loop.
-                Some(Err(e)) => logln!("PR credential renewal could not be attempted ({e}) — will retry"),
+                Some(Err(e)) => errorln!("PR credential renewal could not be attempted ({e}) — will retry"),
                 None => {}
             }
         }
@@ -451,9 +454,7 @@ fn run_poll_loop(
             continue; // retry at once with the fresh credential
         }
 
-        // A queued burst entry wins over normal pacing, so resolve the real delay before
-        // logging it — otherwise the log would claim the steady-state interval during a burst,
-        // which is exactly when someone is watching it.
+        // A queued burst entry wins over normal pacing, so resolve the real delay here.
         let delay = match next_pace(&mut burst, state.rate_limited(), state.next_delay()) {
             Pace::Burst(delay) => delay,
             // Leaving the burst also ends the unconditional streak it was running.
@@ -463,29 +464,9 @@ fn run_poll_loop(
             }
         };
 
-        // Each axis contributes its own segment, or none at all when it is unconfigured — unlike
-        // the old always-on notifications axis, an empty poll (every feature off) is now possible
-        // and must not render as a mangled arrow-to-nowhere.
-        let mut polled = Vec::new();
-        if let Some(k) = notif_kind {
-            let conditional = if etag.is_some() { "conditional" } else { "unconditional" };
-            polled.push(format!("{conditional} notifications→{k}"));
-        }
-        for (axis, kind) in &pr_kinds {
-            polled.push(format!("{axis:?}→{kind}"));
-        }
-        let polled = if polled.is_empty() { "nothing configured".to_string() } else { polled.join(", ") };
-
-        logln!(
-            "poll → {polled} → {:?}/{:?}/{:?}/{:?} (next in {}s) [{}]",
-            icon.notifications,
-            icon.review_requested,
-            icon.ready_to_merge,
-            icon.changes_requested,
-            delay.as_secs(),
-            // The tooltip is deliberately multi-line for the UI; keep the log one line per poll.
-            tooltip.replace('\n', " · ")
-        );
+        // No healthy-poll heartbeat here on purpose: a clean cycle logs nothing, so the only lines
+        // in the file are the failures worth reading. Each failing poll already logged its reason
+        // above, named by axis.
 
         match wake_rx.recv_timeout(delay) {
             // Either way the next cycle starts at once, and without an `If-None-Match`: a
@@ -495,14 +476,14 @@ fn run_poll_loop(
                 skip_etag = true;
                 match wake {
                     Wake::Refresh => {
-                        logln!("refresh requested — polling {} more times", REFRESH_BURST.len());
+                        infoln!("refresh requested — polling {} more times", REFRESH_BURST.len());
                         burst = REFRESH_BURST.iter().copied().collect();
                     }
                     // A short even burst rather than the widening one: one sample taken within a
                     // second of the click is thin, and anything that changes a moment later would
                     // otherwise stay invisible for the rest of the minute.
                     Wake::PollNow => {
-                        logln!(
+                        infoln!(
                             "menu opened — polling now and {} more times, 5s apart",
                             MENU_BURST.len()
                         );
@@ -516,7 +497,7 @@ fn run_poll_loop(
                             // `swap` rather than load-then-store: two menu clicks in quick succession
                             // must not both get past this.
                             if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-                                logln!("an update install is already in progress");
+                                infoln!("an update install is already in progress");
                             } else {
                                 let restart = restart.clone();
                                 std::thread::spawn(move || {
@@ -525,7 +506,7 @@ fn run_poll_loop(
                                         // can take the tray down cleanly before the process ends.
                                         Ok(plan) => restart(plan),
                                         Err(crate::update::UpdateError::Declined) => {
-                                            logln!("update declined by the user");
+                                            infoln!("update declined by the user");
                                         }
                                         Err(e) => crate::dialog::report(
                                             "git-system-tray: update failed",
@@ -539,7 +520,7 @@ fn run_poll_loop(
                                 });
                             }
                         } else {
-                            logln!("install requested, but no update is pending");
+                            infoln!("install requested, but no update is pending");
                         }
                     }
                     // Opening settings says nothing about GitHub, so this is the one wake that does not
@@ -562,7 +543,7 @@ fn run_poll_loop(
                             // repositories at all. Another click cannot fix that, so the exclamation
                             // comes down and a stated reason replaces it. Same check startup does.
                             Ok(0) => {
-                                logln!("{PR_NOT_INSTALLED}");
+                                infoln!("{PR_NOT_INSTALLED}");
                                 state.clear_pr_auth();
                                 for axis in PrAxis::ALL {
                                     state.disable_pr(axis, PR_NOT_INSTALLED.to_string());
@@ -574,16 +555,16 @@ fn run_poll_loop(
                             // startup uses.
                             outcome => {
                                 if let Err(e) = outcome {
-                                    logln!("could not confirm installations ({e}) — continuing anyway");
+                                    errorln!("could not confirm installations ({e}) — continuing anyway");
                                 }
-                                logln!("PR status authorized");
+                                infoln!("PR status authorized");
                                 state.clear_pr_auth();
                                 pr = Some(store);
                             }
                         },
                         // Denied, expired, or the network went away mid-flow. The state is left as
                         // it was, so the item is still on the menu to try again.
-                        Err(e) => logln!("authorization failed: {e}"),
+                        Err(e) => errorln!("authorization failed: {e}"),
                     },
                 }
             }
@@ -634,7 +615,7 @@ fn may_retry(last: &mut Option<Instant>) -> bool {
         *last = Some(Instant::now());
         true
     } else {
-        logln!("skipping credential renewal — attempted too recently");
+        infoln!("skipping credential renewal — attempted too recently");
         false
     }
 }
