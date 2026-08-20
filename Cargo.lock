@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "git-system-tray"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "arboard",
  "dirs",
