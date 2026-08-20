@@ -155,7 +155,7 @@ const ARROW_BORDER_PX: f32 = BAR_BORDER_PX;
 // glyph or splitting it down the middle.
 //
 // The erase ring is therefore back: the mark is over the glyph again, and the ring is what keeps it
-// readable against the glyph's bright white strokes and against any taskbar colour.
+// readable against the glyph's bright white body and against any taskbar colour.
 //
 // All ratios are of icon *width*, except the vertical extents which are of height, so the mark
 // survives the source assets being resized the same way the dots do.
@@ -1004,7 +1004,7 @@ mod tests {
     ///
     /// This is the assertion that pins `MARK_CARVE_PX` to the gap width.
     /// Twice during development the ring was too narrow, the middle of the gap came out only partly
-    /// erased, the glyph's white strokes showed through, and the mark read as one solid bar at 16px.
+    /// erased, the glyph's white body showed through, and the mark read as one solid bar at 16px.
     #[test]
     fn the_gap_keeps_stem_and_dot_apart() {
         let out = with_exclamation(&base());

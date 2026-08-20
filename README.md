@@ -18,9 +18,9 @@ Nothing here shells out to the `gh` CLI; every credential comes from GitHub's ow
 
 Everything is composited at runtime, so `assets/` holds two files and the variants cannot drift apart.
 
-The base glyph is a branch merging back into its trunk, drawn for this project. It used to be
-GitHub's Invertocat, which is their trademark and not this app's to wear as an application icon.
-The glyph carries no state, so replacing it cost nothing but the drawing.
+The base glyph is an owl, drawn for this project: the thing that sits still and watches so you do
+not have to. It used to be GitHub's Invertocat, which is their trademark and not this app's to wear
+as an application icon. The glyph carries no state, so replacing it cost nothing but the drawing.
 
 It is dark (<img src="docs/icons/tray.png" alt="base icon" height="20" valign="middle">), or
 blue when notifications are on and something is unread
