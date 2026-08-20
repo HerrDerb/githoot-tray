@@ -99,6 +99,34 @@ be **installed** on that org — see [PR status](#pr-status).
 
 `config.txt` is created on first run with every setting at its default; see [Settings](#settings).
 
+### Windows Defender may flag the binary
+
+It has happened: `Trojan:Win32/Bearfoos.B!ml`. The `!ml` suffix means a machine-learning verdict
+rather than a signature match, and this binary fits the shape those models are trained to distrust —
+it is **not code-signed**, so it carries no publisher reputation, it runs with no console and no
+window, and its updater downloads a new `.exe`, stages it beside the running one and renames it into
+place. Every one of those is also how a dropper behaves.
+
+The releases now embed a `VERSIONINFO` resource, an application manifest and an icon, so the binary at
+least identifies itself in Explorer's Properties dialog and to anything that reads publisher metadata.
+That reduces the odds; it does not eliminate them, and it is not a claim that the binary is safe.
+
+**What to do instead of taking anyone's word for it.** Verify the download against the signed manifest
+— that chain is described under [What is verified](#what-is-verified-and-what-that-proves), and it is the
+same check the updater runs before installing anything:
+
+```bash
+# Compare your download against the signed digest list for its tag.
+curl -LO https://github.com/HerrDerb/github-trayicon/releases/download/vX.Y.Z/sha256sums.txt
+curl -LO https://github.com/HerrDerb/github-trayicon/releases/download/vX.Y.Z/sha256sums.txt.minisig
+minisign -Vm sha256sums.txt \
+  -P 'RWSYrhd3sxiQUDZtxm8c+p0iRdj+z+fGQKdLq62ojrmfii2OjCG8PX8D'  # authenticity
+sha256sum -c sha256sums.txt --ignore-missing                    # integrity
+```
+
+If both pass, the file is the one CI built and signed. Whether you then allow it to run is your call,
+and a Defender exclusion is a decision to make deliberately rather than a step in an install guide.
+
 ---
 
 ## Tray menu

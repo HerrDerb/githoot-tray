@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for git-system-tray.
+
+  Two of the three things declared here are only worth having because the binary was flagged as
+  `Trojan:Win32/Bearfoos.B!ml`: an unsigned PE with no manifest at all declares no OS support and no
+  execution level, and "carries no manifest" is one of the static features that verdict weighs. The
+  third, dpiAwareness, is a plain bug fix that happens to live in the same file.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    Deliberately fixed at 1.0.0.0 and never bumped. An assembly identity is a side-by-side binding
+    name, not a release number — the release number lives in the VERSIONINFO resource that `build.rs`
+    generates from the git tag. Wiring this to the tag as well would imply a versioned assembly
+    contract that nothing binds to, and would put a second version in the binary that could drift.
+  -->
+  <assemblyIdentity
+      type="win32"
+      name="HerrDerb.git-system-tray"
+      version="1.0.0.0"
+      processorArchitecture="amd64"/>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <!--
+          Explicitly asInvoker, never elevated. This is the same promise `update::probe_writable`
+          makes in code — an install that cannot write its own target fails and says so rather than
+          asking for administrator rights — stated here in a form the OS reads before the process
+          starts.
+        -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 10 and 11: one GUID covers both. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!--
+        Not heuristic padding: without this the process is system-DPI-aware, so the `MessageBoxW`
+        dialogs in `dialog.rs` are bitmap-stretched by the compositor on any monitor that is not at
+        the primary's scale factor. PerMonitorV2 is what makes the OS scale the dialog's own metrics.
+      -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- Fallback for Windows 8.1, which does not read dpiAwareness. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

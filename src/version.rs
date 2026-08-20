@@ -21,11 +21,16 @@
 /// `option_env!` is resolved at compile time, so there is no runtime cost and no way for the value to
 /// be absent — the `match` picks the fallback while the constant is still being folded.
 ///
-/// No `build.rs` and no `rerun-if-env-changed` is needed to make this reliable: rustc records the
-/// environment variables an `option_env!` reads, and Cargo folds them into the crate's fingerprint, so
-/// changing `GST_VERSION` does force a rebuild. Verified by hand rather than assumed, because the
-/// failure it would cause — a cached binary shipping a release under the previous version's name — is
-/// silent and would only surface as an updater that never sees an update.
+/// **This constant** needs no `rerun-if-env-changed` to be reliable: rustc records the environment
+/// variables an `option_env!` reads, and Cargo folds them into the crate's fingerprint, so changing
+/// `GST_VERSION` does force a rebuild. Verified by hand rather than assumed, because the failure it
+/// would cause — a cached binary shipping a release under the previous version's name — is silent and
+/// would only surface as an updater that never sees an update.
+///
+/// `build.rs` is a different matter and does need the directive. It exists now, and embeds this same
+/// version into the Windows `VERSIONINFO` resource; a build script is only re-run when Cargo is told
+/// what it depends on, so without `cargo:rerun-if-env-changed=GST_VERSION` a tag change would rebuild
+/// this constant while serving a stale resource. `tests/version_resource.rs` asserts the two agree.
 pub const VERSION: &str = match option_env!("GST_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),

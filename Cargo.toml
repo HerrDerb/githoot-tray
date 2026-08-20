@@ -31,6 +31,21 @@ minisign-verify = "0.2"
 # SHA-256 for the per-asset digests listed in the signed sums file.
 sha2 = "0.10"
 
+# ── Build-time only: the Windows resource section ────────────────────────────────────────────────
+#
+# Target-gated, so a Linux or macOS build resolves neither of these. They exist because the shipped
+# `.exe` had no VERSIONINFO, no manifest and no icon at all, which is one of the static features
+# Defender's ML models weigh — it flagged the binary as `Trojan:Win32/Bearfoos.B!ml`. See `build.rs`.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# The maintained fork of the unmaintained `winres`. Drives the MSVC `rc.exe` that the toolchain
+# building this target already provides, so it adds no new tool requirement to CI.
+winresource = "0.1"
+# The same crate the app uses at runtime, here only to turn `assets/github.png` into the `.ico` the
+# resource needs. Generated rather than committed on purpose: `assets/` deliberately holds exactly
+# two files so the icon variants cannot drift apart, and a checked-in `.ico` would be a third that
+# can.
+image = { version = "0.24", default-features = false, features = ["png", "ico"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"
 # glib is deliberately NOT a direct dependency: `gtk` re-exports the exact glib it was built
@@ -45,4 +60,8 @@ tray-icon = "0.21.1"
 winit = "0.30.12"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3.9", features = ["winuser", "synchapi", "errhandlingapi", "processthreadsapi", "handleapi", "winnt"] }
+# `winver` is used only by `tests/version_resource.rs`, which reads the VERSIONINFO resource back
+# out of the linked binary. Listed here rather than in `dev-dependencies` because a test target links
+# against both, and a second winapi entry with a different feature set would be a second copy of the
+# crate to keep in step.
+winapi = { version = "0.3.9", features = ["winuser", "synchapi", "errhandlingapi", "processthreadsapi", "handleapi", "winnt", "winver"] }
