@@ -43,7 +43,7 @@ fn main() {
     // build would register no dependencies at all, and a later Windows build in the same tree could
     // reuse a stale script output.
     println!("cargo:rerun-if-env-changed=GST_VERSION");
-    println!("cargo:rerun-if-changed=assets/github.png");
+    println!("cargo:rerun-if-changed=assets/tray.png");
     println!("cargo:rerun-if-changed=windows/git-system-tray.manifest");
 
     #[cfg(windows)]
@@ -138,7 +138,7 @@ fn parse_triple(v: &str) -> (u16, u16, u16) {
     (next("major"), next("minor"), next("patch"))
 }
 
-/// Re-encodes `assets/github.png` as an `.ico` in `OUT_DIR` and returns its path.
+/// Re-encodes `assets/tray.png` as an `.ico` in `OUT_DIR` and returns its path.
 ///
 /// Generated rather than committed because the README makes a point of `assets/` holding exactly two
 /// files so the icon variants cannot drift apart. A third, hand-maintained `.ico` is precisely the
@@ -155,7 +155,7 @@ fn generate_icon() -> Result<String, Box<dyn std::error::Error>> {
     let out_dir = std::env::var("OUT_DIR")?;
     let ico_path = std::path::Path::new(&out_dir).join("git-system-tray.ico");
 
-    let src = image::load_from_memory(&std::fs::read("assets/github.png")?)?;
+    let src = image::load_from_memory(&std::fs::read("assets/tray.png")?)?;
     let square = src.resize_exact(64, 64, image::imageops::FilterType::Lanczos3);
     let rgba = square.to_rgba8();
     let (w, h) = rgba.dimensions();

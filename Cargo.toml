@@ -40,7 +40,7 @@ sha2 = "0.10"
 # The maintained fork of the unmaintained `winres`. Drives the MSVC `rc.exe` that the toolchain
 # building this target already provides, so it adds no new tool requirement to CI.
 winresource = "0.1"
-# The same crate the app uses at runtime, here only to turn `assets/github.png` into the `.ico` the
+# The same crate the app uses at runtime, here only to turn `assets/tray.png` into the `.ico` the
 # resource needs. Generated rather than committed on purpose: `assets/` deliberately holds exactly
 # two files so the icon variants cannot drift apart, and a checked-in `.ico` would be a third that
 # can.

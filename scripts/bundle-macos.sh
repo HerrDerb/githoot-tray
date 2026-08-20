@@ -82,7 +82,7 @@ PLIST
 # CFBundleIconFile just falls back to a generic icon, which is not worth failing a release over.
 #
 # The source is 98x96, so squaring it stretches it by about 2%. Visible only if you go looking.
-SOURCE_ICON="$REPO_ROOT/assets/github.png"
+SOURCE_ICON="$REPO_ROOT/assets/tray.png"
 ICONSET="$OUT/AppIcon.iconset"
 if [ -f "$SOURCE_ICON" ] && command -v iconutil >/dev/null 2>&1; then
   rm -rf "$ICONSET"

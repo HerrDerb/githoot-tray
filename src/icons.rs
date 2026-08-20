@@ -21,8 +21,8 @@ use crate::errorln;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
-const GITHUB_ICON: &[u8] = include_bytes!("../assets/github.png");
-const GITHUB_BLUE_ICON: &[u8] = include_bytes!("../assets/github_blue.png");
+const TRAY_ICON: &[u8] = include_bytes!("../assets/tray.png");
+const TRAY_BLUE_ICON: &[u8] = include_bytes!("../assets/tray_blue.png");
 
 // ── Indicator geometry ──────────────────────────────────────────────────────
 // One column of rounded bars down the right-hand side. Ratios rather than pixels so the layout
@@ -67,7 +67,7 @@ const BAR_RIGHT_MARGIN_RATIO: f32 = 0.041;
 ///
 /// At this width it is no longer a hairline outline: 10px against a 39×26 bar clears the 7px gaps
 /// between bars completely and costs about 29% of the glyph's white pixels. That is the point — the
-/// bars have to separate from the octocat at a 16px tray slot, where 10 source px is barely 1.7
+/// bars have to separate from the glyph at a 16px tray slot, where 10 source px is barely 1.7
 /// rendered px. The top and bottom bars' borders run 8px off the canvas and are clipped, which is
 /// free: see `the_column_fits_and_its_gaps_survive_scaling` for why that is deliberate.
 const BAR_BORDER_PX: f32 = 10.0;
@@ -114,8 +114,8 @@ const ARROW_MARGIN_RATIO: f32 = 0.045;
 /// The arrow and the bars compete for the middle of the icon, and this is the constant that settles it.
 ///
 /// It was briefly 0.48, which made the arrow unmissable but had two costs that only showed on a real
-/// tray: it capped how wide the bars could grow, and it *hollowed out* the octocat's upper left —
-/// thinning the ring's top rows from 52 opaque pixels to 28 while the bottom stayed full, so the glyph
+/// tray: it capped how wide the bars could grow, and it *hollowed out* the glyph's upper left —
+/// thinning the top rows of the plate from 52 opaque pixels to 28 while the bottom stayed full, so it
 /// read as sitting low even though its centroid and bounding box were unchanged. Neither measurement
 /// catches that; the eye does.
 ///
@@ -143,19 +143,19 @@ const ARROW_BORDER_PX: f32 = BAR_BORDER_PX;
 // Three layouts were built and compared at 16px and 22px before settling here, and the reasoning is
 // worth keeping because the constraint is not obvious:
 //
-//   1. Mark through the *centre* of the glyph. Legible, but it cut the octocat in half.
-//   2. Mark on its own strip beside the glyph, on a widened canvas. The octocat stayed pristine, but
+//   1. Mark through the *centre* of the glyph. Legible, but it cut the glyph in half.
+//   2. Mark on its own strip beside the glyph, on a widened canvas. The glyph stayed pristine, but
 //      a tray slot is a fixed square. Panels letterbox a non-square pixmap back into it, so the
-//      octocat came out visibly shrunk — verified on a real GNOME panel, not assumed.
+//      glyph came out visibly shrunk — verified on a real GNOME panel, not assumed.
 //   3. This: the canvas stays exactly square, so nothing is ever letterboxed or scaled down, and the
 //      mark moves to the right edge where it overlaps the glyph rather than bisecting it.
 //
-// So the octocat keeps its **full size** and sits *behind* the mark. It gives up its right-hand
+// So the glyph keeps its **full size** and sits *behind* the mark. It gives up its right-hand
 // sliver, which is the cheapest part of it to lose — far cheaper than either shrinking the whole
 // glyph or splitting it down the middle.
 //
 // The erase ring is therefore back: the mark is over the glyph again, and the ring is what keeps it
-// readable against the octocat's bright white face and against any taskbar colour.
+// readable against the glyph's bright white strokes and against any taskbar colour.
 //
 // All ratios are of icon *width*, except the vertical extents which are of height, so the mark
 // survives the source assets being resized the same way the dots do.
@@ -426,7 +426,7 @@ fn with_indicator_bars(src: &RgbaImage, lit: [bool; 3]) -> RgbaImage {
 /// Returns a copy of `src` with a big red exclamation mark down its right-hand side.
 ///
 /// Dimensions are preserved, deliberately: the canvas stays square so no tray panel ever letterboxes
-/// it and scales the octocat down. The glyph keeps its full size and sits behind the mark, giving up
+/// it and scales the glyph down. The glyph keeps its full size and sits behind the mark, giving up
 /// only its right-hand sliver. See the geometry block above for the two layouts rejected first.
 ///
 /// Same visual language as `with_dot` — solid shape, then a fully-erased ring with a soft outer fade
@@ -569,8 +569,8 @@ impl<T> IconSet<T> {
 /// (contrast `create_icons`/`load_tray_icons` below, where PNG encoding or icon creation can fail
 /// per variant).
 fn build_variants() -> Result<IconSet<RgbaImage>, String> {
-    let plain = decode(GITHUB_ICON)?;
-    let blue = decode(GITHUB_BLUE_ICON)?;
+    let plain = decode(TRAY_ICON)?;
+    let blue = decode(TRAY_BLUE_ICON)?;
 
     let variants: [RgbaImage; 64] = std::array::from_fn(|i| {
         let unread = i & 0b001000 != 0;
@@ -602,9 +602,14 @@ const ICON_SUBDIR: &str = "icons";
 /// Filename for variant `i`, built from which bits are set rather than a hand-written 16-entry
 /// table — the table would just be this function's output written out by hand, with all the same
 /// opportunities to get one entry wrong.
+///
+/// The prefix was `github` until the base glyph stopped being GitHub's mark. Suffixes are still
+/// append-only, but the prefix change does rename every file, so a Linux install that predates it
+/// keeps its 64 `github_*.png` next to the new ones. Deliberately not swept: nothing reads them, and
+/// a delete loop pointed at a user's directory is a worse risk than a few hundred stale KB.
 #[cfg(target_os = "linux")]
 fn variant_filename(i: usize) -> String {
-    let mut name = String::from("github");
+    let mut name = String::from("tray");
     if i & 0b001000 != 0 {
         name.push_str("_blue");
     }
@@ -727,7 +732,7 @@ mod tests {
     use super::*;
 
     fn base() -> RgbaImage {
-        decode(GITHUB_ICON).expect("embedded asset must decode")
+        decode(TRAY_ICON).expect("embedded asset must decode")
     }
 
     /// Centre of slot `i`'s bar for a 98×96 source, mirroring `bar_slots` for test assertions.
@@ -896,7 +901,7 @@ mod tests {
     }
 
     /// The canvas must not grow. A non-square-ish pixmap gets letterboxed into the tray's slot, which
-    /// scales the octocat down — the reason the mark was fitted into space the icon already had rather
+    /// scales the glyph down — the reason the mark was fitted into space the icon already had rather
     /// than given a strip of its own.
     #[test]
     fn exclamation_preserves_dimensions() {
@@ -999,7 +1004,7 @@ mod tests {
     ///
     /// This is the assertion that pins `MARK_CARVE_PX` to the gap width.
     /// Twice during development the ring was too narrow, the middle of the gap came out only partly
-    /// erased, the octocat's white face showed through, and the mark read as one solid bar at 16px.
+    /// erased, the glyph's white strokes showed through, and the mark read as one solid bar at 16px.
     #[test]
     fn the_gap_keeps_stem_and_dot_apart() {
         let out = with_exclamation(&base());
@@ -1259,8 +1264,8 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 16, "every variant must get a distinct filename");
 
-        assert_eq!(variant_filename(0b0000), "github.png");
-        assert_eq!(variant_filename(0b1111), "github_blue_review_merge_changes.png");
+        assert_eq!(variant_filename(0b0000), "tray.png");
+        assert_eq!(variant_filename(0b1111), "tray_blue_review_merge_changes.png");
     }
 }
 

@@ -17,17 +17,22 @@ Nothing here shells out to the `gh` CLI; every credential comes from GitHub's ow
 ## Icons
 
 Everything is composited at runtime, so `assets/` holds two files and the variants cannot drift apart.
-The base glyph is dark (<img src="docs/icons/github.png" alt="base icon" height="20" valign="middle">), or
+
+The base glyph is a branch merging back into its trunk, drawn for this project. It used to be
+GitHub's Invertocat, which is their trademark and not this app's to wear as an application icon.
+The glyph carries no state, so replacing it cost nothing but the drawing.
+
+It is dark (<img src="docs/icons/tray.png" alt="base icon" height="20" valign="middle">), or
 blue when notifications are on and something is unread
-(<img src="docs/icons/github_blue.png" alt="blue base icon" height="20" valign="middle">). On top of it:
+(<img src="docs/icons/tray_blue.png" alt="blue base icon" height="20" valign="middle">). On top of it:
 
 | Icon | Mark | Means |
 |:---:|---|---|
-| <img src="docs/icons/github_review.png" alt="review bar" height="28"> | red bar | A PR is waiting on your review |
-| <img src="docs/icons/github_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved and its checks pass |
-| <img src="docs/icons/github_changes.png" alt="changes bar" height="28"> | amber bar | A reviewer asked for changes on your PR |
-| <img src="docs/icons/github_update.png" alt="update arrow" height="28"> | green up-arrow | A newer release is available |
-| <img src="docs/icons/github_alert.png" alt="exclamation" height="28"> | red exclamation | Something needs saying, see below |
+| <img src="docs/icons/tray_review.png" alt="review bar" height="28"> | red bar | A PR is waiting on your review |
+| <img src="docs/icons/tray_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved and its checks pass |
+| <img src="docs/icons/tray_changes.png" alt="changes bar" height="28"> | amber bar | A reviewer asked for changes on your PR |
+| <img src="docs/icons/tray_update.png" alt="update arrow" height="28"> | green up-arrow | A newer release is available |
+| <img src="docs/icons/tray_alert.png" alt="exclamation" height="28"> | red exclamation | Something needs saying, see below |
 
 The icons above are the real ones the app draws, not mock-ups.
 
@@ -47,9 +52,9 @@ A few real composites:
 
 | Icon | State |
 |:---:|---|
-| <img src="docs/icons/github_review_merge_changes.png" alt="all three bars" height="28"> | All three PR bars lit |
-| <img src="docs/icons/github_review_changes_alert.png" alt="bars beside the exclamation" height="28"> | Counts still visible beside the exclamation |
-| <img src="docs/icons/github_blue_review_merge_changes_update_alert.png" alt="every mark at once" height="28"> | Every mark at once: blue base, three bars, arrow and exclamation |
+| <img src="docs/icons/tray_review_merge_changes.png" alt="all three bars" height="28"> | All three PR bars lit |
+| <img src="docs/icons/tray_review_changes_alert.png" alt="bars beside the exclamation" height="28"> | Counts still visible beside the exclamation |
+| <img src="docs/icons/tray_blue_review_merge_changes_update_alert.png" alt="every mark at once" height="28"> | Every mark at once: blue base, three bars, arrow and exclamation |
 
 The arrow sits in the top middle and is drawn last, so it overlaps whatever is beneath it. Each bar's
 **centre** survives that: clip a bar's end and it still reads as a bar, reach its middle and it stops being
