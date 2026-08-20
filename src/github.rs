@@ -5,10 +5,12 @@
 //! failure. The previous version returned `Ok(0)` for any non-2xx response, which meant an
 //! expired token or a rate limit rendered as a confident "you have no notifications".
 
+use crate::errorln;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, ETAG, IF_NONE_MATCH, RETRY_AFTER, USER_AGENT};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NOTIFICATIONS_URL: &str = "https://api.github.com/notifications";
@@ -193,11 +195,29 @@ pub fn poll_changes_requested(client: &Client, token: &str, query: &str) -> Poll
 /// exposes the real signal via `statusCheckRollup.state`, which aggregates check runs *and* legacy
 /// statuses. So the same server-side search string is handed to GraphQL, and the check-health gate is
 /// applied client-side in `checks_ready` — the same split the changes-requested axis already uses.
+///
+/// The rollup is read **off the pull request**, never through `commits(last:1)`. That detour was
+/// this axis's second false start, and it is worth spelling out so nobody walks back into it:
+/// resolving a `PullRequestCommit` needs the App's **Contents: read** permission — read access to
+/// every line of source in every installed repository, to power a tray icon. Without it GitHub
+/// answers `200 OK` and refuses the node itself:
+///
+/// ```text
+/// {"type":"FORBIDDEN","path":["search","nodes",0,"commits","nodes",0],
+///  "message":"Resource not accessible by integration"}
+/// ```
+///
+/// `PullRequest.statusCheckRollup` is the same head-commit rollup with none of that cost. It does
+/// still want two *narrow* permissions, since `StatusCheckRollupContext` is the union
+/// `CheckRun | StatusContext`: **Checks: read** for check runs and **Commit statuses: read** for the
+/// legacy status API. Missing those does not fail the request either — the rollup comes back nulled
+/// with a `FORBIDDEN` per hit, which `parse_merge_ready` degrades rather than mistaking for "no
+/// checks configured".
 const MERGE_READY_DOCUMENT: &str = "\
 query($q:String!,$hits:Int!){\
   search(query:$q,type:ISSUE,first:$hits){\
     nodes{...on PullRequest{\
-      commits(last:1){nodes{commit{statusCheckRollup{state}}}}\
+      statusCheckRollup{state}\
     }}\
   }\
 }";
@@ -292,6 +312,16 @@ struct GraphQlResponse {
 #[derive(Debug, Deserialize)]
 struct GraphQlError {
     message: String,
+    /// GitHub's machine-readable error class - `FORBIDDEN`, `RATE_LIMITED`, `NOT_FOUND`. Absent on
+    /// query-validation errors, which carry only a message, hence `Option`.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    /// The response path this error applies to, e.g.
+    /// `["search","nodes",3,"commits","nodes",0,"commit","statusCheckRollup"]`. Segments mix field
+    /// names with array indices, so `Value` rather than a typed enum - see `blinded_rollup_index`
+    /// for the one shape actually read.
+    #[serde(default)]
+    path: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,7 +343,7 @@ struct PullRequestNode {
     latest_opinionated_reviews: Option<ReviewConnection>,
     review_requests: Option<RequestConnection>,
     /// Only requested by the merge-ready query; absent (`None`) in changes-requested responses.
-    commits: Option<CommitConnection>,
+    status_check_rollup: Option<StatusCheckRollup>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,27 +384,8 @@ struct RequestedReviewer {
 
 // ─── The merge-ready payload ──────────────────────────────────────────────────
 //
-// Every level is optional, for the same reason as the changes-requested structs: GraphQL can answer
-// with partial data, and a repo with no checks at all returns a null `statusCheckRollup`. See
-// `checks_ready` for how an absent rollup is read.
-
-#[derive(Debug, Deserialize)]
-struct CommitConnection {
-    nodes: Vec<Option<CommitNode>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CommitNode {
-    commit: Option<Commit>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Commit {
-    /// `None` when the repo has no checks configured at all — GitHub returns a null rollup, not an
-    /// empty one.
-    status_check_rollup: Option<StatusCheckRollup>,
-}
+// One field, one level. `statusCheckRollup` is `Option` because a repo with no checks at all comes
+// back null rather than empty — observed live on a docs repo, not assumed. See `checks_ready`.
 
 #[derive(Debug, Deserialize)]
 struct StatusCheckRollup {
@@ -385,21 +396,19 @@ struct StatusCheckRollup {
 /// Whether this pull request's checks are healthy enough to call it ready to merge.
 ///
 /// Ready means the rollup is `SUCCESS`, or there is no rollup at all — a repo with no checks
-/// configured has nothing that can fail, and because the search is scoped to `author:@me` an absent
-/// rollup means "no checks", never "not allowed to see them". Everything else (`FAILURE`, `ERROR`,
-/// a still-running `PENDING`/`EXPECTED`, or any state we do not recognise) is not ready.
+/// configured has nothing that can fail. Everything else (`FAILURE`, `ERROR`, a still-running
+/// `PENDING`/`EXPECTED`, or any state we do not recognise) is not ready.
+///
+/// Reading an absent rollup as "no checks" is only sound because `parse_merge_ready` never asks
+/// about a hit GraphQL refused to resolve: a permission failure nulls the rollup exactly like a
+/// checkless repo does, so those hits are dropped by index before they reach here. Conflating the
+/// two is what lit the green bar over a pull request nobody could actually see.
 ///
 /// The safe direction here is the *opposite* of `still_on_you`. A green bar that should be dark
 /// claims a pull request is mergeable while its checks are red — the exact false signal this axis
 /// exists to kill — so anything short of a clear success is dropped.
 fn checks_ready(pr: &PullRequestNode) -> bool {
-    let rollup_state = pr
-        .commits
-        .as_ref()
-        .and_then(|c| c.nodes.iter().flatten().next())
-        .and_then(|node| node.commit.as_ref())
-        .and_then(|commit| commit.status_check_rollup.as_ref())
-        .map(|rollup| rollup.state.as_str());
+    let rollup_state = pr.status_check_rollup.as_ref().map(|rollup| rollup.state.as_str());
 
     match rollup_state {
         None => true,             // no checks configured: nothing to fail
@@ -482,10 +491,34 @@ fn parse_merge_ready(body: &str) -> Result<(bool, Option<u32>), String> {
     let response: GraphQlResponse = serde_json::from_str(body)
         .map_err(|e| format!("unparseable merge-ready payload: {e}"))?;
 
-    if !response.errors.is_empty() {
-        let joined =
-            response.errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("; ");
-        return Err(format!("GraphQL reported an error: {joined}"));
+    // Sort the errors into the one kind this axis can survive and everything else. Anything
+    // unrecognised keeps the old all-or-nothing behaviour: better a frozen count than a wrong one.
+    let mut blinded: HashSet<usize> = HashSet::new();
+    let mut fatal: Vec<&str> = Vec::new();
+    for error in &response.errors {
+        match blinded_hit_index(error) {
+            Some(index) => {
+                blinded.insert(index);
+            }
+            None => fatal.push(error.message.as_str()),
+        }
+    }
+
+    if !fatal.is_empty() {
+        return Err(format!("GraphQL reported an error: {}", fatal.join("; ")));
+    }
+
+    // Said here rather than left to `scheduler`'s failed-poll line, because this is no longer a
+    // failed poll: the count below is honest and the bar stays live. Left unsaid, a missing
+    // permission would render as a dark bar indistinguishable from "nothing to merge" — the exact
+    // ambiguity `github_app::PrStatus` exists to avoid.
+    if !blinded.is_empty() {
+        errorln!(
+            "merge-ready: GitHub refused {} of the pull requests found, so they are not counted \
+             as ready — check the App has Checks: read and Commit statuses: read, approved on each \
+             installation, then re-authorize",
+            blinded.len()
+        );
     }
 
     let search = response
@@ -493,8 +526,48 @@ fn parse_merge_ready(body: &str) -> Result<(bool, Option<u32>), String> {
         .ok_or_else(|| "GraphQL answered with neither data nor errors".to_string())?
         .search;
 
-    let count = search.nodes.iter().flatten().filter(|pr| checks_ready(pr)).count() as u32;
+    // `enumerate` before dropping nulls: GitHub's error paths index into `nodes` as sent, holes
+    // included, so filtering first would shift every index past the first null.
+    let count = search
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| node.as_ref().map(|pr| (index, pr)))
+        .filter(|(index, pr)| !blinded.contains(index) && checks_ready(pr))
+        .count() as u32;
     Ok((count > 0, Some(count)))
+}
+
+/// The search-node index of a hit this token was refused, or `None` if the error is anything else.
+///
+/// The index is the point of the whole function. A `FORBIDDEN` *underneath* one search node says
+/// "this one pull request is unjudgeable", not "the query broke" — but the null it leaves behind is
+/// byte-identical to a checkless repo's null rollup, so without knowing *which* hit was refused
+/// there is no way to drop it and keep the rest.
+///
+/// Keyed on the path *shape*, not on a field name, which is the correction this cost two rounds to
+/// learn: the first version demanded the path end at `"statusCheckRollup"`, and GitHub's actual
+/// refusal ended at `["search","nodes",0,"commits","nodes",0]` — an integer. It matched nothing and
+/// froze the axis exactly as before. Since the query now asks for one field per hit, *any* refusal
+/// below a hit means the same thing, so the shape is the honest thing to match on.
+///
+/// Still narrow in the direction that matters. A path that stops at `search` or `search.nodes`, or
+/// no path at all, is the whole page being denied: `None`, and the poll fails as it always did.
+fn blinded_hit_index(err: &GraphQlError) -> Option<usize> {
+    // `kind` is the reliable signal; the message text is the fallback for the day GitHub omits it.
+    let denied = err.kind.as_deref() == Some("FORBIDDEN")
+        || err.message.contains("not accessible by integration");
+    if !denied {
+        return None;
+    }
+
+    // `["search","nodes",3, …]` and at least one segment past the index, so this names a field
+    // below one hit rather than the connection itself.
+    let path = err.path.as_ref()?;
+    if path.len() < 4 || path.first()?.as_str()? != "search" || path.get(1)?.as_str()? != "nodes" {
+        return None;
+    }
+    path.get(2)?.as_u64().map(|index| index as usize)
 }
 
 /// Maps one HTTP response onto a `PollResult`.
@@ -827,14 +900,15 @@ mod tests {
         classify_with(status, h, body, now, parse_merge_ready)
     }
 
-    /// A single merge-ready search hit whose head commit carries `state` as its check rollup.
-    /// `None` renders a null rollup — GitHub's answer for a repo with no checks configured.
+    /// A single merge-ready search hit carrying `state` as its check rollup. `None` renders a null
+    /// rollup — GitHub's real answer for a repo with no checks configured, as seen live on
+    /// `QUMEA/user-doc`.
     fn mrhit(state: Option<&str>) -> String {
         let rollup = match state {
             Some(s) => format!(r#"{{"state":"{s}"}}"#),
             None => "null".to_string(),
         };
-        format!(r#"{{"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}"#)
+        format!(r#"{{"statusCheckRollup":{rollup}}}"#)
     }
 
     fn merge_count(body: &str) -> u32 {
@@ -924,6 +998,130 @@ mod tests {
             merge(StatusCode::OK, &headers(&[]), "not json at all", 0),
             PollResult::Transient(_)
         ));
+    }
+
+    /// A field-level permission failure: `200 OK`, `data` still present, the refused field nulled,
+    /// and one `FORBIDDEN` entry per unreadable hit.
+    ///
+    /// `blinded` are the search-node indices GitHub could not resolve, and `tail` is the path
+    /// beneath each of them. Parameterised because GitHub does not point at one fixed field: the
+    /// shape captured live was `commits","nodes",0` (a refused `PullRequestCommit`), while a token
+    /// lacking Checks/Commit statuses read is refused at `statusCheckRollup`. Both must degrade
+    /// identically.
+    fn blinded_payload(hits: &[String], blinded: &[usize], tail: &str) -> String {
+        let errors = blinded
+            .iter()
+            .map(|i| {
+                format!(
+                    r#"{{"type":"FORBIDDEN","path":["search","nodes",{i},{tail}],"message":"Resource not accessible by integration"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"data":{{"search":{{"nodes":[{}]}}}},"errors":[{errors}]}}"#, hits.join(","))
+    }
+
+    /// The path GitHub actually sent for the bug this fix exists for, captured verbatim from a live
+    /// App token on 2026-08-20.
+    const OBSERVED_TAIL: &str = r#""commits","nodes",0"#;
+
+    /// The path a token lacking `Checks: read` / `Commit statuses: read` is refused at.
+    const ROLLUP_TAIL: &str = r#""statusCheckRollup""#;
+
+    /// The bug: a blinded hit used to fail the *whole* poll, freezing the axis on its last count
+    /// (or leaving it blank on a cold start). It must instead cost only its own hit.
+    /// **The regression this whole two-round hunt produced.** Captured verbatim from a live App
+    /// token: GitHub refuses the `PullRequestCommit` node, so the path ends at an *integer*, not at
+    /// a field name. The first version of this tolerance keyed on the path ending in
+    /// `"statusCheckRollup"`, matched nothing, and froze the axis exactly as before.
+    #[test]
+    fn the_observed_forbidden_path_degrades_to_one_lost_hit() {
+        let body =
+            blinded_payload(&[mrhit(None), mrhit(Some("SUCCESS"))], &[0], OBSERVED_TAIL);
+        match merge(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(present);
+                assert_eq!(count, Some(1), "the readable SUCCESS hit still counts");
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_forbidden_rollup_is_not_ready_but_does_not_break_the_poll() {
+        let body = blinded_payload(&[mrhit(None), mrhit(Some("SUCCESS"))], &[0], ROLLUP_TAIL);
+        match merge(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(present);
+                assert_eq!(count, Some(1), "only the readable SUCCESS hit counts");
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// The other half of the same bug, and the one that must never regress: a blinded null rollup
+    /// must NOT be read as `checks_ready`'s "no checks configured, nothing to fail". That would
+    /// light the green bar on a PR with red checks.
+    #[test]
+    fn every_pr_blinded_is_a_fresh_zero_not_a_frozen_count() {
+        let body = blinded_payload(&[mrhit(None), mrhit(None)], &[0, 1], ROLLUP_TAIL);
+        match merge(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { present, count, .. } => {
+                assert!(!present, "unreadable is not ready");
+                assert_eq!(count, Some(0));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// The new tolerance is for one known, degradable field only — it must not swallow real
+    /// breakage such as a bad query or an exhausted rate limit.
+    #[test]
+    fn an_unrelated_graphql_error_still_fails_the_whole_poll() {
+        let body = format!(
+            r#"{{"data":{{"search":{{"nodes":[{}]}}}},"errors":[{{"type":"RATE_LIMITED","message":"API rate limit exceeded"}}]}}"#,
+            mrhit(Some("SUCCESS"))
+        );
+        match merge(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Transient(why) => assert!(why.contains("rate limit"), "got {why:?}"),
+            other => panic!("expected Transient, got {:?}", other),
+        }
+    }
+
+    /// `FORBIDDEN` alone is not the licence — the path must single out *one* hit. A refusal at
+    /// `search` or `search.nodes` is the whole page being denied, and there is nothing to salvage.
+    #[test]
+    fn a_query_wide_forbidden_still_fails_the_whole_poll() {
+        for path in [r#"["search"]"#, r#"["search","nodes"]"#, "null"] {
+            let body = format!(
+                r#"{{"data":{{"search":{{"nodes":[{}]}}}},"errors":[{{"type":"FORBIDDEN","path":{path},"message":"Resource not accessible by integration"}}]}}"#,
+                mrhit(Some("SUCCESS"))
+            );
+            assert!(
+                matches!(merge(StatusCode::OK, &headers(&[]), &body, 0), PollResult::Transient(_)),
+                "path {path} names no single hit, so it must stay fatal"
+            );
+        }
+    }
+
+    /// The detour through `commits(last:1)` cost a whole extra App permission — `Contents: read`,
+    /// read access to every line of source in every installed repo — and was the reason this axis
+    /// was dead. `statusCheckRollup` hangs off the pull request directly. Never go back.
+    #[test]
+    fn the_merge_document_never_walks_through_commits() {
+        assert!(
+            !MERGE_READY_DOCUMENT.contains("commits"),
+            "a PullRequestCommit needs Contents: read; ask the PullRequest for its rollup instead"
+        );
+        assert!(MERGE_READY_DOCUMENT.contains("statusCheckRollup"));
+    }
+
+    /// A null rollup with a clean `errors` array still means "no checks configured", so the two
+    /// causes of a null rollup stay distinguishable. Guards `an_absent_rollup_is_ready` from being
+    /// collateral damage of the fix above.
+    #[test]
+    fn an_absent_rollup_with_no_errors_is_still_ready() {
+        assert_eq!(merge_count(&blinded_payload(&[mrhit(None)], &[], ROLLUP_TAIL)), 1);
     }
 
     #[test]

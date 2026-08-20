@@ -228,6 +228,22 @@ has no checks at all. A PR with red or still-running checks does not light it. U
 approved PRs are inspected. Still not checked: branch protection needing multiple approvals or named
 reviewers, and merge conflicts (`mergeable` is computed lazily and reads `UNKNOWN` on a cold poll).
 
+**The rollup is read off the pull request, never through its head commit.** `PullRequest`
+has a `statusCheckRollup` field; walking there via `commits(last:1){nodes{commit{…}}}` reaches the same
+rollup but resolving a `PullRequestCommit` requires the App's **Contents: read** permission — read access
+to every line of source in every installed repo, to power a tray icon. Without it GitHub answers
+`200 OK` and refuses the node (`FORBIDDEN` at `search.nodes.0.commits.nodes.0`), which is exactly how
+this axis was dead through 1.7.0 and 1.7.1. Going straight at the pull request costs nothing extra.
+
+Two *narrow* permissions are still needed, since the rollup aggregates check runs and legacy commit
+statuses: **Checks: read** and **Commit statuses: read**. Missing those does not fail the request
+either — the rollup comes back nulled with a `FORBIDDEN` per pull request. Those pull requests are
+**not** counted as ready (a nulled rollup looks exactly like "repo has no checks", and guessing green
+there would light the bar over red checks), the rest of the page still counts, and the log names what to
+grant. Granting it is not enough on its own: each installation owner must **approve the updated
+permissions**, and you must re-authorize (delete `pr_token.txt`, then *Authenticate*) before the token
+carries them.
+
 **Changes requested does one thing more than its query.** Re-requesting a review does not dismiss the
 reviewer's earlier verdict, so `review:changes_requested` keeps matching a pull request you have already
 handed back, and the bar used to stay lit until the reviewer replied. That query is now sent through
@@ -243,8 +259,11 @@ reviews and 20 pending requests within each.
 
 All three queries need to see PRs in private repos. The only *classic* OAuth scope that can is `repo`,
 which also grants **write** to everything you can reach. Rather than hand out a key that broad, PR status
-uses one shared fine-grained **GitHub App** with read-only Pull requests and Metadata permissions. Device
-Flow needs no client secret, so its Client ID is public and baked in rather than configured.
+uses one shared fine-grained **GitHub App** with read-only Pull requests, Metadata, Checks and Commit
+statuses permissions — the last two only so the green bar can read check health. **Contents is
+deliberately not requested**, which is why no query may traverse a commit object; see the note on
+`statusCheckRollup` above. Device Flow needs no client secret, so its Client ID is public and baked in
+rather than configured.
 
 Access to a private org is granted by **installing** the App there, not by a wider scope — an org owner
 approves once and every member benefits.
