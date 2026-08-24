@@ -99,7 +99,7 @@ pub fn write_line(level: Level, line: &str) {
     }
 }
 
-/// Appends an `ERROR` line to `~/.github-trayicon/log.txt`: a failure or non-OK response. Written
+/// Appends an `ERROR` line to `~/.githoot-tray/log.txt`: a failure or non-OK response. Written
 /// at every level, including the `error` default.
 #[macro_export]
 macro_rules! errorln {

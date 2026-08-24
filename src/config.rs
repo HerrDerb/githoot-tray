@@ -1,4 +1,4 @@
-//! User-editable settings: `~/.github-trayicon/config.txt`.
+//! User-editable settings: `~/.githoot-tray/config.txt`.
 //!
 //! One `key=value` per line, `#` comments and blank lines ignored — the same tolerant shape
 //! `access_token.rs` already uses for `client_id.txt`, so there is nothing new to explain to
@@ -134,7 +134,7 @@ fn pr_key(axis: PrAxis) -> &'static str {
 /// the file states what is actually in force and editing one means changing a value.
 fn default_config() -> String {
     format!(
-        "# git-system-tray settings\n\
+        "# githoot-tray settings\n\
          #\n\
          # One key=value per line. Lines starting with # are ignored. Anything not recognised as an\n\
          # off value (off, false, 0, no) leaves the setting at its default, so a typo cannot silently\n\

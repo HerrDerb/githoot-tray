@@ -1,4 +1,4 @@
-//! Icon management for GitHub Tray Icon.
+//! Icon management for GitHoot Tray.
 //!
 //! Four independent signals are drawn onto the tray icon, giving sixteen variants:
 //!   * base glyph — dark (no unread notifications) or blue (unread notifications)
@@ -1276,17 +1276,17 @@ mod tests {
 mod render_dump {
     use super::*;
 
-    /// Dumps every built variant to `$GST_ICON_DUMP` for visual inspection.
+    /// Dumps every built variant to `$GHT_ICON_DUMP` for visual inspection.
     ///
     /// No assertion can judge whether a bar still reads as a bar once a taskbar has scaled it to
     /// 16px, and several colour and geometry choices in this file carry a "check on a real render"
     /// caveat for exactly that reason. `#[ignore]`d: it writes files and its only output is pictures
     /// for a human. Run with
-    /// `GST_ICON_DUMP=/tmp/icons cargo test -- --ignored dump_all_variants --nocapture`.
+    /// `GHT_ICON_DUMP=/tmp/icons cargo test -- --ignored dump_all_variants --nocapture`.
     #[test]
     #[ignore = "writes PNGs for a human to look at"]
     fn dump_all_variants() {
-        let Ok(dir) = std::env::var("GST_ICON_DUMP") else { return };
+        let Ok(dir) = std::env::var("GHT_ICON_DUMP") else { return };
         let dir = std::path::PathBuf::from(dir);
         let set = build_variants().expect("variants must build");
         for (i, img) in set.variants.iter().enumerate() {

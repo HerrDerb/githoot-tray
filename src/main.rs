@@ -1,7 +1,7 @@
 // On Windows, use the "windows" subsystem so no console window is created.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! Main entry point for the GitHub Tray Icon application.
+//! Main entry point for the GitHoot Tray application.
 //! Handles cross-platform initialization and tray icon setup.
 
 mod access_token;
@@ -137,9 +137,9 @@ fn load_pr_credential(app_asset_path: &std::path::Path) -> github_app::PrStatus 
             // Not `dialog::message` on Linux: this runs during startup and nobody is waiting to be
             // asked anything, so its stdin fallback would block the app before the tray appears.
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            dialog::message("git-system-tray: PR status", &msg);
+            dialog::message("githoot-tray: PR status", &msg);
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            eprintln!("\ngit-system-tray: PR status disabled\n\n{msg}\n");
+            eprintln!("\ngithoot-tray: PR status disabled\n\n{msg}\n");
 
             return github_app::PrStatus::Off("PR status off: setup failed".to_string());
         }
@@ -165,7 +165,7 @@ fn load_pr_credential(app_asset_path: &std::path::Path) -> github_app::PrStatus 
 /// Creates the directory if it does not exist.
 fn get_app_asset_path() -> Result<std::path::PathBuf, String> {
     let user_home = dirs::home_dir().ok_or("could not find home directory")?;
-    let assets_path = user_home.join(".github-trayicon");
+    let assets_path = user_home.join(".githoot-tray");
     std::fs::create_dir_all(&assets_path)
         .map_err(|e| format!("failed to create {}: {e}", assets_path.display()))?;
     Ok(assets_path)
@@ -440,7 +440,7 @@ fn exec_into(plan: &update::RestartPlan) -> ! {
         errorln!("the previous version would not start either ({error})");
     }
     dialog::report(
-        "git-system-tray: restart failed",
+        "githoot-tray: restart failed",
         "The update was installed but the app could not restart. Start it again by hand.",
     );
     std::process::exit(1);
@@ -459,7 +459,7 @@ fn exec_into(plan: &update::RestartPlan) -> ! {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn fatal(message: &str) -> ! {
     errorln!("fatal: {message}");
-    dialog::message("git-system-tray", message);
+    dialog::message("githoot-tray", message);
     std::process::exit(1);
 }
 
@@ -496,7 +496,7 @@ fn main() {
         use winapi::um::errhandlingapi::{GetLastError, SetLastError};
         use winapi::um::synchapi::CreateMutexW;
 
-        let name: Vec<u16> = "Local\\GitSystemTray\0".encode_utf16().collect();
+        let name: Vec<u16> = "Local\\GitHootTray\0".encode_utf16().collect();
         SetLastError(0);
         let handle = CreateMutexW(null_mut(), 0, name.as_ptr());
 
@@ -504,7 +504,7 @@ fn main() {
             eprintln!("Warning: could not create single-instance mutex (err {})", GetLastError());
         } else if GetLastError() == 0xB7 {
             // ERROR_ALREADY_EXISTS — another instance owns the mutex
-            dialog::message("Already Running", "git-system-tray is already running.");
+            dialog::message("Already Running", "githoot-tray is already running.");
             return;
         }
         // On a fresh mutex (first instance) GetLastError() is 0 — fall through.
@@ -514,7 +514,7 @@ fn main() {
         Ok(path) => path,
         Err(e) => {
             // Not `fatal`: the log has no home yet, since finding that home is what just failed.
-            dialog::message("git-system-tray", &format!("Fatal: {e}"));
+            dialog::message("githoot-tray", &format!("Fatal: {e}"));
             std::process::exit(1);
         }
     };
@@ -911,7 +911,7 @@ fn main() {
                         let _ = std::fs::rename(backup, &plan.target);
                     }
                     dialog::report(
-                        "git-system-tray: update failed",
+                        "githoot-tray: update failed",
                         &format!(
                             "The update was installed but would not start, so the previous version \
                              has been put back.\n\n{e}"

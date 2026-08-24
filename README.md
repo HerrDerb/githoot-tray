@@ -1,4 +1,4 @@
-# git-system-tray
+# GitHoot Tray
 
 A small Rust tray app that watches your pull requests — reviews requested of you, your PRs ready to
 merge, your PRs with changes requested — and changes its icon the moment one needs you. Unread GitHub
@@ -80,14 +80,14 @@ and shows no mark, and a single transient blip holds the last known value rather
 ## Setup
 
 ```bash
-cargo build --release          # -> target/release/git-system-tray
+cargo build --release          # -> target/release/githoot-tray
 ```
 
 On macOS the bare binary takes a Dock icon and an app menu, because `LSUIElement` needs a bundle:
 
 ```bash
-scripts/bundle-macos.sh target/release/git-system-tray dist 1.6.0
-open dist/git-system-tray.app
+scripts/bundle-macos.sh target/release/githoot-tray dist 1.6.0
+open dist/githoot-tray.app
 ```
 
 That is the same script the release workflow runs, so local and released bundles are identical.
@@ -122,8 +122,8 @@ same check the updater runs before installing anything:
 
 ```bash
 # Compare your download against the signed digest list for its tag.
-curl -LO https://github.com/HerrDerb/github-trayicon/releases/download/vX.Y.Z/sha256sums.txt
-curl -LO https://github.com/HerrDerb/github-trayicon/releases/download/vX.Y.Z/sha256sums.txt.minisig
+curl -LO https://github.com/HerrDerb/githoot-tray/releases/download/vX.Y.Z/sha256sums.txt
+curl -LO https://github.com/HerrDerb/githoot-tray/releases/download/vX.Y.Z/sha256sums.txt.minisig
 minisign -Vm sha256sums.txt \
   -P 'RWSYrhd3sxiQUDZtxm8c+p0iRdj+z+fGQKdLq62ojrmfii2OjCG8PX8D'  # authenticity
 sha256sum -c sha256sums.txt --ignore-missing                    # integrity
@@ -170,9 +170,16 @@ page still shows every PR with changes requested, including ones you have alread
 
 ## Settings
 
-`~/.github-trayicon/config.txt` is created on first run with every setting at its default. An existing
+`~/.githoot-tray/config.txt` is created on first run with every setting at its default. An existing
 file is **never** rewritten, so your edits are safe — which also means a later version's new keys will not
 appear in it, and the table below is the complete list.
+
+> **Upgrading from `git-system-tray`?** The app was renamed, and with it the asset names, the binary
+> and this directory — settings and log used to live in `~/.github-trayicon/`. Nothing is migrated
+> automatically, so copy your old `config.txt` across if you want to keep it. Install the new release by
+> hand as well: a pre-rename copy still *sees* the new version and offers it, then fails the integrity
+> check with "the signed sums file has no entry for git-system-tray", because the asset it wants is no
+> longer published.
 
 | Key | Default | Does |
 |---|---|---|
@@ -306,7 +313,7 @@ ID in. Then a device code, same as PR status. The token lands in `access_token.t
 ## Troubleshooting
 
 The tooltip always states what the app currently believes, including *why* it is unsure. Full history is
-appended to `~/.github-trayicon/log.txt` — the only way to see errors on Windows and macOS, where there is
+appended to `~/.githoot-tray/log.txt` — the only way to see errors on Windows and macOS, where there is
 no console. The log never contains a token.
 
 That directory holds the four files worth opening — `config.txt`, `log.txt` and the two credentials — plus
@@ -372,7 +379,7 @@ bytes.
 ### If a restart is interrupted
 
 On Linux the swap is one atomic `rename`, so the binary is never missing. On Windows and macOS it is
-necessarily two renames, and a crash between them leaves `git-system-tray.exe.old` (or `.app.old`) with
+necessarily two renames, and a crash between them leaves `githoot-tray.exe.old` (or `.app.old`) with
 nothing at the original name. The app cannot repair that — the repairer is the missing file. Rename the
 `.old` back. The recovery line is logged *before* the swap starts, so it is there to find.
 
@@ -388,7 +395,7 @@ renamed without breaking updates from every release already published.
 
 ### Version numbers
 
-The binary reports the git tag it was built from, passed in by CI as `GST_VERSION`, not `Cargo.toml`'s
+The binary reports the git tag it was built from, passed in by CI as `GHT_VERSION`, not `Cargo.toml`'s
 version. A local build has no tag and falls back to `Cargo.toml`, so local and release builds of the same
 commit can report different versions. Deliberate: a local build is not a release.
 
@@ -400,9 +407,9 @@ Download from the [Releases](../../releases) page.
 
 | Platform | Asset |
 |---|---|
-| Windows x86-64 | `git-system-tray.exe` |
-| Linux x86-64 | `git-system-tray` |
-| macOS Apple Silicon | `git-system-tray-macos-aarch64.zip` |
+| Windows x86-64 | `githoot-tray.exe` |
+| Linux x86-64 | `githoot-tray` |
+| macOS Apple Silicon | `githoot-tray-macos-aarch64.zip` |
 | All | `sha256sums.txt`, `sha256sums.txt.minisig` |
 
 Only those three are built. On anything else — Arm Linux, an Intel Mac — the updater reports that there is
@@ -415,9 +422,9 @@ The bundle is ad-hoc signed, not notarized (that needs a paid Apple account), so
 download. Clear it once:
 
 ```bash
-unzip git-system-tray-macos-aarch64.zip
-xattr -dr com.apple.quarantine git-system-tray.app
-open git-system-tray.app
+unzip githoot-tray-macos-aarch64.zip
+xattr -dr com.apple.quarantine githoot-tray.app
+open githoot-tray.app
 ```
 
 The icon then appears in the menu bar with no Dock icon. It keeps its colour rather than using a macOS

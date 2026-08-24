@@ -12,8 +12,8 @@
 //! forgotten would ship as `v1.4.0` while believing it is `1.3.0`. It would then either offer an
 //! update that is already installed, or, worse, never notice a real one.
 //!
-//! So CI passes the tag in through `GST_VERSION` and this module prefers it. A locally built binary
-//! has no `GST_VERSION` and falls back to `Cargo.toml`. That asymmetry is deliberate: a local build is
+//! So CI passes the tag in through `GHT_VERSION` and this module prefers it. A locally built binary
+//! has no `GHT_VERSION` and falls back to `Cargo.toml`. That asymmetry is deliberate: a local build is
 //! not a release and has no tag to claim.
 
 /// The version this binary reports, without a leading `v`.
@@ -23,15 +23,15 @@
 ///
 /// **This constant** needs no `rerun-if-env-changed` to be reliable: rustc records the environment
 /// variables an `option_env!` reads, and Cargo folds them into the crate's fingerprint, so changing
-/// `GST_VERSION` does force a rebuild. Verified by hand rather than assumed, because the failure it
+/// `GHT_VERSION` does force a rebuild. Verified by hand rather than assumed, because the failure it
 /// would cause — a cached binary shipping a release under the previous version's name — is silent and
 /// would only surface as an updater that never sees an update.
 ///
 /// `build.rs` is a different matter and does need the directive. It exists now, and embeds this same
 /// version into the Windows `VERSIONINFO` resource; a build script is only re-run when Cargo is told
-/// what it depends on, so without `cargo:rerun-if-env-changed=GST_VERSION` a tag change would rebuild
+/// what it depends on, so without `cargo:rerun-if-env-changed=GHT_VERSION` a tag change would rebuild
 /// this constant while serving a stale resource. `tests/version_resource.rs` asserts the two agree.
-pub const VERSION: &str = match option_env!("GST_VERSION") {
+pub const VERSION: &str = match option_env!("GHT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
@@ -74,7 +74,7 @@ impl Version {
     /// This binary's own version, or `None` if it somehow cannot be parsed.
     ///
     /// `None` is not reachable from a normal build — `CARGO_PKG_VERSION` is validated by Cargo, and CI
-    /// sets `GST_VERSION` from a `v*` tag — but it is returned rather than panicked on because a tray
+    /// sets `GHT_VERSION` from a `v*` tag — but it is returned rather than panicked on because a tray
     /// app that refuses to start over a malformed version string would be trading a working icon for a
     /// feature the user can live without.
     pub fn current() -> Option<Self> {
@@ -133,7 +133,7 @@ mod tests {
     }
 
     /// Whatever the build put in must itself be parseable, or the app could never compare against a
-    /// release. This is the test that fails if `GST_VERSION` is ever set to something odd.
+    /// release. This is the test that fails if `GHT_VERSION` is ever set to something odd.
     #[test]
     fn the_baked_in_version_is_parseable() {
         assert!(Version::current().is_some(), "VERSION {VERSION:?} must parse");

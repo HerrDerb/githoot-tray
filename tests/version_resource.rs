@@ -11,12 +11,12 @@
 //! ## Why it is an integration test
 //!
 //! There is nothing to unit-test: the resource is not Rust, it is bytes the linker attaches. Only
-//! the finished, linked artefact can answer whether it landed. `CARGO_BIN_EXE_git-system-tray` is
+//! the finished, linked artefact can answer whether it landed. `CARGO_BIN_EXE_githoot-tray` is
 //! the path to exactly that artefact, and Cargo builds the binary before running this file.
 //!
 //! ## Why the version is checked, and not just "is the field non-empty"
 //!
-//! `src/version.rs` prefers `GST_VERSION` over `Cargo.toml`, and `build.rs` has to resolve the
+//! `src/version.rs` prefers `GHT_VERSION` over `Cargo.toml`, and `build.rs` has to resolve the
 //! version the same way. If the two ever disagree the binary ships claiming one version in its
 //! resource and another to the updater — silent, and exactly the class of failure `version.rs`
 //! warns about. So the expected value is taken from the binary itself, by running the
@@ -26,7 +26,7 @@
 use std::os::windows::ffi::OsStrExt;
 use winapi::ctypes::c_void;
 
-const EXE: &str = env!("CARGO_BIN_EXE_git-system-tray");
+const EXE: &str = env!("CARGO_BIN_EXE_githoot-tray");
 
 /// The fixed, binary half of a version resource.
 ///
@@ -226,13 +226,13 @@ fn version_resource_identifies_the_publisher() {
     // Exact values, not merely non-empty: "a field is present" was never the point — an ML model and
     // a human reading the Properties dialog both want to see who ships this and what it is.
     assert_eq!(string_value(&block, "CompanyName"), "HerrDerb");
-    assert_eq!(string_value(&block, "ProductName"), "git-system-tray");
+    assert_eq!(string_value(&block, "ProductName"), "githoot-tray");
     assert_eq!(
         string_value(&block, "OriginalFilename"),
-        "git-system-tray.exe"
+        "githoot-tray.exe"
     );
     assert!(
-        string_value(&block, "FileDescription").contains("git-system-tray"),
+        string_value(&block, "FileDescription").contains("githoot-tray"),
         "FileDescription should name the product; got {:?}",
         string_value(&block, "FileDescription")
     );

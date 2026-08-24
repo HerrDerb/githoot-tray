@@ -884,7 +884,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-system-tray"
+name = "githoot-tray"
 version = "1.8.0"
 dependencies = [
  "arboard",

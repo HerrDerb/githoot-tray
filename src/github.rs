@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const NOTIFICATIONS_URL: &str = "https://api.github.com/notifications";
 const SEARCH_URL: &str = "https://api.github.com/search/issues";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
-const AGENT: &str = "git-system-tray";
+const AGENT: &str = "githoot-tray";
 
 /// How many search hits a GraphQL poll inspects (shared by the changes-requested and merge-ready
 /// axes).

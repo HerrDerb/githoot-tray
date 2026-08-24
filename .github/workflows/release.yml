@@ -102,11 +102,11 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: git-system-tray.exe
+            artifact: githoot-tray.exe
 
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: git-system-tray
+            artifact: githoot-tray
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -133,9 +133,9 @@ jobs:
         # whatever the binary reports — so if it reported Cargo.toml's version, a forgotten bump would
         # make it either miss real updates or claim ones that do not exist.
         env:
-          GST_VERSION: ${{ github.ref_name }}
+          GHT_VERSION: ${{ github.ref_name }}
         run: |
-          export GST_VERSION="${GST_VERSION#v}"
+          export GHT_VERSION="${GHT_VERSION#v}"
           cargo build --release --target ${{ matrix.target }}
         shell: bash
 
@@ -181,9 +181,9 @@ jobs:
 
       - name: Build release binary
         env:
-          GST_VERSION: ${{ github.ref_name }}
+          GHT_VERSION: ${{ github.ref_name }}
         run: |
-          export GST_VERSION="${GST_VERSION#v}"
+          export GHT_VERSION="${GHT_VERSION#v}"
           cargo build --release --target aarch64-apple-darwin
 
       - name: Bundle, sign and zip
@@ -192,7 +192,7 @@ jobs:
           # The tag is the source of truth for the version here, as it is for the release notes.
           # Cargo.toml's version is never consulted by this workflow.
           bash scripts/bundle-macos.sh \
-            target/aarch64-apple-darwin/release/git-system-tray \
+            target/aarch64-apple-darwin/release/githoot-tray \
             dist \
             "${GITHUB_REF_NAME#v}"
 
@@ -202,13 +202,13 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            dist/git-system-tray-macos-aarch64.zip \
+            dist/githoot-tray-macos-aarch64.zip \
             --clobber
 
       - uses: actions/upload-artifact@v4
         with:
           name: asset-macos
-          path: dist/git-system-tray-macos-aarch64.zip
+          path: dist/githoot-tray-macos-aarch64.zip
           if-no-files-found: error
           retention-days: 1
 
@@ -246,7 +246,7 @@ jobs:
           # All three must be present. Hashing two of three would publish a manifest that silently does
           # not cover a platform, and the updater would then refuse that platform with a message about a
           # missing entry rather than the truth.
-          for f in git-system-tray git-system-tray.exe git-system-tray-macos-aarch64.zip; do
+          for f in githoot-tray githoot-tray.exe githoot-tray-macos-aarch64.zip; do
             test -s "dist/$f" || { echo "::error::dist/$f is missing or empty"; exit 1; }
           done
 
@@ -256,7 +256,7 @@ jobs:
           cd dist
           # Plain `sha256sum` format: "<hex>  <name>". The updater matches on the file name only, so
           # running this from inside dist/ keeps the paths bare.
-          sha256sum git-system-tray git-system-tray.exe git-system-tray-macos-aarch64.zip \
+          sha256sum githoot-tray githoot-tray.exe githoot-tray-macos-aarch64.zip \
             > sha256sums.txt
           cat sha256sums.txt
 

@@ -33,10 +33,10 @@ use serde::Deserialize;
 
 /// The repository the updater talks to. Hard-coded rather than configurable: this is the app updating
 /// *itself*, and a settable update source would be a way to talk someone into installing anything.
-const REPO: &str = "HerrDerb/github-trayicon";
+const REPO: &str = "HerrDerb/githoot-tray";
 
 /// Matches the User-Agent the other GitHub-facing modules send.
-const AGENT: &str = "git-system-tray";
+const AGENT: &str = "githoot-tray";
 
 /// How many releases to ask for. The changelog spans every release between the installed version and
 /// the newest, so this also bounds how far back that can reach — someone thirty releases behind gets a
@@ -53,11 +53,11 @@ const RELEASES_PER_PAGE: u32 = 30;
 /// Silicon under Rosetta reports `x86_64`, so it correctly declines instead of installing an
 /// aarch64 bundle over itself.
 const ASSET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-    Some("git-system-tray")
+    Some("githoot-tray")
 } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-    Some("git-system-tray.exe")
+    Some("githoot-tray.exe")
 } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-    Some("git-system-tray-macos-aarch64.zip")
+    Some("githoot-tray-macos-aarch64.zip")
 } else {
     None
 };
@@ -369,7 +369,7 @@ impl ScratchDir {
         let parent = target
             .parent()
             .ok_or_else(|| UpdateError::Local("the install target has no parent directory".into()))?;
-        let dir = parent.join(format!(".git-system-tray-update-{}", std::process::id()));
+        let dir = parent.join(format!(".githoot-tray-update-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)
             .map_err(|e| UpdateError::Local(format!("could not create a staging directory: {e}")))?;
@@ -643,7 +643,7 @@ fn probe_writable(target: &Path) -> Result<(), UpdateError> {
     let parent = target
         .parent()
         .ok_or_else(|| UpdateError::Local("the install target has no parent directory".into()))?;
-    let probe = parent.join(format!(".git-system-tray-probe-{}", std::process::id()));
+    let probe = parent.join(format!(".githoot-tray-probe-{}", std::process::id()));
     let result = std::fs::write(&probe, b"x");
     let _ = std::fs::remove_file(&probe);
     result.map_err(|e| {
@@ -657,7 +657,7 @@ fn probe_writable(target: &Path) -> Result<(), UpdateError> {
 
 /// Where this binary lives, and a refusal if that looks like a build tree.
 ///
-/// Clobbering `target/release/git-system-tray` would mean an update silently overwriting a developer's
+/// Clobbering `target/release/githoot-tray` would mean an update silently overwriting a developer's
 /// own build, which is both surprising and pointless since the next `cargo build` undoes it.
 fn resolve_current_exe() -> Result<PathBuf, UpdateError> {
     let exe = std::env::current_exe()
@@ -694,7 +694,7 @@ pub fn install(available: &Available) -> Result<RestartPlan, UpdateError> {
          from GitHub, replaces this app, and restarts it.",
         available.version, VERSION, available.notes
     );
-    if !crate::dialog::confirm_install("git-system-tray: update available", &prompt) {
+    if !crate::dialog::confirm_install("githoot-tray: update available", &prompt) {
         return Err(UpdateError::Declined);
     }
 
@@ -748,7 +748,7 @@ pub fn restart_target() -> Result<RestartPlan, String> {
 fn install_target(exe: &Path) -> Result<PathBuf, UpdateError> {
     #[cfg(target_os = "macos")]
     {
-        // `…/Foo.app/Contents/MacOS/git-system-tray` → `…/Foo.app`. The whole bundle is replaced rather
+        // `…/Foo.app/Contents/MacOS/githoot-tray` → `…/Foo.app`. The whole bundle is replaced rather
         // than the inner binary, because CI's ad-hoc signature covers `Info.plist`, which carries a
         // per-release version string — dropping a new binary into an old bundle invalidates it.
         let bundle = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent());
@@ -872,7 +872,7 @@ fn install_verified(
         Err(e) => errorln!("could not run codesign ({e}) — continuing on the signature check alone"),
     }
 
-    let inner = extracted.join("Contents/MacOS/git-system-tray");
+    let inner = extracted.join("Contents/MacOS/githoot-tray");
     smoke_test(&inner, &available.version)?;
 
     let backup = with_suffix(target, ".old");
@@ -928,7 +928,7 @@ fn extract_bundle(payload: &Path, into: &Path) -> Result<PathBuf, UpdateError> {
         ));
     }
 
-    // The archive holds `git-system-tray.app` and `README.txt` side by side at the top level, so this
+    // The archive holds `githoot-tray.app` and `README.txt` side by side at the top level, so this
     // looks for the bundle rather than assuming a single entry.
     let entries = std::fs::read_dir(into).map_err(|e| UpdateError::Local(e.to_string()))?;
     for entry in entries.flatten() {
@@ -976,7 +976,7 @@ pub fn clean_up_after_update() {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".git-system-tray-update-") {
+            if name.starts_with(".githoot-tray-update-") {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -1112,10 +1112,10 @@ mod tests {
 
     #[test]
     fn asset_urls_point_at_the_tag_not_at_latest() {
-        let url = asset_url("v1.4.0", "git-system-tray");
+        let url = asset_url("v1.4.0", "githoot-tray");
         assert_eq!(
             url,
-            "https://github.com/HerrDerb/github-trayicon/releases/download/v1.4.0/git-system-tray"
+            "https://github.com/HerrDerb/githoot-tray/releases/download/v1.4.0/githoot-tray"
         );
         assert!(url.starts_with("https://"), "the scheme must never be interpolated");
     }
@@ -1131,6 +1131,12 @@ mod tests {
     // tests are what prove `minisign-verify` accepts that.
 
     const FIXTURE_KEY: &str = "RWRSP1s7ph02lSgOjs/sRoqD96ZfhLGQiWDuvACDyGTGaUR9uNujah6q";
+    /// The asset names below are **payload bytes covered by `FIXTURE_SIG`**, not brand occurrences.
+    /// They deliberately keep the app's former `git-system-tray` naming: the signature was produced
+    /// over exactly these bytes with a throwaway key whose secret half is not in the repository, so
+    /// editing a single character here — including renaming the app — invalidates the signature and
+    /// there is no way to re-sign. What the fixture pins down is the minisign format handshake, which
+    /// does not care what the file names say.
     const FIXTURE_SUMS: &str = "aaaa1111  git-system-tray\nbbbb2222  git-system-tray.exe\n";
     const FIXTURE_SIG: &str = "untrusted comment: signature from rsign secret key\nRURSP1s7ph02lQCwMH52Gi3Zoh1jG+gtapvj6PYMIoILCxU0MAnfmJQAEdkSX9Hh3L0A8cPvB2UECff7s0T2zjDKBUZeIqyy4Qw=\ntrusted comment: timestamp:1786700573\tfile:sums.txt\tprehashed\nH1ON98b2Caza1va3kteJKdWdtKn35NZKV1zZNUsRForYSSaEl+rstQqlTvkBmYvTR8pDYahUhPLn5dz1g8BZCA==\n";
 
@@ -1268,6 +1274,7 @@ mod tests {
 
     #[test]
     fn digests_are_looked_up_by_file_name() {
+        // The names are the fixture's own — see `FIXTURE_SUMS`, whose bytes are frozen by a signature.
         assert_eq!(digest_for(FIXTURE_SUMS, "git-system-tray").unwrap(), "aaaa1111");
         assert_eq!(digest_for(FIXTURE_SUMS, "git-system-tray.exe").unwrap(), "bbbb2222");
         // An asset the signed manifest does not cover is an integrity failure, not a skipped check.
@@ -1290,9 +1297,9 @@ mod tests {
     #[test]
     fn asset_selection_matches_the_published_matrix() {
         let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => Some("git-system-tray"),
-            ("windows", "x86_64") => Some("git-system-tray.exe"),
-            ("macos", "aarch64") => Some("git-system-tray-macos-aarch64.zip"),
+            ("linux", "x86_64") => Some("githoot-tray"),
+            ("windows", "x86_64") => Some("githoot-tray.exe"),
+            ("macos", "aarch64") => Some("githoot-tray-macos-aarch64.zip"),
             _ => None,
         };
         assert_eq!(ASSET, expected);

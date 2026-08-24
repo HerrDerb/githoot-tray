@@ -22,7 +22,7 @@ const CLIENT_ID_FILE: &str = "client_id.txt";
 const CLIENT_ID_PLACEHOLDER: &str = "YOUR_CLIENT_ID_HERE";
 
 const NOTIFICATION_SCOPE: &str = "notifications";
-const AGENT: &str = "git-system-tray";
+const AGENT: &str = "githoot-tray";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 

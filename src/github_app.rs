@@ -51,7 +51,7 @@ const CLIENT_ID_ENV: &str = "GITHUB_APP_CLIENT_ID";
 const CLIENT_ID: &str = "Iv23lipB1miHw6m9SG6n";
 
 const PR_TOKEN_FILE: &str = "pr_token.txt";
-const AGENT: &str = "git-system-tray";
+const AGENT: &str = "githoot-tray";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 

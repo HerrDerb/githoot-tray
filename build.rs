@@ -2,7 +2,7 @@
 //!
 //! ## Why this file exists
 //!
-//! The shipped `git-system-tray.exe` was flagged by Windows Defender as
+//! The shipped `githoot-tray.exe` was flagged by Windows Defender as
 //! `Trojan:Win32/Bearfoos.B!ml`. That verdict was a confirmed false positive — the flagged bytes
 //! hashed to exactly the digest in the release's minisign-signed `sha256sums.txt` — but `!ml` means
 //! a machine-learning model, and the model scores features. The binary was carrying an unusually bad
@@ -31,7 +31,7 @@
 //!
 //! ## The version, and why `rerun-if-env-changed` is load-bearing
 //!
-//! `src/version.rs` prefers `GST_VERSION` (the git tag, injected by CI) over `Cargo.toml`, and notes
+//! `src/version.rs` prefers `GHT_VERSION` (the git tag, injected by CI) over `Cargo.toml`, and notes
 //! that `option_env!` is folded into the crate fingerprint automatically so no build script is needed
 //! for *that*. True for the Rust constant, not for this file: a build script is only re-run when
 //! Cargo is told what it depends on. Without the line below, changing the tag would rebuild
@@ -42,9 +42,9 @@ fn main() {
     // Emitted unconditionally, on every host. If these lines were inside the Windows branch, a Linux
     // build would register no dependencies at all, and a later Windows build in the same tree could
     // reuse a stale script output.
-    println!("cargo:rerun-if-env-changed=GST_VERSION");
+    println!("cargo:rerun-if-env-changed=GHT_VERSION");
     println!("cargo:rerun-if-changed=assets/tray.png");
-    println!("cargo:rerun-if-changed=windows/git-system-tray.manifest");
+    println!("cargo:rerun-if-changed=windows/githoot-tray.manifest");
 
     #[cfg(windows)]
     windows_resource();
@@ -70,21 +70,21 @@ fn windows_resource() {
 
     // The string block. Explorer shows these; so does every "what is this process" tool.
     res.set("CompanyName", "HerrDerb");
-    res.set("ProductName", "git-system-tray");
+    res.set("ProductName", "githoot-tray");
     res.set(
         "FileDescription",
-        "git-system-tray - GitHub pull request tray icon",
+        "githoot-tray - GitHub pull request tray icon",
     );
     // Matches LICENSE, which is the Unlicense. Stating a real licence rather than a plausible
     // copyright line matters: this is the field a compliance scan reads.
     res.set("LegalCopyright", "Public domain (Unlicense)");
-    res.set("OriginalFilename", "git-system-tray.exe");
+    res.set("OriginalFilename", "githoot-tray.exe");
     // Text form of the same numbers. Windows does not enforce that the two agree, and this is the one
     // a human sees, so it is derived from the same parse rather than typed separately.
     res.set("FileVersion", &format!("{major}.{minor}.{patch}.0"));
     res.set("ProductVersion", &format!("{major}.{minor}.{patch}.0"));
 
-    res.set_manifest_file("windows/git-system-tray.manifest");
+    res.set_manifest_file("windows/githoot-tray.manifest");
 
     let icon = generate_icon();
     // A failure here must not be fatal: the icon is cosmetic, while the manifest and VERSIONINFO are
@@ -114,7 +114,7 @@ fn windows_resource() {
 /// and `src/version.rs` is `const`-evaluated at compile time, so there is nothing to share.
 #[cfg(windows)]
 fn resolve_version() -> String {
-    match std::env::var("GST_VERSION") {
+    match std::env::var("GHT_VERSION") {
         Ok(v) if !v.trim().is_empty() => v.trim().trim_start_matches('v').to_string(),
         // `CARGO_PKG_VERSION` is always set for a build script, so this is the `Cargo.toml` fallback
         // a local build takes, matching `env!("CARGO_PKG_VERSION")` in `src/version.rs`.
@@ -153,7 +153,7 @@ fn generate_icon() -> Result<String, Box<dyn std::error::Error>> {
     use image::codecs::ico::IcoEncoder;
 
     let out_dir = std::env::var("OUT_DIR")?;
-    let ico_path = std::path::Path::new(&out_dir).join("git-system-tray.ico");
+    let ico_path = std::path::Path::new(&out_dir).join("githoot-tray.ico");
 
     let src = image::load_from_memory(&std::fs::read("assets/tray.png")?)?;
     let square = src.resize_exact(64, 64, image::imageops::FilterType::Lanczos3);

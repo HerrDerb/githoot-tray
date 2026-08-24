@@ -8,7 +8,7 @@
 # — wrong for something whose whole UI is one status item.
 #
 # Usage: scripts/bundle-macos.sh <binary> <out-dir> <version>
-#   e.g. scripts/bundle-macos.sh target/release/git-system-tray dist 1.4.1
+#   e.g. scripts/bundle-macos.sh target/release/githoot-tray dist 1.4.1
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ BIN="${1:?$USAGE}"
 OUT="${2:?$USAGE}"
 VERSION="${3:?$USAGE}"
 
-NAME="git-system-tray"
-BUNDLE_ID="com.github.herrderb.git-system-tray"
+NAME="githoot-tray"
+BUNDLE_ID="com.github.herrderb.githoot-tray"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 APP="$OUT/$NAME.app"
@@ -53,7 +53,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleName</key>
 	<string>$NAME</string>
 	<key>CFBundleDisplayName</key>
-	<string>GitHub Tray Icon</string>
+	<string>GitHoot Tray</string>
 	<key>CFBundleIdentifier</key>
 	<string>$BUNDLE_ID</string>
 	<key>CFBundleExecutable</key>
@@ -126,7 +126,7 @@ mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/$NAME.app"
 
 cat > "$STAGE/README.txt" <<TXT
-git-system-tray $VERSION (macOS, Apple Silicon)
+githoot-tray $VERSION (macOS, Apple Silicon)
 ================================================
 
 This build is ad-hoc signed, not notarized -- that would need a paid Apple Developer
@@ -134,8 +134,8 @@ account -- so Gatekeeper quarantines it after download and refuses to open it.
 
 Clear the quarantine flag once, then launch normally:
 
-    xattr -dr com.apple.quarantine git-system-tray.app
-    open git-system-tray.app
+    xattr -dr com.apple.quarantine githoot-tray.app
+    open githoot-tray.app
 
 Notes:
 - For the review indicator to work, gh must be findable. An app launched from Finder

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--
-  Application manifest for git-system-tray.
+  Application manifest for githoot-tray.
 
   Two of the three things declared here are only worth having because the binary was flagged as
   `Trojan:Win32/Bearfoos.B!ml`: an unsigned PE with no manifest at all declares no OS support and no
@@ -16,7 +16,7 @@
   -->
   <assemblyIdentity
       type="win32"
-      name="HerrDerb.git-system-tray"
+      name="HerrDerb.githoot-tray"
       version="1.0.0.0"
       processorArchitecture="amd64"/>
 

@@ -386,7 +386,7 @@ mod confirm_tests {
     #[ignore = "needs a real desktop session and a human to click"]
     fn shows_a_two_button_dialog() {
         let accepted = confirm(
-            "git-system-tray: dialog self-test",
+            "githoot-tray: dialog self-test",
             &format!("Click \"{OPEN_WEBSITE_LABEL}\" for this test to pass."),
             OPEN_WEBSITE_LABEL,
             "Close",
@@ -450,7 +450,7 @@ mod clipboard_tests {
     #[test]
     #[ignore = "needs a real clipboard/display session"]
     fn copies_text_that_can_be_read_back() {
-        let marker = format!("git-system-tray-clipboard-test-{}", std::process::id());
+        let marker = format!("githoot-tray-clipboard-test-{}", std::process::id());
         copy_to_clipboard(&marker);
 
         let read_back = arboard::Clipboard::new()

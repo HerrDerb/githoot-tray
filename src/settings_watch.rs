@@ -217,7 +217,7 @@ fn watch(path: &std::path::Path, restart: impl Fn(RestartPlan)) {
 
         infoln!("settings changed — asking whether to restart");
         let accepted = crate::dialog::confirm_restart(
-            "git-system-tray: settings changed",
+            "githoot-tray: settings changed",
             "Settings are only read when the app starts.\n\nRestart now to apply them?",
         );
         if !accepted {
@@ -230,7 +230,7 @@ fn watch(path: &std::path::Path, restart: impl Fn(RestartPlan)) {
             // Nothing has been changed on disk, so there is nothing to undo — say so and leave the
             // running app alone.
             Err(e) => crate::dialog::report(
-                "git-system-tray: could not restart",
+                "githoot-tray: could not restart",
                 &format!("{e}\n\nThe new settings will apply the next time you start the app."),
             ),
         }
