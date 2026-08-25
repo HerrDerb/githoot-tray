@@ -27,6 +27,7 @@ const KEY_REVIEW_REQUESTED: &str = "reviewRequested";
 const KEY_READY_TO_MERGE: &str = "readyToMerge";
 const KEY_CHANGES_REQUESTED: &str = "changesRequested";
 const KEY_LOG_LEVEL: &str = "logLevel";
+const KEY_SOUND: &str = "sound";
 
 /// Keys that used to work, paired with what replaced them.
 ///
@@ -52,6 +53,11 @@ pub struct Config {
     /// entries silently swaps which bar a setting controls — it compiles, type-checks, and is
     /// visible only by looking at the tray.
     pr_enabled: [bool; 3],
+    /// Whether a PR arriving plays the hoot. On unless explicitly turned off — see `sound`.
+    ///
+    /// Only the *sound* is switched off. The icon, the tooltip and the menu counts are untouched, so
+    /// silencing this loses nothing but the noise, which is why it needs no more than one flag.
+    pub sound: bool,
     /// How much detail the log file carries. `Error` by default — only failures — so the file stays
     /// quiet and readable; set `logLevel=info` to add the lifecycle narration when diagnosing.
     pub log_level: Level,
@@ -98,6 +104,9 @@ impl Config {
             // Built by mapping over the axes rather than as a literal, so the axis name appears on
             // both sides of each pairing and the three cannot be written in the wrong order.
             pr_enabled: PrAxis::ALL.map(|axis| !values.get(pr_key(axis)).is_some_and(|v| is_off(v))),
+            // Default **on**, for the reason `update_check` is: a notification sound nobody knows
+            // about does not notify. `is_off` rather than `!is_on`, so `sound=onn` stays on.
+            sound: !values.get(KEY_SOUND).is_some_and(|v| is_off(v)),
             // Unrecognised (or absent) falls back to the quiet default, the same way a typo'd bool
             // does — see `Level::parse`.
             log_level: values.get(KEY_LOG_LEVEL).and_then(|v| Level::parse(v)).unwrap_or(Level::Error),
@@ -156,6 +165,10 @@ fn default_config() -> String {
          {KEY_READY_TO_MERGE}=on\n\
          {KEY_CHANGES_REQUESTED}=on\n\
          \n\
+         # Play a short hoot when a pull-request signal goes from none to some. Only the sound is
+         # affected: the icon, tooltip and counts behave the same either way.
+         {KEY_SOUND}=on
+         
          # How much the log file records. \"error\" (the default) logs only failures; \"info\" adds\n\
          # the normal lifecycle detail (startup, sign-in, updates, each poll) for diagnosing.\n\
          {KEY_LOG_LEVEL}=error\n"
@@ -294,11 +307,12 @@ mod tests {
         assert_eq!(values.get(KEY_UPDATE_CHECK), Some(&"on"));
         assert_eq!(values.get(KEY_NOTIFICATION_INDICATION), Some(&"off"));
         assert_eq!(values.get(KEY_LOG_LEVEL), Some(&"error"));
+        assert_eq!(values.get(KEY_SOUND), Some(&"on"));
         for axis in PrAxis::ALL {
             assert_eq!(values.get(pr_key(axis)), Some(&"on"), "{axis:?}");
         }
         // And nothing else, so a key added to the template without being read is caught.
-        assert_eq!(values.len(), 6, "unexpected keys in the template: {values:?}");
+        assert_eq!(values.len(), 7, "unexpected keys in the template: {values:?}");
     }
 
     /// Every key the template writes must be one `load` actually reads. A key present in the file
@@ -312,10 +326,43 @@ mod tests {
             KEY_READY_TO_MERGE,
             KEY_CHANGES_REQUESTED,
             KEY_LOG_LEVEL,
+            KEY_SOUND,
         ];
         let text = default_config();
         for key in parse(&text).keys() {
             assert!(known.contains(key), "{key:?} is written but never read");
+        }
+    }
+
+    // ── The hoot switch ─────────────────────────────────────────────────────
+
+    fn values(content: &str) -> Config {
+        Config::from_values(&parse(content))
+    }
+
+    /// Default on: the hoot is the feature someone just asked for, and a notification sound that is
+    /// off until you find the setting does not do its job — the same reasoning as `updateCheck`.
+    #[test]
+    fn sound_is_on_when_the_key_is_absent() {
+        assert!(values("").sound, "an empty config must leave the hoot on");
+        assert!(values("other=off
+").sound);
+    }
+
+    #[test]
+    fn sound_is_off_only_when_explicitly_turned_off() {
+        for v in ["off", "Off", "FALSE", "0", "no"] {
+            assert!(!values(&format!("sound={v}
+")).sound, "sound={v} must silence it");
+        }
+    }
+
+    /// A default-on flag must survive a typo, or someone confirming the setting turns it off.
+    #[test]
+    fn a_mistyped_sound_value_leaves_the_hoot_on() {
+        for v in ["offf", "yse", "", "quiet"] {
+            assert!(values(&format!("sound={v}
+")).sound, "sound={v} must not silence it");
         }
     }
 

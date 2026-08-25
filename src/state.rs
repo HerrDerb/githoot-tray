@@ -263,6 +263,19 @@ struct Track {
     detail: Option<String>,
     count: Option<u32>,
     needs_reauth: bool,
+    /// Nothing has just turned into something, and nobody has been told yet.
+    ///
+    /// Latched rather than derived, because the only caller reads it once per cycle and the edge it
+    /// describes exists only between two `apply` calls. See `PollState::take_pr_arrivals` for which
+    /// transitions count.
+    arrived: bool,
+    /// Whether this track has ever had a confirmed answer, of either kind.
+    ///
+    /// Exists to tell the two `Unknown`s apart. `value == Unknown` covers both "we have not asked yet"
+    /// (a launch, which *is* news when it finds something) and "we asked and lost track" (a failure
+    /// streak, which is not). Nothing else can distinguish them, because both look identical in
+    /// `value`, and `failures` is reset by the very response that would need to consult it.
+    ever_confirmed: bool,
 }
 
 impl Track {
@@ -275,6 +288,8 @@ impl Track {
             detail: Some("starting up".to_string()),
             count: None,
             needs_reauth: false,
+            arrived: false,
+            ever_confirmed: false,
         }
     }
 
@@ -285,7 +300,17 @@ impl Track {
                 self.count = count;
                 self.failures = 0;
                 self.detail = None;
+                // Both reads happen before their writes. `No` is a known-empty axis filling up;
+                // `!ever_confirmed` is the first answer of a launch, which is news for the same
+                // reason even though what it replaced was `Unknown`. A recovered failure streak is
+                // neither: it is `Unknown` on a track that has already spoken.
+                let was_confirmed_absent = self.value == Presence::No;
+                let is_first_answer = !self.ever_confirmed;
+                self.ever_confirmed = true;
                 self.value = if present { Presence::Yes } else { Presence::No };
+                if present && (was_confirmed_absent || is_first_answer) {
+                    self.arrived = true;
+                }
                 None
             }
 
@@ -553,6 +578,36 @@ impl PollState {
         let Some(track) = self.pr[axis.index()].as_mut() else { return };
         let forced = track.apply(response.result);
         self.record_forced(forced);
+    }
+
+    /// Which PR axes have just gone from a confirmed zero to a confirmed one or more, indexed by
+    /// `PrAxis::index`, consuming the flags as it reads them.
+    ///
+    /// ## Which transitions count
+    ///
+    /// Two of them, and the difference between them is the point:
+    ///
+    /// - `No` -> `Yes`: a known-empty axis filling up. The plain case.
+    /// - The **first** confirmed answer of the process, when it is `Yes`. What it replaced was
+    ///   `Unknown`, not a known zero, so this is not strictly a 0-to-1 edge — but starting the app and
+    ///   finding PRs already waiting is exactly when the user wants telling, and staying silent there
+    ///   would mean the hoot only ever worked for people who left the app running.
+    ///
+    /// What deliberately does **not** count is the other `Unknown` -> `Yes`: a failure streak
+    /// recovering. It looks identical in `value`, which is why `Track::ever_confirmed` exists to tell
+    /// them apart. That axis has already had its say, so re-announcing a number the user has seen
+    /// would make every network blip a hoot. `NotModified` cannot arrive either, by construction: it
+    /// means nothing changed.
+    ///
+    /// ## Why taking, rather than asking
+    ///
+    /// The edge exists between two `apply` calls, not in the state itself, so a plain getter would
+    /// either re-announce the same arrival on every later cycle or need a second call to clear it.
+    /// One `take` cannot be read twice by mistake.
+    pub fn take_pr_arrivals(&mut self) -> [bool; 3] {
+        std::array::from_fn(|i| {
+            self.pr[i].as_mut().is_some_and(|track| std::mem::take(&mut track.arrived))
+        })
     }
 
     fn learn_pacing(&mut self, response: &PollResponse) {
@@ -1720,5 +1775,113 @@ mod tests {
 
         state.apply_notifications(fresh(false));
         assert!(!state.icon().shows_exclamation(), "a recovered poll must take the mark down");
+    }
+
+    // ─── Rising-edge arrivals (the hoot) ──────────────────────────────────────
+
+    /// The whole point: a *confirmed* zero turning into a confirmed one or more is news, and it is
+    /// news exactly once.
+    #[test]
+    fn a_confirmed_zero_to_one_is_an_arrival_reported_once() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(0));
+        assert_eq!(state.take_pr_arrivals(), [false; 3], "settling on zero is not an arrival");
+
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(1));
+        assert_eq!(state.take_pr_arrivals(), [true, false, false], "0 to 1 must be reported");
+        assert_eq!(state.take_pr_arrivals(), [false; 3], "taking it must consume it");
+    }
+
+    /// 1 to 2 is not the transition asked for. Only the quiet-to-busy edge is.
+    #[test]
+    fn a_growing_count_is_not_a_second_arrival() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(0));
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(1));
+        assert_eq!(state.take_pr_arrivals(), [true, false, false]);
+
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(4));
+        assert_eq!(state.take_pr_arrivals(), [false; 3], "still busy is not newly busy");
+    }
+
+    /// And it can fire again after the axis has genuinely gone quiet.
+    #[test]
+    fn going_quiet_re_arms_the_arrival() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(1));
+        let _ = state.take_pr_arrivals();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(0));
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(2));
+        assert_eq!(state.take_pr_arrivals(), [true, false, false]);
+    }
+
+    /// The first confirmed answer of a launch counts, even though what it replaced was `Unknown`
+    /// rather than a known zero: starting the app and finding PRs already waiting is exactly when the
+    /// user wants telling.
+    #[test]
+    fn the_first_poll_of_a_launch_hoots_when_prs_are_already_waiting() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(3));
+        assert_eq!(state.take_pr_arrivals(), [true, false, false], "a launch into a full queue hoots");
+    }
+
+    /// But only once. The second poll of that same launch has nothing new to say.
+    #[test]
+    fn the_launch_hoot_does_not_repeat_on_the_next_poll() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(3));
+        let _ = state.take_pr_arrivals();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(3));
+        assert_eq!(state.take_pr_arrivals(), [false; 3]);
+    }
+
+    /// And a launch into an empty queue is silent, which is what makes the hoot mean something.
+    #[test]
+    fn a_launch_into_an_empty_queue_is_silent() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(0));
+        assert_eq!(state.take_pr_arrivals(), [false; 3]);
+    }
+
+    /// A failure streak is the one `Unknown` that stays silent: unlike a launch, this axis has already
+    /// had its say, so coming back from "we lost track" is re-reading a number the user has seen.
+    #[test]
+    fn recovering_from_unknown_is_not_an_arrival() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(0));
+        state.apply_pr(PrAxis::ReviewRequested, respond(PollResult::Unauthorized));
+        let _ = state.take_pr_arrivals();
+        state.apply_pr(PrAxis::ReviewRequested, fresh_count(1));
+        assert_eq!(state.take_pr_arrivals(), [false; 3], "unknown to present is not zero to one");
+    }
+
+    /// A 304 says nothing changed, so it cannot be an arrival either.
+    #[test]
+    fn not_modified_is_not_an_arrival() {
+        let mut state = PollState::new(false, [true; 3]);
+        state.apply_pr(PrAxis::ReadyToMerge, fresh_count(0));
+        state.apply_pr(PrAxis::ReadyToMerge, respond(PollResult::NotModified));
+        assert_eq!(state.take_pr_arrivals(), [false; 3]);
+    }
+
+    /// Each axis reports for itself, in `PrAxis::index` order.
+    #[test]
+    fn axes_report_arrivals_independently() {
+        let mut state = PollState::new(false, [true; 3]);
+        for axis in PrAxis::ALL {
+            state.apply_pr(axis, fresh_count(0));
+        }
+        let _ = state.take_pr_arrivals();
+        state.apply_pr(PrAxis::ChangesRequested, fresh_count(1));
+        assert_eq!(state.take_pr_arrivals(), [false, false, true]);
+    }
+
+    /// Notifications are not a PR axis and must never show up in the array.
+    #[test]
+    fn notifications_are_not_a_pr_arrival() {
+        let mut state = PollState::new(true, [true; 3]);
+        state.apply_notifications(fresh(false));
+        state.apply_notifications(fresh(true));
+        assert_eq!(state.take_pr_arrivals(), [false; 3]);
     }
 }

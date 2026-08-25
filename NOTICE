@@ -1,0 +1,39 @@
+Third-party assets bundled with GitHoot Tray
+============================================
+
+The source code of this project is dedicated to the public domain under The
+Unlicense; see LICENSE. That dedication covers the code and the icons in
+`assets/`, which were drawn for this project.
+
+It does NOT cover the file listed below, which is third-party content used
+under someone else's terms. It is bundled here (and compiled into the released
+binaries via `include_bytes!` in `src/sound.rs`) with the attribution its
+licence requires, and with the restriction that licence carries.
+
+
+assets/hoot.mp3 — the notification sound
+----------------------------------------
+
+Sound effect by elevenlabs.io, obtained from the ElevenLabs free sound-effects
+library <https://elevenlabs.io/sound-effects/free>.
+
+ElevenLabs' free plan requires attribution to elevenlabs.io, which this file
+provides, and permits non-commercial use only. GitHoot Tray is a non-commercial
+personal project, which is the basis on which the clip is used here.
+
+What that means for you, if you are not the author of this project:
+
+  * Using or modifying GitHoot Tray for non-commercial purposes: fine, keep
+    this attribution with it.
+
+  * Any commercial use — selling the app, bundling it in a paid product,
+    shipping it as part of a commercial offering — is NOT granted for this
+    file, notwithstanding the public-domain dedication in LICENSE, because it
+    was never the project author's to grant. Either obtain your own commercial
+    licence from ElevenLabs, or replace `assets/hoot.mp3` with a clip you may
+    use commercially. The code reads whatever is at that path at build time, so
+    replacing it is a one-file change and needs no code edit.
+
+ElevenLabs' terms are the authority on their own licence, not this file:
+  <https://elevenlabs.io/terms-of-use>
+  <https://elevenlabs.io/docs/help-center/legal/can-i-publish-the-content-i-generate-on-the-platform>

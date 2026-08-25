@@ -16,7 +16,9 @@ Nothing here shells out to the `gh` CLI; every credential comes from GitHub's ow
 
 ## Icons
 
-Everything is composited at runtime, so `assets/` holds two files and the variants cannot drift apart.
+Everything is composited at runtime, so `assets/` holds two image files and the variants cannot drift
+apart. (A third file lives there, `hoot.mp3` — the notification sound, not an icon, and the only
+bundled file that is not this project's own work: see [NOTICE](NOTICE).)
 
 The base glyph is an owl, drawn for this project: the thing that sits still and watches so you do
 not have to. It used to be GitHub's Invertocat, which is their trademark and not this app's to wear
@@ -188,6 +190,7 @@ appear in it, and the table below is the complete list.
 | `reviewRequested` | `on` | The red bar |
 | `readyToMerge` | `on` | The green bar |
 | `changesRequested` | `on` | The amber bar |
+| `sound` | `on` | Play the hoot when a PR signal goes from none to some |
 | `logLevel` | `error` | How much `log.txt` records: `error` logs only failures, `info` adds lifecycle detail for diagnosing |
 
 Only `off`, `false`, `0` or `no` switch something off; anything else leaves the default, so a typo cannot
@@ -287,6 +290,41 @@ checks once at startup and turns the bars off with an explanation instead of gue
 
 The credential renews itself — proactively before expiry, and reactively if GitHub rejects it. Only when a
 renewal needs a browser does the exclamation come back.
+
+---
+
+## The hoot
+
+When a PR signal goes from **none to some**, the app plays a short hoot. Each of the three axes hoots for
+itself: reviews requested of you, your PRs ready to merge, your PRs with changes requested.
+
+Only that one edge. Going from one PR to four does not hoot again — you already know, and the count is in
+the tooltip and the menu. It re-arms once the axis has genuinely gone back to zero.
+
+Launching into a queue that already has PRs in it hoots too, once. Strictly that is not a 0-to-1 edge —
+the app knew nothing before it asked — but it is the moment you want telling, and staying silent there
+would mean the hoot only ever worked for people who left the app running.
+
+One case stays deliberately silent: an axis recovering from a run of failed polls. It looks identical to
+a launch from the inside — "we do not know" either way — but that axis has already had its say, and the
+PRs it comes back with are a number you have seen. Hooting there would turn every network blip into a
+notification.
+
+The clip is embedded in the binary, unpacked once per run into the system temp directory, and played by
+whatever the platform already has: `winmm` (MCI) on Windows, `afplay` on macOS, and the first of `mpv`,
+`ffplay`, `mpg123`, `gst-play-1.0` or `cvlc` that is installed on Linux. So no audio crate joins the
+dependency tree for one short sound, and a Linux box with none of those players stays silent with a line
+in the log rather than failing. Playback runs on its own thread and never delays a poll; hoots that
+overlap are dropped rather than layered.
+
+Set `sound=off` in `config.txt` to silence it. That switches off the sound and nothing else — the icon,
+the tooltip and the menu counts behave identically either way, so silence costs no information. There is
+no volume setting; the system mixer is the only control over how loud it is.
+
+The clip is a sound effect by [elevenlabs.io](https://elevenlabs.io/sound-effects/free), used under
+their free plan: attribution required, non-commercial use only. It is the one file in this repository
+the public-domain dedication does not cover — see [NOTICE](NOTICE) before using this app for anything
+commercial.
 
 ---
 
@@ -482,4 +520,11 @@ Launching a second copy shows a notice and exits (Windows; macOS handles it itse
 
 ## License
 
-[The Unlicense](LICENSE) — public domain, no restrictions.
+[The Unlicense](LICENSE) — public domain, no restrictions. That covers the code and the icons, which
+were drawn for this project.
+
+One exception, listed in [NOTICE](NOTICE): `assets/hoot.mp3` is a sound effect by
+[elevenlabs.io](https://elevenlabs.io/sound-effects/free), used under their free plan, which requires
+attribution and permits non-commercial use only. This project is non-commercial, so that is the basis
+it is used on here — but a commercial use of GitHoot Tray needs its own licence for that clip, or a
+replacement file. Nothing in the code cares which clip is at that path.

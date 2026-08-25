@@ -14,6 +14,7 @@ mod icons;
 mod log;
 mod scheduler;
 mod settings_watch;
+mod sound;
 mod state;
 mod update;
 mod version;
@@ -397,6 +398,7 @@ fn main() {
             // sides of each pairing. A literal `[a, b, c]` compiles, type-checks, and silently swaps
             // which bar a setting controls.
             pr_enabled: state::PrAxis::ALL.map(|axis| config.pr_enabled(axis)),
+            sound: config.sound,
         },
         wake_rx,
         restart_tx,
@@ -803,6 +805,7 @@ fn main() {
             // sides of each pairing. A literal `[a, b, c]` compiles, type-checks, and silently swaps
             // which bar a setting controls.
             pr_enabled: state::PrAxis::ALL.map(|axis| config.pr_enabled(axis)),
+            sound: config.sound,
         },
         wake_rx,
         proxy,

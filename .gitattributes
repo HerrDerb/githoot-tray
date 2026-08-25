@@ -2,3 +2,9 @@
 # Windows, where `core.autocrlf=true` would otherwise hand macOS a script whose shebang line ends in
 # a carriage return — which fails as `bad interpreter: /usr/bin/env bash^M`.
 *.sh text eol=lf
+
+# The bundled assets are binary, said explicitly rather than left to Git's NUL-byte heuristic. This
+# repo is developed with core.autocrlf=true, and a single mangled byte in an icon or the hoot is a
+# corrupt file that still builds — `include_bytes!` takes whatever is there.
+*.png binary
+*.mp3 binary

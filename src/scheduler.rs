@@ -199,6 +199,11 @@ pub struct PollInputs {
     /// The **configuration only**, never ANDed with whether a credential exists. See
     /// `PollState::new` for what folding those two together would break.
     pub pr_enabled: [bool; 3],
+    /// Whether an arriving PR plays the hoot. See `config::Config::sound`.
+    ///
+    /// Checked at the call site rather than inside `sound::hoot`, so the module stays a plain "play
+    /// this" with no opinion about settings, and the loop's own log line is silent too when it is off.
+    pub sound: bool,
 }
 
 // ─── Shared polling core ──────────────────────────────────────────────────────
@@ -237,6 +242,7 @@ fn run_poll_loop(
         app_asset_path,
         update_check: update_check_enabled,
         pr_enabled,
+        sound: sound_enabled,
     } = inputs;
     let client = match github::build_client() {
         Ok(client) => client,
@@ -348,6 +354,15 @@ fn run_poll_loop(
             }
         }
 
+        // Read here, right after the axes were applied, rather than after `emit`: the flags belong to
+        // this cycle's responses, and taking them next to the code that produced them is what keeps
+        // "0 -> 1" meaning one poll's worth of change. The sound itself waits until after `emit`.
+        //
+        // Taken unconditionally, even with the sound off, so the latch cannot accumulate. Turning the
+        // sound back on takes a restart (see `settings_watch`), which would clear it anyway — but a
+        // drain that depends on a setting is a stale-state bug waiting for the day it does not.
+        let arrivals = state.take_pr_arrivals();
+
         let icon = state.icon();
         let tooltip = state.tooltip();
         let pr_labels = std::array::from_fn(|i| {
@@ -359,6 +374,21 @@ fn run_poll_loop(
         let update_label = state.update_menu_label();
         if !emit(Update { icon, tooltip: tooltip.clone(), pr_labels, update_label }) {
             return; // UI has gone away
+        }
+
+        // ── The hoot ─────────────────────────────────────────────────────────
+        // After `emit`, so the icon is already showing what the sound is about — a hoot with nothing
+        // to look at yet would send the user to a tray that has not caught up. One hoot even when two
+        // or three axes turn over in the same cycle: `crate::sound::hoot` drops overlapping plays
+        // anyway, and three of the same clip at once is a noise rather than a notification.
+        if sound_enabled && arrivals.iter().any(|&arrived| arrived) {
+            let axes: Vec<&str> = PrAxis::ALL
+                .iter()
+                .filter(|axis| arrivals[axis.index()])
+                .map(|axis| axis.menu_label())
+                .collect();
+            infoln!("hooting: {}", axes.join(", "));
+            crate::sound::hoot();
         }
 
         // ── Is there a newer release? ────────────────────────────────────────
