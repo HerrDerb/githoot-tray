@@ -103,10 +103,12 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: githoot-tray.exe
+            legacy: git-system-tray.exe
 
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: githoot-tray
+            legacy: git-system-tray
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -139,14 +141,30 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
         shell: bash
 
-      - name: Attach binary to the draft release
+      # Staged under both names, and the legacy one is not decoration. The self-updater's asset name is
+      # baked in at compile time, so every copy installed before the githoot-tray rename (b84ccd8) asks
+      # for `git-system-tray*` and then looks that name up in the signed manifest. v1.9.0 published only
+      # the new names, so those copies refuse the download with "no entry in the signed sums file" - and
+      # a published release is immutable, so that release can never be repaired. Publishing both names is
+      # the only way to unstick them; `tests/release_assets.rs` guards it and carries the sunset note.
+      - name: Stage the binary under its current and legacy names
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.artifact }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.legacy }}"
+
+      - name: Attach binaries to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          set -euo pipefail
           gh release upload "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
-            "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
+            "dist/${{ matrix.artifact }}" \
+            "dist/${{ matrix.legacy }}" \
             --clobber
 
       # Also handed to the sign job as a workflow artifact, rather than having it download from the
@@ -156,7 +174,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: asset-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.legacy }}
           if-no-files-found: error
           retention-days: 1
 
@@ -196,19 +216,27 @@ jobs:
             dist \
             "${GITHUB_REF_NAME#v}"
 
-      - name: Attach bundle to the draft release
+      # Same legacy-name shim as the Windows and Linux builds above; see the comment there.
+      - name: Stage the bundle under its legacy name too
+        run: cp dist/githoot-tray-macos-aarch64.zip dist/git-system-tray-macos-aarch64.zip
+
+      - name: Attach bundles to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           gh release upload "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             dist/githoot-tray-macos-aarch64.zip \
+            dist/git-system-tray-macos-aarch64.zip \
             --clobber
 
       - uses: actions/upload-artifact@v4
         with:
           name: asset-macos
-          path: dist/githoot-tray-macos-aarch64.zip
+          path: |
+            dist/githoot-tray-macos-aarch64.zip
+            dist/git-system-tray-macos-aarch64.zip
           if-no-files-found: error
           retention-days: 1
 
@@ -246,7 +274,8 @@ jobs:
           # All three must be present. Hashing two of three would publish a manifest that silently does
           # not cover a platform, and the updater would then refuse that platform with a message about a
           # missing entry rather than the truth.
-          for f in githoot-tray githoot-tray.exe githoot-tray-macos-aarch64.zip; do
+          for f in githoot-tray githoot-tray.exe githoot-tray-macos-aarch64.zip \
+                   git-system-tray git-system-tray.exe git-system-tray-macos-aarch64.zip; do
             test -s "dist/$f" || { echo "::error::dist/$f is missing or empty"; exit 1; }
           done
 
@@ -256,7 +285,10 @@ jobs:
           cd dist
           # Plain `sha256sum` format: "<hex>  <name>". The updater matches on the file name only, so
           # running this from inside dist/ keeps the paths bare.
+          # The legacy names are hashed as well as uploaded: the updater verifies the download against
+          # this manifest, so an asset with no line here is refused exactly as hard as a missing one.
           sha256sum githoot-tray githoot-tray.exe githoot-tray-macos-aarch64.zip \
+            git-system-tray git-system-tray.exe git-system-tray-macos-aarch64.zip \
             > sha256sums.txt
           cat sha256sums.txt
 
