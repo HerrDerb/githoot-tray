@@ -6,7 +6,7 @@
 //! third case representable.
 //!
 //! There are now four *independent* signals: unread notifications (blue glyph, optional — see
-//! `crate::config`) and three PR-search axes (`PrAxis`): review-requested (red dot), ready-to-merge
+//! `crate::config`) and three PR-search axes (`PrAxis`): review-requested (red dot), approved
 //! (green dot), changes-requested (orange dot). They come from different endpoints/queries with
 //! different rate-limit budgets and (for notifications vs. the PR axes) different credentials, so
 //! they fail independently — which is why each gets its own `Track` rather than sharing one
@@ -185,10 +185,17 @@ pub const SETTINGS_MENU_LABEL: &str = "Open Settings";
 /// `Track` machinery. Two of them are a `total_count` read off the Search API (`github::poll_reviews`,
 /// despite its name — see its own doc comment); changes-requested goes through GraphQL instead, because
 /// its query alone cannot tell "still on me" from "handed back to the reviewer". See
-/// `github::poll_changes_requested`. `scheduler::poll_pr` is the one place that mapping lives.
+/// `github::poll_changes_requested`. `scheduler::pr_endpoint` is the one place that mapping lives.
+///
+/// The middle axis means **approved**, not mergeable. It used to mean both: the count dropped any
+/// approved pull request whose checks were red, on the reasoning that a green bar over red CI claims
+/// something false. The cost of that was worse — one failing check hid the fact that anyone had
+/// approved the work at all, which is the news the bar exists to deliver. So the bar answers "did
+/// somebody approve it", the page behind the menu entry answers "can it actually merge", and the two
+/// no longer disagree about what they are counting.
 ///
 /// `ALL` fixes the order used both for tooltip-detail priority and, by convention, for which slot and
-/// colour `icons::IconSet` assigns each bar, top to bottom: review-requested (red), ready-to-merge
+/// colour `icons::IconSet` assigns each bar, top to bottom: review-requested (red), approved
 /// (green), changes-requested (amber).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrAxis {
@@ -219,7 +226,7 @@ impl PrAxis {
             // Reuses the existing constant rather than duplicating the string, so the two can
             // never drift apart.
             PrAxis::ReviewRequested => REVIEWS_MENU_LABEL,
-            PrAxis::ReadyToMerge => "Open Ready to Merge",
+            PrAxis::ReadyToMerge => "Open Approved PRs",
             PrAxis::ChangesRequested => "Open Changes Requested",
         }
     }
@@ -229,8 +236,8 @@ impl PrAxis {
         match (self, count) {
             (PrAxis::ReviewRequested, Some(n)) => format!("{n} PR(s) awaiting your review"),
             (PrAxis::ReviewRequested, None) => "PRs awaiting your review".to_string(),
-            (PrAxis::ReadyToMerge, Some(n)) => format!("{n} PR(s) ready to merge"),
-            (PrAxis::ReadyToMerge, None) => "PRs ready to merge".to_string(),
+            (PrAxis::ReadyToMerge, Some(n)) => format!("{n} PR(s) approved"),
+            (PrAxis::ReadyToMerge, None) => "PRs approved".to_string(),
             (PrAxis::ChangesRequested, Some(n)) => format!("{n} PR(s) with changes requested"),
             (PrAxis::ChangesRequested, None) => "PRs with changes requested".to_string(),
         }
@@ -240,7 +247,7 @@ impl PrAxis {
     fn tooltip_no(self) -> &'static str {
         match self {
             PrAxis::ReviewRequested => "No reviews requested",
-            PrAxis::ReadyToMerge => "Nothing ready to merge",
+            PrAxis::ReadyToMerge => "No approvals yet",
             PrAxis::ChangesRequested => "No changes requested",
         }
     }
@@ -249,7 +256,7 @@ impl PrAxis {
     fn tooltip_unknown(self) -> &'static str {
         match self {
             PrAxis::ReviewRequested => "Review state unknown",
-            PrAxis::ReadyToMerge => "Ready-to-merge state unknown",
+            PrAxis::ReadyToMerge => "Approval state unknown",
             PrAxis::ChangesRequested => "Changes-requested state unknown",
         }
     }
@@ -1329,7 +1336,7 @@ mod tests {
         state.apply_pr(PrAxis::ChangesRequested, fresh_count(5));
 
         assert_eq!(state.pr_menu_label(PrAxis::ReviewRequested), "Open Requested Reviews (3)");
-        assert_eq!(state.pr_menu_label(PrAxis::ReadyToMerge), "Open Ready to Merge (1)");
+        assert_eq!(state.pr_menu_label(PrAxis::ReadyToMerge), "Open Approved PRs (1)");
         assert_eq!(state.pr_menu_label(PrAxis::ChangesRequested), "Open Changes Requested (5)");
     }
 

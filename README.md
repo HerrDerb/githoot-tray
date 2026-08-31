@@ -146,7 +146,7 @@ and a Defender exclusion is a decision to make deliberately rather than a step i
 | **Authenticate GitHub PR Status** | PR status has no usable credential | Starts the sign-in flow |
 | **Open GitHub Notifications** | Notifications on and something unread | Opens them, then re-checks a few seconds later |
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
-| **Open Ready to Merge (N)** | One of yours is approved and its checks pass | Opens exactly what the green bar counts |
+| **Open Approved PRs (N)** | One of yours has been approved | Opens exactly what the green bar counts |
 | **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
 | *— separator —* | Always | |
 | **Open Settings** | Always | Opens `config.txt`, then offers a restart once your edits settle (see below) |
@@ -188,7 +188,7 @@ appear in it, and the table below is the complete list.
 | `updateCheck` | `on` | Check for a newer release daily and at startup |
 | `notificationIndication` | `off` | Tint the icon blue on unread notifications |
 | `reviewRequested` | `on` | The red bar |
-| `readyToMerge` | `on` | The green bar |
+| `readyToMerge` | `on` | The green bar (approved PRs; the key keeps its old name so existing `config.txt` files still work) |
 | `changesRequested` | `on` | The amber bar |
 | `sound` | `on` | Play the hoot when a PR signal goes from none to some |
 | `logLevel` | `error` | How much `log.txt` records: `error` logs only failures, `info` adds lifecycle detail for diagnosing |
@@ -265,30 +265,22 @@ Three independent signals, each a GitHub Search query against your own pull requ
 | 🟢 | `is:pr author:@me review:approved state:open draft:false archived:false` |
 | 🟠 | `is:pr author:@me review:changes_requested state:open archived:false` |
 
-The green "ready to merge" query does only half the work. Search has no qualifier for check health
-(`status:success` reads only the legacy combined commit status, which is empty for repos whose checks are
-all GitHub Actions / check runs — there it matches nothing and hides every mergeable PR), so the query
-above filters on approval alone, and the check-health gate is applied per-PR afterwards: the green bar
-counts an approved PR only when its GraphQL `statusCheckRollup` is `SUCCESS`, or absent because the repo
-has no checks at all. A PR with red or still-running checks does not light it. Up to the first 100
-approved PRs are inspected. Still not checked: branch protection needing multiple approvals or named
-reviewers, and merge conflicts (`mergeable` is computed lazily and reads `UNKNOWN` on a cold poll).
+**The green bar means approved, not mergeable.** It used to mean both: through 1.10.0 the bar counted an
+approved pull request only when its GraphQL `statusCheckRollup` was `SUCCESS`, so one red or still-running
+check darkened it. That hid the thing worth being told — somebody approved your work — and it also
+disagreed with the entry beside it, since **Open Ready to Merge** opened the query above, red checks
+included. Approval is the whole signal now. Whether CI is green is a question you answer on the page the
+entry opens.
 
-**The rollup is read off the pull request, never through its head commit.** `PullRequest`
-has a `statusCheckRollup` field; walking there via `commits(last:1){nodes{commit{…}}}` reaches the same
-rollup but resolving a `PullRequestCommit` requires the App's **Contents: read** permission — read access
-to every line of source in every installed repo, to power a tray icon. Without it GitHub answers
-`200 OK` and refuses the node (`FORBIDDEN` at `search.nodes.0.commits.nodes.0`), which is exactly how
-this axis was dead through 1.7.0 and 1.7.1. Going straight at the pull request costs nothing extra.
+Dropping the gate makes this axis a plain `total_count` read again: it asks for one search hit instead of
+a hundred, and its count is exact past 100 approved PRs, which the GraphQL page could not see past.
 
-Two *narrow* permissions are still needed, since the rollup aggregates check runs and legacy commit
-statuses: **Checks: read** and **Commit statuses: read**. Missing those does not fail the request
-either — the rollup comes back nulled with a `FORBIDDEN` per pull request. Those pull requests are
-**not** counted as ready (a nulled rollup looks exactly like "repo has no checks", and guessing green
-there would light the bar over red checks), the rest of the page still counts, and the log names what to
-grant. Granting it is not enough on its own: each installation owner must **approve the updated
-permissions**, and you must re-authorize (delete `pr_token.txt`, then *Authenticate*) before the token
-carries them.
+Still not checked, and never was: branch protection needing multiple approvals or named reviewers, and
+merge conflicts (`mergeable` is computed lazily and reads `UNKNOWN` on a cold poll).
+
+Two GitHub App permissions are now unused: **Checks: read** and **Commit statuses: read**, which the
+rollup needed. They are still requested rather than withdrawn, because narrowing an installed App's
+permissions makes every installation owner re-approve — a real cost to pay for tidiness.
 
 **Changes requested does one thing more than its query.** Re-requesting a review does not dismiss the
 reviewer's earlier verdict, so `review:changes_requested` keeps matching a pull request you have already
@@ -306,10 +298,10 @@ reviews and 20 pending requests within each.
 All three queries need to see PRs in private repos. The only *classic* OAuth scope that can is `repo`,
 which also grants **write** to everything you can reach. Rather than hand out a key that broad, PR status
 uses one shared fine-grained **GitHub App** with read-only Pull requests, Metadata, Checks and Commit
-statuses permissions — the last two only so the green bar can read check health. **Contents is
-deliberately not requested**, which is why no query may traverse a commit object; see the note on
-`statusCheckRollup` above. Device Flow needs no client secret, so its Client ID is public and baked in
-rather than configured.
+statuses permissions. The last two are now unused — the green bar no longer reads check health — and are
+kept only to spare every installation owner a re-approval; see the note above. **Contents is deliberately
+not requested**, which is why no query may traverse a commit object. Device Flow needs no client secret,
+so its Client ID is public and baked in rather than configured.
 
 Access to a private org is granted by **installing** the App there, not by a wider scope — an org owner
 approves once and every member benefits.
@@ -327,7 +319,7 @@ renewal needs a browser does the exclamation come back.
 ## The hoot
 
 When a PR signal goes from **none to some**, the app plays a short hoot. Each of the three axes hoots for
-itself: reviews requested of you, your PRs ready to merge, your PRs with changes requested.
+itself: reviews requested of you, your PRs that were approved, your PRs with changes requested.
 
 Only that one edge. Going from one PR to four does not hoot again — you already know, and the count is in
 the tooltip and the menu. It re-arms once the axis has genuinely gone back to zero.
@@ -392,7 +384,7 @@ memory and never write one to disk.
 | Tooltip | Meaning |
 |---|---|
 | `N PR(s) awaiting your review` / `No reviews requested` | Confirmed by a successful search |
-| `N PR(s) ready to merge` / `Nothing ready to merge` | Confirmed |
+| `N PR(s) approved` / `No approvals yet` | Confirmed |
 | `N PR(s) with changes requested` / `No changes requested` | Confirmed |
 | `unread notifications` / `no unread notifications` | Confirmed (when enabled) |
 | `PR status: not authorized yet` | No credential — use the menu entry |

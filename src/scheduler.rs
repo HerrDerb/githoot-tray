@@ -63,12 +63,15 @@ const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open archived:false
 
 /// Search query for the user's own pull requests that are approved.
 ///
-/// This is only the *server-side* half of the "ready to merge" test: approval, open, not-draft. It
-/// carries no CI-status qualifier on purpose — `status:success` reads only the legacy combined commit
-/// status, which is empty for repos whose checks are all GitHub Actions / check runs, so it matches
-/// nothing there and hides every genuinely mergeable PR. Check health is gated client-side instead,
-/// in `github::poll_merge_ready` via the GraphQL `statusCheckRollup`. What is still not checked:
-/// branch-protection rules needing more than one approval or named reviewers.
+/// The whole test, server-side: approved, open, not a draft. There is deliberately no CI qualifier.
+/// A red check used to disqualify a hit — the bar meant *approved and mergeable* — and that hid the
+/// one thing worth being told, that somebody approved your work. Approval is the signal now; whether
+/// CI is green is a question you go and answer on the page the entry opens.
+///
+/// So `status:success` is not merely unused but unwanted. (It would not have worked anyway: it reads
+/// only GitHub's legacy combined commit status, empty for repos whose checks are all check runs, where
+/// it matches nothing at all.) Also still unchecked, and always was: branch-protection rules needing
+/// more than one approval or named reviewers.
 const MERGE_QUERY: &str = "is:pr author:@me review:approved state:open draft:false archived:false";
 
 /// Search query for the user's own pull requests where a reviewer requested changes.
@@ -88,19 +91,40 @@ fn pr_query(axis: PrAxis) -> &'static str {
     }
 }
 
+/// Which endpoint answers an axis's poll.
+///
+/// Split out of `poll_pr` for one reason: `poll_pr` does I/O and therefore cannot be asserted, while
+/// *which endpoint an axis uses* is exactly the kind of decision that should not be able to change
+/// unnoticed. Same motivation as `pr_query` above — the mapping gets one definition and a test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrEndpoint {
+    /// A `total_count` read off the REST Search API, `per_page=1`. Nothing about the individual hits is
+    /// needed, so nothing about them is fetched.
+    SearchTotal,
+    /// The GraphQL search, because the answer needs reading hit by hit.
+    ChangesGraphQl,
+}
+
+/// The endpoint behind `axis`'s dot.
+fn pr_endpoint(axis: PrAxis) -> PrEndpoint {
+    match axis {
+        PrAxis::ReviewRequested => PrEndpoint::SearchTotal,
+        PrAxis::ReadyToMerge => PrEndpoint::SearchTotal,
+        PrAxis::ChangesRequested => PrEndpoint::ChangesGraphQl,
+    }
+}
+
 /// Issues `axis`'s poll.
 ///
-/// Only `ReviewRequested` is a plain `total_count` read off the Search API. `ChangesRequested` and
-/// `ReadyToMerge` are not: the Search query alone cannot tell "still on me" from "handed back", nor
-/// an approved PR with green checks from one with red — see `github::poll_changes_requested` and
-/// `github::poll_merge_ready`. All three take the same query string; they differ only in which
-/// endpoint answers it and how much of the answer has to be read.
+/// All three axes take the same query string; they differ only in which endpoint answers it and how
+/// much of the answer has to be read. `ChangesRequested` is the one that cannot be a plain
+/// `total_count`, because the Search query alone cannot tell "still on me" from "handed back" — see
+/// `github::poll_changes_requested`.
 fn poll_pr(client: &reqwest::blocking::Client, token: &str, axis: PrAxis) -> github::PollResponse {
     let query = pr_query(axis);
-    match axis {
-        PrAxis::ChangesRequested => github::poll_changes_requested(client, token, query),
-        PrAxis::ReadyToMerge => github::poll_merge_ready(client, token, query),
-        PrAxis::ReviewRequested => github::poll_reviews(client, token, query),
+    match pr_endpoint(axis) {
+        PrEndpoint::SearchTotal => github::poll_reviews(client, token, query),
+        PrEndpoint::ChangesGraphQl => github::poll_changes_requested(client, token, query),
     }
 }
 
@@ -956,6 +980,25 @@ mod tests {
     use super::*;
 
     const STEADY: Duration = Duration::from_secs(60);
+
+    /// The approved axis reads a count and nothing else.
+    ///
+    /// It used to fetch each hit's `statusCheckRollup` over GraphQL so a red-CI pull request could be
+    /// filtered out. Approval alone now lights the bar, so there is nothing left to read off a hit — and
+    /// a `total_count` read is not merely simpler: it asks for one hit instead of a hundred, and its
+    /// count is exact past the hundred the GraphQL page could see.
+    #[test]
+    fn ready_to_merge_reads_a_plain_search_total() {
+        assert_eq!(pr_endpoint(PrAxis::ReadyToMerge), PrEndpoint::SearchTotal);
+        assert_eq!(pr_endpoint(PrAxis::ReviewRequested), PrEndpoint::SearchTotal);
+    }
+
+    /// The guard against over-reaching. Dropping one axis's client-side rule must not drop the other's:
+    /// `still_on_you` answers a question the Search query genuinely cannot, so this axis keeps GraphQL.
+    #[test]
+    fn changes_requested_still_needs_graphql() {
+        assert_eq!(pr_endpoint(PrAxis::ChangesRequested), PrEndpoint::ChangesGraphQl);
+    }
 
     fn burst_of(secs: &[u64]) -> VecDeque<Duration> {
         secs.iter().map(|s| Duration::from_secs(*s)).collect()

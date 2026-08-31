@@ -3,7 +3,7 @@
 //! Four independent signals are drawn onto the tray icon, giving sixteen variants:
 //!   * base glyph — dark (no unread notifications) or blue (unread notifications)
 //!   * review indicator — red, slot 1, when a PR is awaiting your review
-//!   * ready-to-merge indicator — green, slot 2, when one of your PRs is approved and passing
+//!   * approved indicator — green, slot 2, when one of your PRs has been approved
 //!   * changes-requested indicator — amber, slot 3, when a reviewer asked for changes on one of
 //!     your PRs
 //!
