@@ -145,6 +145,31 @@ impl IconState {
     }
 }
 
+/// Label of the fallback tray menu item that opens GitHub's own pull-request inbox.
+pub const PR_INBOX_MENU_LABEL: &str = "Open PR inbox";
+
+/// Where that entry goes. GitHub's own inbox view, not a search of ours — the whole point of this one
+/// is that it needs no query, no count and no credential to be worth clicking.
+pub const PR_INBOX_URL: &str = "https://github.com/pulls/inbox";
+
+/// Whether the fallback inbox entry is shown: exactly when no *specific* PR entry is.
+///
+/// Lives here rather than in either platform's menu code for the same reason
+/// [`IconState::shows_exclamation`] does. Both platforms decide menu visibility independently, and a
+/// copy each drifts — which on screen means the entry appearing next to the three it exists to stand in
+/// for, or vanishing on the one day the menu has nothing else to offer.
+///
+/// Takes resolved `bool`s rather than `Presence`, because by the time either platform asks, it has
+/// already folded `Unknown` into "whatever is on screen" — and that fold is what should govern this
+/// too. An axis we merely lost track of keeps its entry, so this entry stays away.
+///
+/// `needs_auth` counts as showing nothing, because it hides all three PR entries whatever their counts.
+/// That is the case this matters most in: a plain URL needs no credential, so it is the one PR link that
+/// still works while the app is waiting to be authorized.
+pub fn shows_pr_inbox(pr_entries: [bool; 3], needs_auth: bool) -> bool {
+    needs_auth || !pr_entries.iter().any(|&on| on)
+}
+
 /// Base text of the tray menu item that opens the review list.
 ///
 /// Lives here, next to the code that appends the count to it, so the two cannot drift apart.
@@ -1325,6 +1350,36 @@ mod tests {
         assert_eq!(icon.review_requested, Presence::Yes, "unrelated axis must be unaffected");
         assert_eq!(icon.ready_to_merge, Presence::Unknown, "the failing axis alone gives up");
         assert_eq!(icon.changes_requested, Presence::Yes, "unrelated axis must be unaffected");
+    }
+
+    // ── The fallback PR-inbox entry ───────────────────────────────────────────
+
+    /// The gap this entry fills. Every PR entry hides itself when its axis is dark, on the sound
+    /// principle that an entry opening an empty list is a dead end — which left a quiet day with no
+    /// way into GitHub's pull requests at all.
+    #[test]
+    fn the_inbox_entry_fills_in_for_an_empty_pr_list() {
+        assert!(shows_pr_inbox([false, false, false], false));
+    }
+
+    /// It is a fallback, not a fixture: any entry that can name what it opens says it better.
+    #[test]
+    fn the_inbox_entry_stands_down_for_any_real_entry() {
+        for axis in PrAxis::ALL {
+            let mut lit = [false; 3];
+            lit[axis.index()] = true;
+            assert!(!shows_pr_inbox(lit, false), "{axis:?} alone must speak for itself");
+        }
+        assert!(!shows_pr_inbox([true, true, true], false));
+    }
+
+    /// The one case where it matters most. Waiting to authorize hides all three PR entries whatever
+    /// their counts, so this is the only PR link left — and being a plain URL, it is the one that still
+    /// works without a credential.
+    #[test]
+    fn the_inbox_entry_survives_waiting_to_authorize() {
+        assert!(shows_pr_inbox([true, true, true], true));
+        assert!(shows_pr_inbox([false, false, false], true));
     }
 
     #[test]

@@ -714,6 +714,9 @@ pub struct MenuItems {
     pub reviews: gtk::MenuItem,
     pub ready_to_merge: gtk::MenuItem,
     pub changes_requested: gtk::MenuItem,
+    /// The fallback for when none of the three above have anything behind them. Conditional like they
+    /// are, but on the opposite condition — see `state::shows_pr_inbox`.
+    pub pr_inbox: gtk::MenuItem,
     /// Shown only while PR status is waiting to be authorized. It is the counterpart of the four
     /// above: they are hidden when there is nothing to open, this one is hidden when there is
     /// nothing to authorize.
@@ -836,15 +839,13 @@ pub fn start_notification_scheduler(
                 applied = None;
             }
 
-            // A separator needs something on **both** sides. Above it is the top group; below it is the
-            // body — Authenticate, notifications, and the PR entries. With either side empty the rule is
-            // a stray line, which reads as a rendering fault rather than a grouping.
-            //
-            // `needs_auth` counts as body content even though it hides the three PR entries: it is itself
-            // an entry sitting below the rule, so there is still something to separate.
+            // A separator needs something on both sides. Only the top side is still in question: the
+            // body — Authenticate, notifications, the PR entries — used to be able to empty out, leaving
+            // this rule directly above the bottom one, which reads as a rendering fault rather than a
+            // grouping. The PR-inbox entry appears exactly when the three PR entries do not, so the body
+            // can no longer be empty and the old test for it was permanently true.
             let top_group = status_degraded || update_available;
-            let body_group = needs_auth || wanted.iter().any(|&on| on);
-            let separate = top_group && body_group;
+            let separate = top_group;
             if applied_top_group != Some(separate) {
                 menu_items.top_separator.set_visible(separate);
                 applied_top_group = Some(separate);
@@ -896,6 +897,10 @@ pub fn start_notification_scheduler(
                 for (item, &visible) in menu_items.pr_items().into_iter().zip(&wanted[1..]) {
                     item.set_visible(!needs_auth && visible);
                 }
+                // Deliberately *not* gated on `needs_auth`: a plain URL needs no credential, which is
+                // exactly what makes it worth keeping when the three that do need one are hidden.
+                let pr_entries = [wanted[1], wanted[2], wanted[3]];
+                menu_items.pr_inbox.set_visible(crate::state::shows_pr_inbox(pr_entries, needs_auth));
 
                 applied = Some(wanted);
             }

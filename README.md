@@ -148,6 +148,7 @@ and a Defender exclusion is a decision to make deliberately rather than a step i
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
 | **Open Approved PRs (N)** | One of yours has been approved | Opens exactly what the green bar counts |
 | **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
+| **Open PR inbox** | None of the three entries above is shown | Opens [GitHub's own PR inbox](https://github.com/pulls/inbox) |
 | *— separator —* | Always | |
 | **Open Settings** | Always | Opens `config.txt`, then offers a restart once your edits settle (see below) |
 | **Quit** | Always | Exits |
@@ -155,8 +156,14 @@ and a Defender exclusion is a decision to make deliberately rather than a step i
 The update and GitHub-status entries come first: they are about the app and the service rather than about
 your pull requests, and when the icon is wearing a mark two of its three causes are explained up there.
 
-The upper separator appears only when there is something on **both** sides of it. A rule with nothing above
-or nothing below is a stray line, which reads as a rendering fault rather than a grouping.
+The upper separator appears only when there is something above it. A rule with nothing on one side is a
+stray line, which reads as a rendering fault rather than a grouping — and below it there is now always
+something, because **Open PR inbox** stands in whenever the three PR entries have nothing to open.
+
+That fallback exists because every other PR entry hides itself when its count is zero: an entry opening an
+empty list is a dead end. On a quiet day that left no way into your pull requests at all. Being a plain
+URL rather than a search of ours, it also needs no credential, so it stays while the app is waiting to be
+authorized and the three entries that do need one are hidden.
 
 The requested-reviews URL is generated from the same query its bar counts, so that page cannot disagree
 with the icon. Labels carry the exact count, unbounded.

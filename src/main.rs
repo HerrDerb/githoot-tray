@@ -288,6 +288,16 @@ fn main() {
         let _ = changes_requested_wake_tx.send(scheduler::Wake::Refresh);
     });
 
+    // The fallback for a menu with none of the three above in it. No `Wake::Refresh` afterwards,
+    // unlike all three: those open a list this app counts, so a click means the counts are about to
+    // change. This opens a view we count nothing in, so there is nothing to pull forward.
+    let pr_inbox_item = MenuItem::with_label(state::PR_INBOX_MENU_LABEL);
+    pr_inbox_item.connect_activate(move |_| {
+        if let Err(e) = open::that(state::PR_INBOX_URL) {
+            errorln!("failed to open the PR inbox: {e}");
+        }
+    });
+
     // Placed first so it is the obvious thing to click when the icon is wearing an exclamation and
     // every other entry is hidden. The click only *asks*: the device flow itself runs on the poll
     // thread (see `scheduler::Wake::Authenticate`), because it blocks for as long as the user takes
@@ -349,6 +359,7 @@ fn main() {
     menu.append(&reviews_item);
     menu.append(&ready_to_merge_item);
     menu.append(&changes_requested_item);
+    menu.append(&pr_inbox_item);
     menu.append(&bottom_separator);
     menu.append(&settings_item);
     menu.append(&quit_item);
@@ -384,6 +395,7 @@ fn main() {
             reviews: reviews_item.clone(),
             ready_to_merge: ready_to_merge_item.clone(),
             changes_requested: changes_requested_item.clone(),
+            pr_inbox: pr_inbox_item.clone(),
             status: status_item.clone(),
             top_separator: top_separator.clone(),
             authenticate: authenticate_item.clone(),
@@ -574,6 +586,10 @@ fn main() {
         ready_to_merge_item_id: tray_icon::menu::MenuId,
         changes_requested_item: tray_icon::menu::MenuItem,
         changes_requested_item_id: tray_icon::menu::MenuId,
+        /// The fallback for when none of the three above have anything behind them. Conditional like
+        /// they are, but on the opposite condition — see `state::shows_pr_inbox`.
+        pr_inbox_item: tray_icon::menu::MenuItem,
+        pr_inbox_item_id: tray_icon::menu::MenuId,
         /// Always present, so unlike the conditional entries it is never taken out or put back — but it
         /// still has to be re-appended by every `rebuild_menu`, which is exactly what it was missing.
         settings_item: tray_icon::menu::MenuItem,
@@ -649,6 +665,8 @@ fn main() {
         let changes_requested_item =
             MenuItem::new(state::PrAxis::ChangesRequested.menu_label(), true, None);
         let changes_requested_item_id = changes_requested_item.id().clone();
+        let pr_inbox_item = MenuItem::new(state::PR_INBOX_MENU_LABEL, true, None);
+        let pr_inbox_item_id = pr_inbox_item.id().clone();
         let authenticate_item = MenuItem::new(state::AUTHENTICATE_MENU_LABEL, true, None);
         let authenticate_item_id = authenticate_item.id().clone();
         let update_item = MenuItem::new(state::UPDATE_MENU_LABEL, true, None);
@@ -670,6 +688,7 @@ fn main() {
             (&reviews_item, "reviews"),
             (&ready_to_merge_item, "ready to merge"),
             (&changes_requested_item, "changes requested"),
+            (&pr_inbox_item, "PR inbox"),
             (&settings_item, "settings"),
             (&quit_item, "quit"),
         ] {
@@ -698,6 +717,8 @@ fn main() {
             ready_to_merge_item_id,
             changes_requested_item,
             changes_requested_item_id,
+            pr_inbox_item,
+            pr_inbox_item_id,
             settings_item,
             settings_item_id,
             status_item,
@@ -863,6 +884,13 @@ fn main() {
                     errorln!("failed to open browser: {e}");
                 }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
+            } else if *id == tray.pr_inbox_item_id {
+                // No `Wake::Refresh` afterwards, unlike the three entries above it. Those open a list
+                // this app is counting, so a refresh catches up with whatever the user just read there.
+                // This one opens a view we count nothing in, so there is nothing to catch up with.
+                if let Err(e) = open::that(state::PR_INBOX_URL) {
+                    errorln!("failed to open the PR inbox: {e}");
+                }
             } else if *id == tray.authenticate_item_id {
                 // Only asks. The device flow runs on the poll thread (see
                 // `scheduler::Wake::Authenticate`), because it blocks for as long as the user takes
@@ -1007,10 +1035,13 @@ fn main() {
             // Both sides have to be non-empty, or the rule has nothing to separate — see the Linux
             // equivalent in `scheduler` for the reasoning, which is deliberately identical.
             let top_group = update || status_degraded;
-            let body_group = needs_auth || wanted.iter().any(|&on| on);
-            let separate = top_group && body_group;
+            // Only the top side is in question now. The body used to be able to empty out — every entry
+            // below the rule was conditional — and a rule with nothing under it reads as a rendering
+            // fault. The PR-inbox entry appears exactly when the three PR entries do not, so there is
+            // always something down there and the old `body_group` test was permanently true.
+            let separate = top_group;
 
-            let entries: [(&dyn tray_icon::menu::IsMenuItem, bool, &str); 11] = [
+            let entries: [(&dyn tray_icon::menu::IsMenuItem, bool, &str); 12] = [
                 // The top group: the app's own state and the service's, rather than anything about your
                 // pull requests. First because when the icon is wearing a mark, two of the three things
                 // that explain it are here.
@@ -1029,6 +1060,14 @@ fn main() {
                 (&self.reviews_item, !needs_auth && wanted[1], "review-requested"),
                 (&self.ready_to_merge_item, !needs_auth && wanted[2], "ready-to-merge"),
                 (&self.changes_requested_item, !needs_auth && wanted[3], "changes-requested"),
+                // The fallback, in the slot the three above would have filled. Deliberately *not*
+                // gated on `needs_auth`: it is a plain URL that needs no credential, which is what
+                // makes it worth keeping when the three that do need one are hidden.
+                (
+                    &self.pr_inbox_item,
+                    state::shows_pr_inbox([wanted[1], wanted[2], wanted[3]], needs_auth),
+                    "pr-inbox",
+                ),
                 // Unconditional, all three. Settings was missing from this list until now, which
                 // silently deleted it on the first rebuild — the hazard a full rebuild trades for not
                 // having to compute insert positions, and the reason every entry must be listed here.
