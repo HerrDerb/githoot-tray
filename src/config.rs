@@ -28,6 +28,40 @@ const KEY_READY_TO_MERGE: &str = "readyToMerge";
 const KEY_CHANGES_REQUESTED: &str = "changesRequested";
 const KEY_LOG_LEVEL: &str = "logLevel";
 const KEY_SOUND: &str = "sound";
+const KEY_STATUS_COMPONENTS: &str = "statusComponents";
+
+/// Every component GitHub publishes on its status page, in the order the page lists them.
+///
+/// Written into a fresh `config.txt` as the value of `statusComponents`, so narrowing the watch is a
+/// deletion rather than a research task. Hardcoding it means it can go stale, which is why the
+/// ignored `every_component_named_in_the_default_config_still_exists` test in `github_status` checks
+/// it against the live payload; a stale entry costs nothing worse than an unwatched component and a
+/// line in the log.
+///
+/// One name is deliberately absent: `Visit www.githubstatus.com for more information`, a Statuspage
+/// placeholder rather than a service, and never anything but operational.
+const KNOWN_STATUS_COMPONENTS: [&str; 11] = [
+    "Git Operations",
+    "Webhooks",
+    "API Requests",
+    "Issues",
+    "Pull Requests",
+    "Actions",
+    "Packages",
+    "Pages",
+    "Copilot",
+    "Codespaces",
+    "Copilot AI Model Providers",
+];
+
+/// The component list a fresh `config.txt` is written with.
+///
+/// Test-only: the shipped file gets the list from `KNOWN_STATUS_COMPONENTS` directly. This exists so
+/// the live test in `github_status` can hold those names up against what GitHub actually publishes.
+#[cfg(test)]
+pub fn default_status_components() -> Vec<String> {
+    KNOWN_STATUS_COMPONENTS.iter().map(|name| name.to_string()).collect()
+}
 
 /// Keys that used to work, paired with what replaced them.
 ///
@@ -61,6 +95,17 @@ pub struct Config {
     /// How much detail the log file carries. `Error` by default — only failures — so the file stays
     /// quiet and readable; set `logLevel=info` to add the lifecycle narration when diagnosing.
     pub log_level: Level,
+    /// Which parts of GitHub may raise the outage mark, as the user spelled them.
+    ///
+    /// **Empty means the whole page**, which is both the old behaviour and the only sane reading of an
+    /// absent key: `config.txt` is never rewritten, so no file written before this key existed will
+    /// ever grow it, and treating absence as "watch nothing" would silently retire the feature for
+    /// every existing install. A fresh file is written with every component named, so the two paths
+    /// agree on the day of writing and diverge only as GitHub adds components.
+    ///
+    /// Kept as the user typed it, not folded or canonicalised: it is what the log quotes back when a
+    /// name matches nothing. Folding happens at match time, in `github_status`.
+    pub status_components: Vec<String>,
 }
 
 /// Where the settings file lives.
@@ -110,6 +155,12 @@ impl Config {
             // Unrecognised (or absent) falls back to the quiet default, the same way a typo'd bool
             // does — see `Level::parse`.
             log_level: values.get(KEY_LOG_LEVEL).and_then(|v| Level::parse(v)).unwrap_or(Level::Error),
+            // The one list-valued setting. Absent, empty, or nothing but separators all come out
+            // empty, which means the page-wide indicator rather than "watch nothing" — see the field.
+            status_components: values
+                .get(KEY_STATUS_COMPONENTS)
+                .map(|v| split_list(v))
+                .unwrap_or_default(),
         }
     }
 
@@ -142,6 +193,9 @@ fn pr_key(axis: PrAxis) -> &'static str {
 /// [`Config::load`] agree without touching a disk. Values are *active* rather than commented out, so
 /// the file states what is actually in force and editing one means changing a value.
 fn default_config() -> String {
+    // Joined rather than written out, so the list has exactly one definition and the file cannot name
+    // a component the code has never heard of.
+    let components = KNOWN_STATUS_COMPONENTS.join(", ");
     format!(
         "# githoot-tray settings\n\
          #\n\
@@ -165,13 +219,20 @@ fn default_config() -> String {
          {KEY_READY_TO_MERGE}=on\n\
          {KEY_CHANGES_REQUESTED}=on\n\
          \n\
-         # Play a short hoot when a pull-request signal goes from none to some. Only the sound is
-         # affected: the icon, tooltip and counts behave the same either way.
-         {KEY_SOUND}=on
-         
+         # Play a short hoot when a pull-request signal goes from none to some. Only the sound is\n\
+         # affected: the icon, tooltip and counts behave the same either way.\n\
+         {KEY_SOUND}=on\n\
+         \n\
          # How much the log file records. \"error\" (the default) logs only failures; \"info\" adds\n\
          # the normal lifecycle detail (startup, sign-in, updates, each poll) for diagnosing.\n\
-         {KEY_LOG_LEVEL}=error\n"
+         {KEY_LOG_LEVEL}=error\n\
+         \n\
+         # Which parts of GitHub may put the exclamation on the icon, comma separated, one line.\n\
+         # Every component GitHub publishes is listed below; delete the ones you do not care about,\n\
+         # and the rest stop raising the mark. GitHub's page-wide verdict says \"degraded\" whenever\n\
+         # any one of these is, including the ones a pull-request tray never touches.\n\
+         # Names must match GitHub's exactly, bar case. An empty list watches the whole page.\n\
+         {KEY_STATUS_COMPONENTS}={components}\n"
     )
 }
 
@@ -224,6 +285,20 @@ fn parse(content: &str) -> std::collections::HashMap<&str, &str> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.split_once('='))
         .map(|(k, v)| (k.trim(), v.trim()))
+        .collect()
+}
+
+/// Splits a comma-separated value into its entries, trimmed, with the empties dropped.
+///
+/// Empties are dropped rather than kept because a trailing comma is the most ordinary edit there is
+/// (delete the last name, leave the comma), and an entry of `""` would be a watch on a component
+/// whose name is nothing.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
@@ -311,8 +386,11 @@ mod tests {
         for axis in PrAxis::ALL {
             assert_eq!(values.get(pr_key(axis)), Some(&"on"), "{axis:?}");
         }
+        // The one key whose written value is not its absent-key default: see
+        // `the_template_is_explicit_where_an_absent_key_is_not`.
+        assert!(values.get(KEY_STATUS_COMPONENTS).is_some_and(|v| v.contains("Pull Requests")));
         // And nothing else, so a key added to the template without being read is caught.
-        assert_eq!(values.len(), 7, "unexpected keys in the template: {values:?}");
+        assert_eq!(values.len(), 8, "unexpected keys in the template: {values:?}");
     }
 
     /// Every key the template writes must be one `load` actually reads. A key present in the file
@@ -327,6 +405,7 @@ mod tests {
             KEY_CHANGES_REQUESTED,
             KEY_LOG_LEVEL,
             KEY_SOUND,
+            KEY_STATUS_COMPONENTS,
         ];
         let text = default_config();
         for key in parse(&text).keys() {
@@ -363,6 +442,18 @@ mod tests {
         for v in ["offf", "yse", "", "quiet"] {
             assert!(values(&format!("sound={v}
 ")).sound, "sound={v} must not silence it");
+        }
+    }
+
+    /// Every line the template writes is either a comment, blank, or a flush-left `key=value`. A
+    /// missing `\n\` continuation in the source produces a real newline plus the source's own
+    /// indentation, which `parse` still reads — so the only symptom is a file that looks broken to
+    /// the person opening it.
+    #[test]
+    fn no_line_of_the_template_is_indented() {
+        for line in default_config().lines() {
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+            assert!(!line.starts_with(' '), "indented line: {line:?}");
         }
     }
 
@@ -426,6 +517,10 @@ mod tests {
     /// The generated file must produce exactly the same `Config` as no file at all. This is what
     /// stops the template and the defaults drifting apart — and it compares the parsed *settings*,
     /// not the text, so it would catch a key written with the wrong value.
+    ///
+    /// `status_components` is the deliberate exception and is checked separately, by
+    /// `the_template_is_explicit_where_an_absent_key_is_not`: a fresh file names every component,
+    /// an absent key means the whole page, and on the day of writing those two are the same set.
     #[test]
     fn the_generated_file_produces_the_same_settings_as_no_file() {
         let template = default_config();
@@ -493,6 +588,76 @@ mod tests {
     }
 
     // ── Per-axis keys ───────────────────────────────────────────────────────
+
+    // ── Watched status components ───────────────────────────────────────────
+
+    /// Absent means the whole page, which is what every config.txt written before this key existed
+    /// says — and those files are never rewritten. See `default_config`.
+    #[test]
+    fn status_components_is_empty_when_the_key_is_absent() {
+        assert!(from("").status_components.is_empty());
+        assert!(from("updateCheck=on
+").status_components.is_empty());
+    }
+
+    #[test]
+    fn status_components_are_split_on_commas_and_trimmed() {
+        let cfg = from("statusComponents=Issues,  Pull Requests ,Git Operations
+");
+        assert_eq!(cfg.status_components, ["Issues", "Pull Requests", "Git Operations"]);
+    }
+
+    /// A trailing comma, a double comma, or a value of nothing but separators must not produce a
+    /// watch on the empty name — which would match nothing and read as "watching something".
+    #[test]
+    fn empty_entries_are_dropped() {
+        assert_eq!(from("statusComponents=Issues,,  ,Actions,
+").status_components, ["Issues", "Actions"]);
+        assert!(from("statusComponents=
+").status_components.is_empty());
+        assert!(from("statusComponents=  , ,
+").status_components.is_empty());
+    }
+
+    /// The user's own spelling survives, because it is what the log quotes back when a name matches
+    /// no live component. Case folding happens at match time, not here.
+    #[test]
+    fn the_configured_spelling_is_kept_verbatim() {
+        assert_eq!(from("statusComponents= ISSUES 
+").status_components, ["ISSUES"]);
+    }
+
+    /// The written template names every component GitHub publishes, so trimming the list is a
+    /// deletion rather than research. This is the one place a stale list would show.
+    #[test]
+    fn the_generated_template_lists_every_known_component() {
+        let template = default_config();
+        let cfg = Config::from_values(&parse(&template));
+        assert_eq!(cfg.status_components, KNOWN_STATUS_COMPONENTS.to_vec());
+        assert!(cfg.status_components.contains(&"Pull Requests".to_string()));
+    }
+
+    /// The deliberate exception to "the template equals the defaults": a fresh file names the
+    /// components explicitly, an absent key means the whole page. Asserted so the divergence is a
+    /// decision on the record rather than a drift someone later "fixes".
+    #[test]
+    fn the_template_is_explicit_where_an_absent_key_is_not() {
+        let template = default_config();
+        assert!(!Config::from_values(&parse(&template)).status_components.is_empty());
+        assert!(from("").status_components.is_empty());
+    }
+
+    /// The template is one `key=value` line like every other, since `parse` has no continuation
+    /// syntax — a wrapped list would silently lose everything after the first line.
+    #[test]
+    fn the_component_list_is_a_single_line() {
+        let template = default_config();
+        let line = template
+            .lines()
+            .find(|l| l.starts_with(KEY_STATUS_COMPONENTS))
+            .expect("the template must state the key");
+        assert!(line.contains("Codespaces"), "the whole list must fit on one line: {line}");
+    }
 
     /// The three axes must map to three *distinct* keys. Duplicating one would silently tie two bars
     /// to the same setting.

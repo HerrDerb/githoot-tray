@@ -192,10 +192,41 @@ appear in it, and the table below is the complete list.
 | `changesRequested` | `on` | The amber bar |
 | `sound` | `on` | Play the hoot when a PR signal goes from none to some |
 | `logLevel` | `error` | How much `log.txt` records: `error` logs only failures, `info` adds lifecycle detail for diagnosing |
+| `statusComponents` | every component | Which parts of GitHub may raise the outage mark — see below |
 
 Only `off`, `false`, `0` or `no` switch something off; anything else leaves the default, so a typo cannot
-silently disable a feature. `logLevel` is the one non-toggle: it takes `error` or `info`, and an
-unrecognised value falls back to `error`.
+silently disable a feature. Two keys are not toggles: `logLevel` takes `error` or `info`, falling back to
+`error`; `statusComponents` takes a comma-separated list.
+
+### Which parts of GitHub count as an outage
+
+GitHub's page-wide verdict is one judgement over everything it runs, and most of that is nothing to do
+with pull requests. A single degraded component — Copilot, say — makes the whole page read "Partially
+Degraded Service", which put a red exclamation on the tray for a service this app never touches. Cry wolf
+often enough and the mark stops meaning anything.
+
+So `statusComponents` names the parts that may raise it. A fresh `config.txt` lists every component GitHub
+publishes, on one line; delete the ones you do not care about:
+
+```
+statusComponents=Git Operations, Webhooks, API Requests, Issues, Pull Requests, Actions, Packages, Pages, Copilot, Codespaces, Copilot AI Model Providers
+```
+
+- **One line, commas between.** There is no line-continuation syntax, so a wrapped list loses everything
+  after the first line.
+- **Names match GitHub's own, bar case and surrounding spaces.** `issues` is `Issues`; `operations` is not
+  `Git Operations`, and `copilot` is not `Copilot AI Model Providers`. Partial matches are refused on
+  purpose — one word would otherwise drag in a component you meant to leave out. A name matching nothing
+  is named in `log.txt`, once, since its only other symptom would be a mark that never appears.
+- **A component is faulty at `degraded_performance`, `partial_outage` or `major_outage`.** Scheduled
+  maintenance is not, matching how the page-wide check has always treated it.
+- **An empty list, or no key at all, watches the whole page** — the old behaviour, which is what every
+  `config.txt` written before this key existed says. Those files are never rewritten, so they keep it.
+- The tooltip and the log then name what is actually broken: `GitHub: Issues (Partial Outage)` rather
+  than `GitHub: Partially Degraded Service`.
+
+Naming components costs one extra request per five minutes' check: `components.json` rather than the
+219-byte `status.json`. An unfiltered install still reads the small one.
 
 **Restart after editing — the menu offers it.** Settings are read once at startup, so **Open Settings**
 opens the file and then watches it. Once the contents change and stay unchanged for a few seconds, a dialog
@@ -369,7 +400,7 @@ memory and never write one to disk.
 | `PR status off: setup failed` | No HTTP client could be built; clicking will not help |
 | `PR status off in config.txt` | All three signals switched off |
 | `... state unknown` | Several polls failed; that signal is no longer trustworthy, and the exclamation is up |
-| `GitHub: <description>` | GitHub reports an incident; quotes its own wording, and comes first in the tooltip |
+| `GitHub: <description>` | GitHub reports an incident; quotes its own wording, and comes first in the tooltip. With `statusComponents` set, the description names the components: `Issues (Partial Outage)` |
 | `Update available: X.Y.Z` | A newer release exists |
 
 A bar that is simply absent, with no message, means you genuinely have nothing pending. That distinction

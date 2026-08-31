@@ -204,6 +204,9 @@ pub struct PollInputs {
     /// Checked at the call site rather than inside `sound::hoot`, so the module stays a plain "play
     /// this" with no opinion about settings, and the loop's own log line is silent too when it is off.
     pub sound: bool,
+    /// Which parts of GitHub may raise the outage mark. Empty means the whole page — see
+    /// `config::Config::status_components`.
+    pub status_components: Vec<String>,
 }
 
 // ─── Shared polling core ──────────────────────────────────────────────────────
@@ -243,6 +246,7 @@ fn run_poll_loop(
         update_check: update_check_enabled,
         pr_enabled,
         sound: sound_enabled,
+        status_components,
     } = inputs;
     let client = match github::build_client() {
         Ok(client) => client,
@@ -278,6 +282,10 @@ fn run_poll_loop(
     let mut last_pr_reauth: Option<Instant> = None;
     // `None` means "never checked", which is what makes the first check happen immediately.
     let mut last_update_check: Option<Instant> = None;
+    // Remembered so a permanent typo in `statusComponents` is said once rather than every five
+    // minutes for as long as the app runs. `None` is "not asked yet", which is why the first
+    // successful check always reports.
+    let mut last_unmatched: Option<Vec<String>> = None;
     let mut last_status_check: Option<Instant> = None;
     // The release the last check found, held so the menu click has something to install without
     // re-asking GitHub. Cleared when a check finds nothing newer.
@@ -345,11 +353,28 @@ fn run_poll_loop(
         // A failed check deliberately does **not** clear a known outage: see `github_status`.
         if last_status_check.is_none_or(|at| at.elapsed() >= STATUS_CHECK_INTERVAL) {
             last_status_check = Some(Instant::now());
-            match crate::github_status::check(&client) {
-                Ok(crate::github_status::Health::Degraded { description }) => {
-                    state.set_status_degraded(Some(description));
+            match crate::github_status::check(&client, &status_components) {
+                Ok(report) => {
+                    // Only on a change, and the first answer always counts as one. A name that
+                    // matches nothing is a typo the user has to fix, and its only other symptom is a
+                    // mark that never appears — indistinguishable from GitHub being well.
+                    if last_unmatched.as_deref() != Some(report.unmatched.as_slice()) {
+                        if !report.unmatched.is_empty() {
+                            errorln!(
+                                "config.txt names components GitHub does not publish, so they are \
+                                 never watched: {}",
+                                report.unmatched.join(", ")
+                            );
+                        }
+                        last_unmatched = Some(report.unmatched);
+                    }
+                    match report.health {
+                        crate::github_status::Health::Degraded { description } => {
+                            state.set_status_degraded(Some(description));
+                        }
+                        crate::github_status::Health::Fine => state.set_status_degraded(None),
+                    }
                 }
-                Ok(crate::github_status::Health::Fine) => state.set_status_degraded(None),
                 Err(e) => errorln!("could not read GitHub's status page: {e}"),
             }
         }

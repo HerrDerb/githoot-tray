@@ -399,6 +399,7 @@ fn main() {
             // which bar a setting controls.
             pr_enabled: state::PrAxis::ALL.map(|axis| config.pr_enabled(axis)),
             sound: config.sound,
+            status_components: config.status_components.clone(),
         },
         wake_rx,
         restart_tx,
@@ -806,6 +807,7 @@ fn main() {
             // which bar a setting controls.
             pr_enabled: state::PrAxis::ALL.map(|axis| config.pr_enabled(axis)),
             sound: config.sound,
+            status_components: config.status_components.clone(),
         },
         wake_rx,
         proxy,
