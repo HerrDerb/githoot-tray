@@ -1,6 +1,6 @@
 [package]
 name = "githoot-tray"
-version = "1.9.1"
+version = "1.10.0"
 edition = "2024"
 
 [[bin]]
