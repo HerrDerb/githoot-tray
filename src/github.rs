@@ -421,7 +421,7 @@ pub fn classify_with(
     }
 
     if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
-        return match rate_limit_wait(headers, now) {
+        return match rate_limit_wait(headers, body, now) {
             Some(retry_after) => PollResult::RateLimited { retry_after },
             // A 403 with no rate-limit signal is a different animal — most likely the token
             // lacks the scope or permission the endpoint needs. Backing off will not help, but
@@ -448,7 +448,14 @@ pub fn classify_with(
 ///
 /// Returns `None` when the response carries no rate-limit signal at all, which is how the
 /// caller distinguishes "slow down" from an unrelated 403.
-fn rate_limit_wait(headers: &HeaderMap, now: u64) -> Option<Duration> {
+///
+/// The body is read, not just the headers, because a **secondary** rate limit can arrive with
+/// neither `retry-after` nor an exhausted primary quota — the quota headers still say there is
+/// plenty left, and the only thing naming the limit is the JSON message. Read from headers alone
+/// that response looks like a permission failure, which is a `Transient` — and three of those in
+/// a row make every axis give up its last known count and blank the tray. Holding the count is
+/// the whole point: a secondary limit says "you asked too fast", never "there is nothing there".
+fn rate_limit_wait(headers: &HeaderMap, body: &str, now: u64) -> Option<Duration> {
     // 1. `retry-after` is an instruction, not a suggestion. Retrying inside this window is
     //    how a short secondary limit becomes a long one.
     if let Some(secs) = header_u64(headers, RETRY_AFTER.as_str()) {
@@ -462,7 +469,21 @@ fn rate_limit_wait(headers: &HeaderMap, now: u64) -> Option<Duration> {
         return Some(Duration::from_secs(wait.max(DEFAULT_RATE_LIMIT_WAIT.as_secs())));
     }
 
+    // 3. A secondary limit that said so only in the body. Both wordings are matched: GitHub
+    //    renamed "abuse detection mechanism" to "secondary rate limit" and still emits the old
+    //    text from some endpoints. Lowercased first so a change of capitalisation cannot silently
+    //    turn this back into a blanked tray.
+    if is_secondary_rate_limit(body) {
+        return Some(DEFAULT_RATE_LIMIT_WAIT);
+    }
+
     None
+}
+
+/// Whether a 403/429 body is GitHub saying "too fast" rather than "not allowed".
+fn is_secondary_rate_limit(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("secondary rate limit") || body.contains("abuse detection mechanism")
 }
 
 fn describe(status: StatusCode, body: &str) -> String {
@@ -805,6 +826,42 @@ mod tests {
             search(StatusCode::FORBIDDEN, &headers(&[]), "missing permission", 0),
             PollResult::Transient(_)
         ));
+    }
+
+    /// The real 403 that blanked the tray: a secondary limit, no `retry-after`, and quota headers
+    /// that still look healthy. Header-only classification called this a permission failure.
+    #[test]
+    fn secondary_rate_limit_in_the_body_is_rate_limited_not_transient() {
+        let h = headers(&[("x-ratelimit-remaining", "4998")]);
+        let body = r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again.","documentation_url":"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"}"#;
+        match search(StatusCode::FORBIDDEN, &h, body, 0) {
+            PollResult::RateLimited { retry_after } => assert_eq!(retry_after, DEFAULT_RATE_LIMIT_WAIT),
+            other => panic!("expected RateLimited, got {:?}", other),
+        }
+        assert!(matches!(
+            notif(StatusCode::FORBIDDEN, &h, body, 0),
+            PollResult::RateLimited { .. }
+        ));
+    }
+
+    /// GitHub's older wording for the same thing, still emitted by some endpoints.
+    #[test]
+    fn abuse_detection_wording_is_rate_limited() {
+        let body = r#"{"message":"You have triggered an abuse detection mechanism."}"#;
+        assert!(matches!(
+            search(StatusCode::FORBIDDEN, &headers(&[]), body, 0),
+            PollResult::RateLimited { .. }
+        ));
+    }
+
+    /// An explicit `retry-after` still outranks the body's generic minute.
+    #[test]
+    fn retry_after_outranks_the_secondary_limit_default() {
+        let h = headers(&[("retry-after", "120")]);
+        match search(StatusCode::FORBIDDEN, &h, "secondary rate limit", 0) {
+            PollResult::RateLimited { retry_after } => assert_eq!(retry_after, Duration::from_secs(120)),
+            other => panic!("expected RateLimited, got {:?}", other),
+        }
     }
 
     #[test]

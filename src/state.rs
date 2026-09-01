@@ -1093,6 +1093,27 @@ mod tests {
         assert_eq!(state.icon().review_requested, Presence::Yes);
     }
 
+    /// The point of separating `RateLimited` from `Transient`: a limit is not our data going
+    /// stale, so it never expires the way three transient failures do. A secondary limit can
+    /// easily outlast `FAILURES_BEFORE_UNKNOWN` cycles, and blanking the tray then would be the
+    /// app forgetting a count GitHub never disputed.
+    #[test]
+    fn a_long_rate_limit_streak_never_gives_up_the_last_count() {
+        let mut state = new_state(true, true);
+        cycle(&mut state, fresh(true), Some(fresh_count(4)));
+        for _ in 0..(FAILURES_BEFORE_UNKNOWN + 5) {
+            cycle(&mut state, rate_limited(60), Some(rate_limited(60)));
+        }
+        assert_eq!(state.icon().review_requested, Presence::Yes);
+        assert_eq!(state.icon().notifications, Presence::Yes);
+        assert!(!state.icon().signals_unsure, "a limit is not us losing track");
+        assert!(
+            state.pr_menu_label(PrAxis::ReviewRequested).contains('4'),
+            "the count itself must survive, not just the dot: {}",
+            state.pr_menu_label(PrAxis::ReviewRequested)
+        );
+    }
+
     /// Paired with `forced_delay_applies_to_one_cycle_only`: the scheduler reads this to decide
     /// whether a burst may run, so it has to be true for exactly as long as the delay itself is.
     #[test]
