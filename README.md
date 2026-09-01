@@ -268,7 +268,7 @@ Three independent signals, each a GitHub Search query against your own pull requ
 
 | Bar | Query |
 |---|---|
-| 🔴 | `is:pr review-requested:@me state:open archived:false -label:dependencies -author:app/dependabot -author:app/renovate` |
+| 🔴 | `is:pr review-requested:@me state:open draft:false archived:false -label:dependencies -author:app/dependabot -author:app/renovate` |
 | 🟢 | `is:pr author:@me review:approved state:open draft:false archived:false` |
 | 🟠 | `is:pr author:@me review:changes_requested state:open archived:false` |
 

@@ -55,10 +55,19 @@ static UPDATE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// rather than guaranteed — a repo with custom Dependabot config, or Renovate instead, would slip
 /// through — so the bot authors are excluded by name as well.
 ///
+/// `draft:false`, same as `MERGE_QUERY`: a draft is not ready for review by GitHub's own
+/// definition, so a request parked on one is work that cannot be acted on yet. It lights the dot
+/// the moment the author marks it ready, because leaving draft state is an update to the PR.
+///
+/// `review-requested:@me`, not `user-review-requested:@me` — a deliberate choice between two
+/// documented qualifiers. The wider one also matches PRs where a *team* the user belongs to was
+/// asked, which is still work someone expects picked up, and it clears once anyone on the team
+/// reviews. The narrower one would count only requests naming the user directly.
+///
 /// `sort:updated-desc` from the equivalent UI search is deliberately absent: it is a UI-only
 /// qualifier (the REST API takes separate `sort`/`order` params) and irrelevant when the only
 /// thing read from the response is `total_count`.
-const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open archived:false \
+const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open draft:false archived:false \
                             -label:dependencies -author:app/dependabot -author:app/renovate";
 
 /// Search query for the user's own pull requests that are approved.
@@ -128,11 +137,14 @@ fn poll_pr(client: &reqwest::blocking::Client, token: &str, axis: PrAxis) -> git
     }
 }
 
-/// The GitHub page listing exactly what `axis`'s dot is counting.
+/// The GitHub page listing what `axis`'s dot is counting.
 ///
-/// Built from the same query the search itself uses, so the page can never disagree with the
-/// icon. A hand-written URL drifts the moment a query changes — and a dot claiming 3 next to a
-/// page showing 5 is worse than no dot at all.
+/// Built from the same query the search itself uses, so the page cannot drift from the icon the
+/// way a hand-written URL would the moment a query changes. For the two `SearchTotal` axes that
+/// makes page and count exactly equal. `ChangesRequested` is the exception: its count is further
+/// narrowed client-side by `github::poll_changes_requested`'s "still on you" filter, which Search
+/// has no qualifier for — so that page is a superset, showing handed-back PRs the dot no longer
+/// counts. A page listing slightly more than the dot beats one missing PRs the dot claims.
 pub fn pr_list_url(axis: PrAxis) -> String {
     format!(
         "https://github.com/pulls?q={}",
@@ -1101,6 +1113,7 @@ mod tests {
         for qualifier in [
             "review-requested%3A%40me",
             "state%3Aopen",
+            "draft%3Afalse",
             "archived%3Afalse",
             "-label%3Adependencies",
             "-author%3Aapp%2Fdependabot",
