@@ -70,18 +70,22 @@ static UPDATE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 const REVIEW_QUERY: &str = "is:pr review-requested:@me state:open draft:false archived:false \
                             -label:dependencies -author:app/dependabot -author:app/renovate";
 
-/// Search query for the user's own pull requests that are approved.
+/// Search query for the user's own pull requests that might be approved.
 ///
-/// The whole test, server-side: approved, open, not a draft. There is deliberately no CI qualifier.
-/// A red check used to disqualify a hit — the bar meant *approved and mergeable* — and that hid the
-/// one thing worth being told, that somebody approved your work. Approval is the signal now; whether
-/// CI is green is a question you go and answer on the page the entry opens.
+/// Server-side: yours, open, not a draft. *Approved* is judged client-side by `github::approved`, and
+/// there is deliberately no `review:approved` here. That qualifier reads `reviewDecision`, GitHub's
+/// verdict on a repository's review *policy*, and a repository that requires no reviews gets no verdict:
+/// every one of its pull requests reports `null`, approved or not, and the qualifier matches none of
+/// them. The green bar sat dark over six approved PRs before this was noticed. Reading the reviews
+/// themselves is what the PR page does, and it is what this axis does now — see `PR_REVIEWS_DOCUMENT`.
 ///
-/// So `status:success` is not merely unused but unwanted. (It would not have worked anyway: it reads
-/// only GitHub's legacy combined commit status, empty for repos whose checks are all check runs, where
-/// it matches nothing at all.) Also still unchecked, and always was: branch-protection rules needing
-/// more than one approval or named reviewers.
-const MERGE_QUERY: &str = "is:pr author:@me review:approved state:open draft:false archived:false";
+/// There is deliberately no CI qualifier either. A red check used to disqualify a hit — the bar meant
+/// *approved and mergeable* — and that hid the one thing worth being told, that somebody approved your
+/// work. Whether CI is green is a question you go and answer on the page the entry opens. So
+/// `status:success` is not merely unused but unwanted. (It would not have worked anyway: it reads only
+/// GitHub's legacy combined commit status, empty for repos whose checks are all check runs.) Also still
+/// unchecked, and always was: branch-protection rules needing more than one approval or named reviewers.
+const MERGE_QUERY: &str = "is:pr author:@me state:open draft:false archived:false";
 
 /// Search query for the user's own pull requests where a reviewer requested changes.
 const CHANGES_QUERY: &str = "is:pr author:@me review:changes_requested state:open archived:false";
@@ -110,7 +114,9 @@ enum PrEndpoint {
     /// A `total_count` read off the REST Search API, `per_page=1`. Nothing about the individual hits is
     /// needed, so nothing about them is fetched.
     SearchTotal,
-    /// The GraphQL search, because the answer needs reading hit by hit.
+    /// The GraphQL search judged by `github::approved`, because the answer needs reading hit by hit.
+    ApprovedGraphQl,
+    /// The GraphQL search judged by `github::still_on_you`, for the same reason.
     ChangesGraphQl,
 }
 
@@ -118,38 +124,71 @@ enum PrEndpoint {
 fn pr_endpoint(axis: PrAxis) -> PrEndpoint {
     match axis {
         PrAxis::ReviewRequested => PrEndpoint::SearchTotal,
-        PrAxis::ReadyToMerge => PrEndpoint::SearchTotal,
+        PrAxis::ReadyToMerge => PrEndpoint::ApprovedGraphQl,
         PrAxis::ChangesRequested => PrEndpoint::ChangesGraphQl,
     }
 }
 
 /// Issues `axis`'s poll.
 ///
-/// All three axes take the same query string; they differ only in which endpoint answers it and how
-/// much of the answer has to be read. `ChangesRequested` is the one that cannot be a plain
-/// `total_count`, because the Search query alone cannot tell "still on me" from "handed back" — see
-/// `github::poll_changes_requested`.
+/// All three axes take the same kind of query string; they differ in which endpoint answers it and how
+/// much of the answer has to be read. Only `ReviewRequested` is a plain `total_count`. The other two
+/// judge each hit by its reviews client-side, because Search's `review:` qualifier reads a field GitHub
+/// leaves empty wherever no review policy exists — see `github::PR_REVIEWS_DOCUMENT`.
 fn poll_pr(client: &reqwest::blocking::Client, token: &str, axis: PrAxis) -> github::PollResponse {
     let query = pr_query(axis);
     match pr_endpoint(axis) {
         PrEndpoint::SearchTotal => github::poll_reviews(client, token, query),
+        PrEndpoint::ApprovedGraphQl => github::poll_approved(client, token, query),
         PrEndpoint::ChangesGraphQl => github::poll_changes_requested(client, token, query),
     }
 }
 
-/// The GitHub page listing what `axis`'s dot is counting.
+/// The GitHub search page for `axis`'s query.
 ///
 /// Built from the same query the search itself uses, so the page cannot drift from the icon the
-/// way a hand-written URL would the moment a query changes. For the two `SearchTotal` axes that
-/// makes page and count exactly equal. `ChangesRequested` is the exception: its count is further
-/// narrowed client-side by `github::poll_changes_requested`'s "still on you" filter, which Search
-/// has no qualifier for — so that page is a superset, showing handed-back PRs the dot no longer
-/// counts. A page listing slightly more than the dot beats one missing PRs the dot claims.
+/// way a hand-written URL would the moment a query changes. For `ReviewRequested`, the one
+/// `SearchTotal` axis, that makes page and count exactly equal, and the page is what its menu entry
+/// opens. The two GraphQL axes narrow their hits client-side with a rule Search has no qualifier for,
+/// so for them this page is a superset — every open PR of yours for the green bar, every PR with
+/// changes requested including handed-back ones for the amber — and only the *fallback* for a click
+/// (see `pr_targets`). A page listing more than the dot beats one missing PRs the dot claims.
 pub fn pr_list_url(axis: PrAxis) -> String {
     format!(
         "https://github.com/pulls?q={}",
         percent_encode(&format!("{} {REVIEW_UI_SORT}", pr_query(axis)))
     )
+}
+
+/// The last PR URLs each axis's poll confirmed, indexed by `PrAxis::index`, for `pr_targets`.
+///
+/// A `static` for the same reason `UPDATE_IN_FLIGHT` is: the writer is the poll thread and the
+/// reader is a menu-click handler on the UI thread, created before the poll loop exists, so there
+/// is no value to thread through. `None` means "no confirmed list" — never "no PRs", which is
+/// `Some(vec![])`. `ReviewRequested`'s slot stays `None` for life: a `total_count` read has no hits
+/// to name, and its search page is exact anyway.
+static PR_URLS: std::sync::Mutex<[Option<Vec<String>>; 3]> =
+    std::sync::Mutex::new([None, None, None]);
+
+/// What clicking `axis`'s menu entry should open.
+///
+/// The exact PRs the dot is counting when the poll has a confirmed list, because no search URL can
+/// express either GraphQL axis's rule: `review:approved` misses every approval in a repository that
+/// requires none, and `review:changes_requested` keeps matching a PR after the author re-requests
+/// review. The search page remains the fallback for every state where the list cannot be trusted:
+/// before the first answer, after the track gives up, when the payload had holes — and when the list
+/// is confirmed *empty*, where the page at least shows the superset instead of a click doing nothing.
+pub fn pr_targets(axis: PrAxis) -> Vec<String> {
+    let known = PR_URLS.lock().expect("PR-URLs lock poisoned");
+    targets_from(axis, known[axis.index()].as_deref())
+}
+
+/// The decision itself, split from the `static` so it can be tested without shared state.
+fn targets_from(axis: PrAxis, known: Option<&[String]>) -> Vec<String> {
+    match known {
+        Some(urls) if !urls.is_empty() => urls.to_vec(),
+        _ => vec![pr_list_url(axis)],
+    }
 }
 
 /// Percent-encodes a query for use in a URL.
@@ -414,6 +453,11 @@ fn run_poll_loop(
                 Err(e) => errorln!("could not read GitHub's status page: {e}"),
             }
         }
+
+        // Published before `emit` for the same reason the outage check is: the menu entries the URLs
+        // belong to are about to be relabeled with this cycle's counts, and a click between the two
+        // writes must open what the new label claims, not what the old one did.
+        *PR_URLS.lock().expect("PR-URLs lock poisoned") = PrAxis::ALL.map(|axis| state.pr_urls(axis));
 
         // Read here, right after the axes were applied, rather than after `emit`: the flags belong to
         // this cycle's responses, and taking them next to the code that produced them is what keeps
@@ -998,19 +1042,26 @@ mod tests {
 
     const STEADY: Duration = Duration::from_secs(60);
 
-    /// The approved axis reads a count and nothing else.
-    ///
-    /// It used to fetch each hit's `statusCheckRollup` over GraphQL so a red-CI pull request could be
-    /// filtered out. Approval alone now lights the bar, so there is nothing left to read off a hit — and
-    /// a `total_count` read is not merely simpler: it asks for one hit instead of a hundred, and its
-    /// count is exact past the hundred the GraphQL page could see.
+    /// The review-requested axis reads a count and nothing else: `review-requested:@me` is a real
+    /// server-side filter, so nothing about a hit needs reading.
     #[test]
-    fn ready_to_merge_reads_a_plain_search_total() {
-        assert_eq!(pr_endpoint(PrAxis::ReadyToMerge), PrEndpoint::SearchTotal);
+    fn review_requested_reads_a_plain_search_total() {
         assert_eq!(pr_endpoint(PrAxis::ReviewRequested), PrEndpoint::SearchTotal);
     }
 
-    /// The guard against over-reaching. Dropping one axis's client-side rule must not drop the other's:
+    /// The approved axis went back to GraphQL, and its query must not carry the qualifier it left behind.
+    ///
+    /// It was a `total_count` read from 1.11.0 (`review:approved`, after the CI gate came out) until
+    /// `review:approved` was found to match nothing in a repository that requires no reviews — GitHub
+    /// leaves `reviewDecision` empty there, and the qualifier reads nothing else. So the hits are judged
+    /// by their reviews again, and putting `review:approved` back into the query would silently
+    /// reintroduce the hole in front of the judge.
+    #[test]
+    fn ready_to_merge_judges_reviews_over_graphql_without_a_review_qualifier() {
+        assert_eq!(pr_endpoint(PrAxis::ReadyToMerge), PrEndpoint::ApprovedGraphQl);
+        assert!(!MERGE_QUERY.contains("review:"), "got {MERGE_QUERY}");
+    }
+
     /// `still_on_you` answers a question the Search query genuinely cannot, so this axis keeps GraphQL.
     #[test]
     fn changes_requested_still_needs_graphql() {
@@ -1134,13 +1185,31 @@ mod tests {
         assert!(url.starts_with("https://github.com/pulls?q="), "got {url}");
         for qualifier in [
             "author%3A%40me",
-            "review%3Aapproved",
             "state%3Aopen",
             "draft%3Afalse",
             "archived%3Afalse",
             "sort%3Aupdated-desc",
         ] {
             assert!(url.contains(qualifier), "{qualifier} missing from {url}");
+        }
+        // The fallback page is a superset on purpose; `review:approved` would make it miss the very
+        // PRs the bar exists to show.
+        assert!(!url.contains("review%3A"), "got {url}");
+    }
+
+    /// The click opens the dot's own list when there is one, and only then. `None` (never
+    /// confirmed, or the track gave up) and a confirmed-empty list both fall back to the search
+    /// page — the first because there is nothing to stand behind, the second because a click that
+    /// opens nothing reads as a dead menu entry.
+    #[test]
+    fn click_targets_are_the_confirmed_urls_or_the_search_page() {
+        let urls = vec!["https://github.com/o/r/pull/1".to_string()];
+        for axis in [PrAxis::ReadyToMerge, PrAxis::ChangesRequested] {
+            assert_eq!(targets_from(axis, Some(&urls)), urls);
+
+            let fallback = vec![pr_list_url(axis)];
+            assert_eq!(targets_from(axis, None), fallback);
+            assert_eq!(targets_from(axis, Some(&[])), fallback);
         }
     }
 

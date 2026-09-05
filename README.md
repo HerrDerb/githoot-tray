@@ -31,7 +31,7 @@ blue when notifications are on and something is unread
 | Icon | Mark | Means |
 |:---:|---|---|
 | <img src="docs/icons/tray_review.png" alt="review bar" height="28"> | red bar | A PR is waiting on your review |
-| <img src="docs/icons/tray_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved and its checks pass |
+| <img src="docs/icons/tray_merge.png" alt="merge bar" height="28"> | green bar | One of your PRs is approved |
 | <img src="docs/icons/tray_changes.png" alt="changes bar" height="28"> | amber bar | A reviewer asked for changes on your PR |
 | <img src="docs/icons/tray_update.png" alt="update arrow" height="28"> | green up-arrow | A newer release is available |
 | <img src="docs/icons/tray_alert.png" alt="exclamation" height="28"> | red exclamation | Something needs saying, see below |
@@ -146,8 +146,8 @@ and a Defender exclusion is a decision to make deliberately rather than a step i
 | **Authenticate GitHub PR Status** | PR status has no usable credential | Starts the sign-in flow |
 | **Open GitHub Notifications** | Notifications on and something unread | Opens them, then re-checks a few seconds later |
 | **Open Requested Reviews (N)** | A PR waits on your review | Opens exactly what the red bar counts, newest first |
-| **Open Approved PRs (N)** | One of yours has been approved | Opens exactly what the green bar counts |
-| **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens GitHub's changes-requested list, which can show more than the bar counts (see below) |
+| **Open Approved PRs (N)** | One of yours has been approved | Opens the exact PRs the bar counts, one tab each; falls back to a list of your open PRs when it has no confirmed list (see below) |
+| **Open Changes Requested (N)** | A reviewer asked for changes and it is still on you | Opens the exact PRs the bar counts, one tab each; falls back to GitHub's changes-requested list when it has no confirmed list (see below) |
 | **Open PR inbox** | None of the three entries above is shown | Opens [GitHub's own PR inbox](https://github.com/pulls/inbox) |
 | *— separator —* | Always | |
 | **Open Settings** | Always | Opens `config.txt`, then offers a restart once your edits settle (see below) |
@@ -168,12 +168,14 @@ authorized and the three entries that do need one are hidden.
 The requested-reviews URL is generated from the same query its bar counts, so that page cannot disagree
 with the icon. Labels carry the exact count, unbounded.
 
-**The other two bars apply a filter GitHub's web search cannot express, so their pages can list more
-than the bar counts — the bar is the accurate one.** Ready to merge counts approved PRs whose checks
-are green (see below); the page it opens shows every approved PR, including ones with red or pending
-checks. Changes requested counts PRs where a reviewer asked for changes *and no re-review is pending
-from that reviewer* — so once you push fixes and re-request the review, the bar goes dark — but its
-page still shows every PR with changes requested, including ones you have already handed back.
+**The other two bars apply a filter GitHub's web search cannot express, so no search page can match
+them.** Approved reads each PR's reviews, because `review:approved` misses every approval in a repository
+that requires none (see below). Changes requested counts a PR only while *no re-review is pending from the
+reviewer who asked*, and `review:changes_requested` keeps matching one you have already handed back.
+Clicking either entry therefore opens the exact pull requests its bar counts, one tab each, straight from
+the poll that counted them. A search page remains the fallback whenever there is no confirmed list to
+open: before the first answer, while the axis has lost track, or when the bar counts zero. For approved
+that page is simply your open PRs; for changes requested it is GitHub's changes-requested list.
 
 ---
 
@@ -266,24 +268,35 @@ read and update checks come back on.
 
 Three independent signals, each a GitHub Search query against your own pull requests:
 
-| Bar | Query |
-|---|---|
-| 🔴 | `is:pr review-requested:@me state:open draft:false archived:false -label:dependencies -author:app/dependabot -author:app/renovate` |
-| 🟢 | `is:pr author:@me review:approved state:open draft:false archived:false` |
-| 🟠 | `is:pr author:@me review:changes_requested state:open archived:false` |
+| Bar | Query | Then |
+|---|---|---|
+| 🔴 | `is:pr review-requested:@me state:open draft:false archived:false -label:dependencies -author:app/dependabot -author:app/renovate` | counted as is |
+| 🟢 | `is:pr author:@me state:open draft:false archived:false` | a hit counts when its latest reviews hold an `APPROVED` and no `CHANGES_REQUESTED` |
+| 🟠 | `is:pr author:@me review:changes_requested state:open archived:false` | a hit counts while no re-review is pending from the reviewer who asked |
+
+**The green bar reads the reviews, not `review:approved`.** That qualifier looks like "somebody approved
+this", and it is not. It is a projection of `reviewDecision`, GitHub's verdict on whether the base branch's
+*review policy* is satisfied, and a repository that requires no reviews gets no verdict: `reviewDecision`
+is `null` on every one of its pull requests, approved or not, and `review:approved` matches none of them.
+Measured on a repository with no required-review rule: 100 of its last 100 PRs reported `null`, six of them
+carrying a real `APPROVED` review on the head commit. The PR page still showed its green **Approved**
+badge, because the page reads the reviews. So the bar does too, over GraphQL: the query above narrows to
+your open PRs, and each hit is judged by its `latestOpinionatedReviews`, one verdict per reviewer.
+
+One approver's yes does not outrank another's no. A PR with an `APPROVED` and a standing
+`CHANGES_REQUESTED` counts as changes requested, not as approved, which is GitHub's own precedence and what
+keeps the two bars from lighting for the same PR. An approval on a commit you have since pushed over still
+counts: the PR page shows it, and this bar reports news rather than gating a merge.
 
 **The green bar means approved, not mergeable.** It used to mean both: through 1.10.0 the bar counted an
 approved pull request only when its GraphQL `statusCheckRollup` was `SUCCESS`, so one red or still-running
 check darkened it. That hid the thing worth being told — somebody approved your work — and it also
-disagreed with the entry beside it, since **Open Ready to Merge** opened the query above, red checks
-included. Approval is the whole signal now. Whether CI is green is a question you answer on the page the
-entry opens.
-
-Dropping the gate makes this axis a plain `total_count` read again: it asks for one search hit instead of
-a hundred, and its count is exact past 100 approved PRs, which the GraphQL page could not see past.
+disagreed with the entry beside it. Approval is the whole signal now. Whether CI is green is a question you
+answer on the page the entry opens.
 
 Still not checked, and never was: branch protection needing multiple approvals or named reviewers, and
-merge conflicts (`mergeable` is computed lazily and reads `UNKNOWN` on a cold poll).
+merge conflicts (`mergeable` is computed lazily and reads `UNKNOWN` on a cold poll). Also unchanged: the
+GraphQL page reads at most 100 open PRs of yours, so past that the bar undercounts.
 
 Two GitHub App permissions are now unused: **Checks: read** and **Commit statuses: read**, which the
 rollup needed. They are still requested rather than withdrawn, because narrowing an installed App's
@@ -293,7 +306,8 @@ permissions makes every installation owner re-approve — a real cost to pay for
 reviewer's earlier verdict, so `review:changes_requested` keeps matching a pull request you have already
 handed back, and the bar used to stay lit until the reviewer replied. That query is now sent through
 GraphQL, which also returns each pull request's pending review requests, and a hit is counted only when
-**no re-review is pending from a reviewer who requested changes**. Adding a *different* reviewer does not
+**no re-review is pending from a reviewer who requested changes**. The same GraphQL answer carries each
+counted PR's URL, which is what the menu entry opens. Adding a *different* reviewer does not
 clear it — the original objection still stands. A pending *team* request does not clear it either, since a
 team has no login to match against the blocker; erring that way keeps the bar lit rather than hiding work.
 

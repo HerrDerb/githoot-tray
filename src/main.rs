@@ -273,8 +273,12 @@ fn main() {
     let ready_to_merge_item = MenuItem::with_label(state::PrAxis::ReadyToMerge.menu_label());
     let ready_to_merge_wake_tx = wake_tx.clone();
     ready_to_merge_item.connect_activate(move |_| {
-        if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReadyToMerge)) {
-            errorln!("failed to open browser: {e}");
+        // The exact PRs the dot counts when the poll has them, the search page otherwise — see
+        // `scheduler::pr_targets` for why the page alone cannot match the dot.
+        for url in scheduler::pr_targets(state::PrAxis::ReadyToMerge) {
+            if let Err(e) = open::that(url) {
+                errorln!("failed to open browser: {e}");
+            }
         }
         let _ = ready_to_merge_wake_tx.send(scheduler::Wake::Refresh);
     });
@@ -282,8 +286,11 @@ fn main() {
     let changes_requested_item = MenuItem::with_label(state::PrAxis::ChangesRequested.menu_label());
     let changes_requested_wake_tx = wake_tx.clone();
     changes_requested_item.connect_activate(move |_| {
-        if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ChangesRequested)) {
-            errorln!("failed to open browser: {e}");
+        // Same as the approved entry above: exact PRs first, search page as the fallback.
+        for url in scheduler::pr_targets(state::PrAxis::ChangesRequested) {
+            if let Err(e) = open::that(url) {
+                errorln!("failed to open browser: {e}");
+            }
         }
         let _ = changes_requested_wake_tx.send(scheduler::Wake::Refresh);
     });
@@ -875,13 +882,20 @@ fn main() {
                 // Reviewing is what clears the dot, so pull the next poll forward.
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.ready_to_merge_item_id {
-                if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ReadyToMerge)) {
-                    errorln!("failed to open browser: {e}");
+                // The exact PRs the dot counts when the poll has them, the search page otherwise —
+                // see `scheduler::pr_targets`.
+                for url in scheduler::pr_targets(state::PrAxis::ReadyToMerge) {
+                    if let Err(e) = open::that(url) {
+                        errorln!("failed to open browser: {e}");
+                    }
                 }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.changes_requested_item_id {
-                if let Err(e) = open::that(scheduler::pr_list_url(state::PrAxis::ChangesRequested)) {
-                    errorln!("failed to open browser: {e}");
+                // Same as the approved entry above: exact PRs first, search page as the fallback.
+                for url in scheduler::pr_targets(state::PrAxis::ChangesRequested) {
+                    if let Err(e) = open::that(url) {
+                        errorln!("failed to open browser: {e}");
+                    }
                 }
                 let _ = self.wake_tx.send(scheduler::Wake::Refresh);
             } else if *id == tray.pr_inbox_item_id {

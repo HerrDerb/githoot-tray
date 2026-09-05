@@ -41,11 +41,24 @@ const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 /// Cap on how much of an error body ends up in a log line or tooltip.
 const MAX_DETAIL_CHARS: usize = 200;
 
-/// Turns a 2xx body into `(signal_present, exact_count_if_the_endpoint_gives_one)`.
+/// What a success-body parser extracts from a 2xx body.
 ///
-/// The two endpoints differ only here: everything about status codes and rate limits is shared,
+/// The endpoints differ only here: everything about status codes and rate limits is shared,
 /// so this is the single seam between them.
-type BodyParser = fn(&str) -> Result<(bool, Option<u32>), String>;
+struct Parsed {
+    /// Whether the signal is present at all — the one field every endpoint can answer.
+    present: bool,
+    /// Exact match count, when the endpoint provides one (search does; notifications does not).
+    count: Option<u32>,
+    /// The URLs of the exact items `count` counted, when the endpoint reads its hits one by one.
+    /// Only the changes-requested GraphQL query does; for everything else the count is a server
+    /// total whose members were never fetched, so this is `None` — as it also is when any counted
+    /// hit came back without a URL, because a partial list would open fewer pages than the dot
+    /// claims. `None` means "send the user to the search page instead", never "no PRs".
+    urls: Option<Vec<String>>,
+}
+
+type BodyParser = fn(&str) -> Result<Parsed, String>;
 
 /// We only ever ask whether the unread list is non-empty, so no fields are needed.
 #[derive(Debug, Deserialize)]
@@ -69,6 +82,10 @@ pub enum PollResult {
         /// Exact match count when the endpoint provides one (search does; notifications does
         /// not, because we request `per_page=1` and only ask about presence).
         count: Option<u32>,
+        /// URLs of the exact items `count` counted, when the endpoint reads its hits one by
+        /// one — see `Parsed::urls`. Carried so the changes-requested menu entry can open the
+        /// very pull requests its dot is counting, which no search URL can express.
+        urls: Option<Vec<String>>,
     },
     /// 304 — the notification list is unchanged, so whatever we already show is still right.
     NotModified,
@@ -150,21 +167,27 @@ pub fn poll_reviews(client: &Client, token: &str, query: &str) -> PollResponse {
     send(request, token, None, parse_search_total)
 }
 
-/// The one query that cannot be a `total_count` read.
+/// The GraphQL document behind both axes that judge pull requests by their reviews.
 ///
-/// Re-requesting a review does not dismiss the reviewer's earlier `CHANGES_REQUESTED` verdict — it only
-/// puts a pending request back on them. So GitHub keeps reporting `reviewDecision: CHANGES_REQUESTED`, and
-/// `review:changes_requested` keeps matching, for a pull request whose ball is squarely in the reviewer's
-/// court. Measured, not assumed: see the tests below for the exact payload shape.
+/// Search's `review:` qualifier is not a view of the reviews. It is a projection of `reviewDecision`,
+/// GitHub's verdict on whether the base branch's *review policy* is satisfied, and a repository with no
+/// such policy gets no verdict: `reviewDecision` stays `null` on every pull request, approved or not.
+/// Measured on 2026-09-05 across a repository with no required-review rule: 100 of its last 100 pull
+/// requests reported `null`, six of them carrying a genuine `APPROVED` review on the head commit, and
+/// `review:approved` matched none of them. The PR page still paints its green "Approved" badge, because
+/// the page reads the reviews. So this document reads what the page reads: `latestOpinionatedReviews`,
+/// one verdict per reviewer, `COMMENTED` already dropped.
 ///
-/// The only field that separates "still on me" from "handed back" is `reviewRequests`, and Search has no
-/// qualifier for it — `review:` accepts only `none`/`required`/`approved`/`changes_requested`, which are
-/// mutually exclusive projections of the same `reviewDecision`. Hence GraphQL: the same server-side query
-/// string, plus the two lists needed to intersect client-side.
-const CHANGES_REQUESTED_DOCUMENT: &str = "\
+/// The changes-requested axis needs one list more. Re-requesting a review does not dismiss the reviewer's
+/// earlier `CHANGES_REQUESTED` verdict — it only puts a pending request back on them — so the verdict
+/// alone cannot tell "still on me" from "handed back". `reviewRequests` can, and Search has no qualifier
+/// for it at all. Hence GraphQL for both: the axis's Search query string handed to `search` verbatim, plus
+/// the lists needed to judge each hit client-side.
+const PR_REVIEWS_DOCUMENT: &str = "\
 query($q:String!,$hits:Int!,$reviews:Int!){\
   search(query:$q,type:ISSUE,first:$hits){\
     nodes{...on PullRequest{\
+      url \
       latestOpinionatedReviews(first:$reviews){nodes{state author{login}}}\
       reviewRequests(first:$reviews){nodes{requestedReviewer{__typename ...on User{login}}}}\
     }}\
@@ -178,13 +201,28 @@ query($q:String!,$hits:Int!,$reviews:Int!){\
 ///
 /// No `If-None-Match`: GraphQL is a POST and does not answer `304`.
 pub fn poll_changes_requested(client: &Client, token: &str, query: &str) -> PollResponse {
+    poll_reviewed(client, token, query, parse_changes_requested)
+}
+
+/// Polls the user's own open pull requests and counts the ones a reviewer approved.
+///
+/// `query` must *not* carry `review:approved`: that qualifier is the `reviewDecision` projection this
+/// axis exists to get away from (see `PR_REVIEWS_DOCUMENT`). The server narrows to the user's open,
+/// non-draft pull requests; `approved` judges each hit by its reviews.
+pub fn poll_approved(client: &Client, token: &str, query: &str) -> PollResponse {
+    poll_reviewed(client, token, query, parse_approved)
+}
+
+/// The shared GraphQL request behind `poll_changes_requested` and `poll_approved`: same document, same
+/// variables, one parser apiece.
+fn poll_reviewed(client: &Client, token: &str, query: &str, parse_ok: BodyParser) -> PollResponse {
     let body = serde_json::json!({
-        "query": CHANGES_REQUESTED_DOCUMENT,
+        "query": PR_REVIEWS_DOCUMENT,
         "variables": { "q": query, "hits": SEARCH_HITS_CAP, "reviews": CHANGES_REVIEWS_CAP },
     });
     let request = client.post(GRAPHQL_URL).json(&body);
 
-    send(request, token, None, parse_changes_requested)
+    send(request, token, None, parse_ok)
 }
 
 /// Shared request/response plumbing for both endpoints.
@@ -230,17 +268,17 @@ fn send(
 }
 
 /// Success-body parser for `/notifications`: presence only, no count.
-fn parse_notifications(body: &str) -> Result<(bool, Option<u32>), String> {
+fn parse_notifications(body: &str) -> Result<Parsed, String> {
     serde_json::from_str::<Vec<Notification>>(body)
-        .map(|list| (!list.is_empty(), None))
+        .map(|list| Parsed { present: !list.is_empty(), count: None, urls: None })
         // Previously `.unwrap_or_default()`, which turned a garbled payload into "no unread".
         .map_err(|e| format!("unparseable notification payload: {e}"))
 }
 
 /// Success-body parser for `/search/issues`: exact count, so the tooltip can quote it.
-fn parse_search_total(body: &str) -> Result<(bool, Option<u32>), String> {
+fn parse_search_total(body: &str) -> Result<Parsed, String> {
     serde_json::from_str::<SearchResult>(body)
-        .map(|r| (r.total_count > 0, Some(r.total_count)))
+        .map(|r| Parsed { present: r.total_count > 0, count: Some(r.total_count), urls: None })
         .map_err(|e| format!("unparseable search payload: {e}"))
 }
 
@@ -287,6 +325,9 @@ struct SearchConnection {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestNode {
+    /// The PR's own web page. `Option` for the same lenience as everything else here: a hole
+    /// in the payload must degrade the menu entry (fall back to the search page), not the count.
+    url: Option<String>,
     latest_opinionated_reviews: Option<ReviewConnection>,
     review_requests: Option<RequestConnection>,
 }
@@ -366,15 +407,49 @@ fn still_on_you(pr: &PullRequestNode) -> bool {
     !handed_back
 }
 
-/// Success-body parser for the changes-requested GraphQL query.
+/// Whether a reviewer approved this pull request and nobody's objection stands against it.
+///
+/// The rule: at least one `APPROVED` among the latest opinionated reviews, and no `CHANGES_REQUESTED`.
+/// The veto is what keeps this axis and the changes-requested one disjoint now that neither is filtered
+/// server-side, and it is GitHub's own precedence: one reviewer's yes does not outrank another's no.
+/// Approvals on a superseded commit count — the PR page shows them, and this bar reports news, it does
+/// not gate a merge.
+///
+/// The fallback direction is the *opposite* of `still_on_you`'s. That predicate narrows a list the server
+/// already vouched for, so a hole in the payload leaves the bar lit. This one is the only filter there
+/// is: the server hands over every open pull request, and a missing or empty review list is simply no
+/// evidence of approval. Lighting a green bar over a PR nobody approved would be the false claim.
+fn approved(pr: &PullRequestNode) -> bool {
+    let mut any_approved = false;
+    for review in pr.latest_opinionated_reviews.iter().flat_map(|c| c.nodes.iter().flatten()) {
+        match review.state.as_str() {
+            "CHANGES_REQUESTED" => return false,
+            "APPROVED" => any_approved = true,
+            _ => {}
+        }
+    }
+    any_approved
+}
+
+/// Success-body parser for the changes-requested GraphQL query: `still_on_you` decides each hit.
+fn parse_changes_requested(body: &str) -> Result<Parsed, String> {
+    parse_reviewed(body, still_on_you)
+}
+
+/// Success-body parser for the approved GraphQL query: `approved` decides each hit.
+fn parse_approved(body: &str) -> Result<Parsed, String> {
+    parse_reviewed(body, approved)
+}
+
+/// Shared body of the two GraphQL parsers: one `PR_REVIEWS_DOCUMENT` answer, one predicate per axis.
 ///
 /// GraphQL answers `200 OK` and puts failures in an `errors` array, so `classify_with` cannot see them
 /// from the status line. A parser that read only `data` would turn any such failure into a confident
 /// **zero** — a dark bar meaning "the request broke". Errors are therefore checked before anything else
 /// and surface as `Err`, which becomes `Transient`, which leaves the previous count standing.
-fn parse_changes_requested(body: &str) -> Result<(bool, Option<u32>), String> {
-    let response: GraphQlResponse = serde_json::from_str(body)
-        .map_err(|e| format!("unparseable changes-requested payload: {e}"))?;
+fn parse_reviewed(body: &str, keep: fn(&PullRequestNode) -> bool) -> Result<Parsed, String> {
+    let response: GraphQlResponse =
+        serde_json::from_str(body).map_err(|e| format!("unparseable PR review payload: {e}"))?;
 
     if !response.errors.is_empty() {
         let joined =
@@ -387,8 +462,12 @@ fn parse_changes_requested(body: &str) -> Result<(bool, Option<u32>), String> {
         .ok_or_else(|| "GraphQL answered with neither data nor errors".to_string())?
         .search;
 
-    let count = search.nodes.iter().flatten().filter(|pr| still_on_you(pr)).count() as u32;
-    Ok((count > 0, Some(count)))
+    let counted: Vec<&PullRequestNode> = search.nodes.iter().flatten().filter(|pr| keep(pr)).collect();
+    let count = counted.len() as u32;
+    // All-or-nothing: a counted hit without a URL would make the menu entry open fewer pages
+    // than the dot claims, so one hole sends the whole click to the search-page fallback.
+    let urls: Option<Vec<String>> = counted.iter().map(|pr| pr.url.clone()).collect();
+    Ok(Parsed { present: count > 0, count: Some(count), urls })
 }
 
 /// Maps one HTTP response onto a `PollResult`.
@@ -400,7 +479,7 @@ fn parse_changes_requested(body: &str) -> Result<(bool, Option<u32>), String> {
 /// The status handling is shared by both endpoints and only the success-body parser differs,
 /// via `parse_ok`. Duplicating this for search would mean two copies of the 304-before-non-2xx
 /// ordering and the rate-limit precedence — i.e. two places for the original bug to come back.
-pub fn classify_with(
+fn classify_with(
     status: StatusCode,
     headers: &HeaderMap,
     body: &str,
@@ -435,9 +514,10 @@ pub fn classify_with(
     }
 
     match parse_ok(body) {
-        Ok((present, count)) => PollResult::Fresh {
-            present,
-            count,
+        Ok(parsed) => PollResult::Fresh {
+            present: parsed.present,
+            count: parsed.count,
+            urls: parsed.urls,
             etag: header_string(headers, ETAG.as_str()),
         },
         Err(why) => PollResult::Transient(why),
@@ -551,7 +631,7 @@ mod tests {
     #[test]
     fn non_empty_list_is_unread_and_keeps_etag() {
         match notif(StatusCode::OK, &headers(&[("etag", "\"abc\"")]), "[{}]", 0) {
-            PollResult::Fresh { present, etag, count } => {
+            PollResult::Fresh { present, etag, count, .. } => {
                 assert!(present);
                 assert_eq!(etag.as_deref(), Some("\"abc\""));
                 assert_eq!(count, None, "notifications use per_page=1, so there is no true count");
@@ -601,6 +681,12 @@ mod tests {
         format!(
             r#"{{"latestOpinionatedReviews":{{"nodes":[{reviews}]}},"reviewRequests":{{"nodes":[{requests}]}}}}"#
         )
+    }
+
+    /// A hit that also carries its web URL, the way the real payload does.
+    fn hit_at(url: &str, blockers: &[&str], pending: &[(&str, &str)]) -> String {
+        let bare = hit(blockers, pending);
+        format!(r#"{{"url":"{url}",{}"#, &bare[1..])
     }
 
     fn payload(hits: &[String]) -> String {
@@ -724,15 +810,167 @@ mod tests {
         }
     }
 
+    /// The click target follows the count: only the still-on-you hits' URLs are handed out, in
+    /// the order GitHub returned them, so the menu entry opens exactly what the dot claims.
+    #[test]
+    fn urls_are_collected_for_exactly_the_counted_hits() {
+        let body = payload(&[
+            hit_at("https://github.com/o/r/pull/1", &["alice"], &[("User", "alice")]), // handed back
+            hit_at("https://github.com/o/r/pull/2", &["bob"], &[]),                    // on you
+            hit_at("https://github.com/o/r/pull/3", &["carol"], &[("User", "dave")]),  // on you
+        ]);
+        match changes(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { count, urls, .. } => {
+                assert_eq!(count, Some(2));
+                assert_eq!(
+                    urls,
+                    Some(vec![
+                        "https://github.com/o/r/pull/2".to_string(),
+                        "https://github.com/o/r/pull/3".to_string(),
+                    ])
+                );
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// One counted hit without a URL poisons the whole list: opening two pages under a dot that
+    /// says three would be the count and the click disagreeing — the fallback page is honest.
+    #[test]
+    fn a_counted_hit_without_a_url_yields_no_list_but_keeps_the_count() {
+        let body = payload(&[
+            hit_at("https://github.com/o/r/pull/2", &["bob"], &[]),
+            hit(&["carol"], &[]), // counted, but the payload hole ate its URL
+        ]);
+        match changes(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { count, urls, .. } => {
+                assert_eq!(count, Some(2));
+                assert_eq!(urls, None);
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// A confirmed-empty page is `Some(vec![])`, not `None` — the difference between "no PRs"
+    /// and "could not read the list", which the menu fallback relies on.
+    #[test]
+    fn no_hits_yields_a_confirmed_empty_url_list() {
+        match changes(StatusCode::OK, &headers(&[]), &payload(&[]), 0) {
+            PollResult::Fresh { urls, .. } => assert_eq!(urls, Some(vec![])),
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// The two search-total endpoints have no per-hit view, so they must never claim one.
+    #[test]
+    fn search_totals_carry_no_urls() {
+        match search(StatusCode::OK, &headers(&[]), r#"{"total_count":7,"items":[{}]}"#, 0) {
+            PollResult::Fresh { urls, .. } => assert_eq!(urls, None),
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// The document has to fetch the field the parser reads, or every hit loses its URL and the
+    /// menu entry silently degrades to the search page forever.
+    #[test]
+    fn the_query_document_fetches_the_url() {
+        assert!(PR_REVIEWS_DOCUMENT.contains("url"));
+    }
+
     /// The document has to name every variable it uses, or GitHub rejects the whole query.
     #[test]
     fn the_query_document_declares_the_variables_it_sends() {
         for var in ["$q", "$hits", "$reviews"] {
             assert!(
-                CHANGES_REQUESTED_DOCUMENT.matches(var).count() >= 2,
+                PR_REVIEWS_DOCUMENT.matches(var).count() >= 2,
                 "{var} should be both declared and used"
             );
         }
+    }
+
+    // ── Approved body parsing ─────────────────────────────────────────────────
+
+    /// Shorthand: classify an APPROVED (GraphQL) response.
+    fn approved_resp(status: StatusCode, h: &HeaderMap, body: &str, now: u64) -> PollResult {
+        classify_with(status, h, body, now, parse_approved)
+    }
+
+    /// One search hit with the given latest opinionated review states, each from a distinct reviewer.
+    fn reviewed(url: &str, states: &[&str]) -> String {
+        let reviews = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!(r#"{{"state":"{s}","author":{{"login":"r{i}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"url":"{url}","latestOpinionatedReviews":{{"nodes":[{reviews}]}},"reviewRequests":{{"nodes":[]}}}}"#
+        )
+    }
+
+    /// The case that motivated the axis: a real approval in a repository where `reviewDecision` is
+    /// `null`, so `review:approved` never matched it. Read off the reviews, it counts.
+    #[test]
+    fn an_approval_lights_the_bar_and_hands_out_its_url() {
+        let body = payload(&[reviewed("https://github.com/o/r/pull/2204", &["APPROVED"])]);
+        match approved_resp(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { present, count, urls, .. } => {
+                assert!(present);
+                assert_eq!(count, Some(1));
+                assert_eq!(urls, Some(vec!["https://github.com/o/r/pull/2204".to_string()]));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// One reviewer's yes does not outrank another's no. This is also what keeps the green and amber
+    /// bars disjoint now that neither is filtered server-side.
+    #[test]
+    fn a_standing_objection_vetoes_an_approval() {
+        let body = payload(&[
+            reviewed("https://github.com/o/r/pull/1", &["APPROVED", "CHANGES_REQUESTED"]),
+            reviewed("https://github.com/o/r/pull/2", &["CHANGES_REQUESTED", "APPROVED"]),
+            reviewed("https://github.com/o/r/pull/3", &["APPROVED", "APPROVED"]),
+        ]);
+        match approved_resp(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { count, urls, .. } => {
+                assert_eq!(count, Some(1), "only the unanimously approved PR counts");
+                assert_eq!(urls, Some(vec!["https://github.com/o/r/pull/3".to_string()]));
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// The server hands over *every* open PR, so this predicate is the only filter there is. Anything
+    /// short of an `APPROVED` verdict — no reviews, a review list missing from the payload, or a state
+    /// this parser does not know — must read as "not approved", the reverse of `still_on_you`'s lenience.
+    #[test]
+    fn without_an_approved_verdict_nothing_is_counted() {
+        let body = payload(&[
+            reviewed("https://github.com/o/r/pull/1", &[]),
+            reviewed("https://github.com/o/r/pull/2", &["COMMENTED"]),
+            reviewed("https://github.com/o/r/pull/3", &["DISMISSED"]),
+            r#"{"url":"https://github.com/o/r/pull/4"}"#.to_string(),
+        ]);
+        match approved_resp(StatusCode::OK, &headers(&[]), &body, 0) {
+            PollResult::Fresh { present, count, urls, .. } => {
+                assert!(!present);
+                assert_eq!(count, Some(0));
+                assert_eq!(urls, Some(vec![]), "confirmed empty, not unreadable");
+            }
+            other => panic!("expected Fresh, got {:?}", other),
+        }
+    }
+
+    /// Same error path as the changes-requested parser: a GraphQL-level failure must hold the last
+    /// count rather than darken the bar.
+    #[test]
+    fn approved_graphql_errors_are_transient() {
+        let body = r#"{"data":null,"errors":[{"message":"API rate limit exceeded"}]}"#;
+        assert!(matches!(
+            approved_resp(StatusCode::OK, &headers(&[]), body, 0),
+            PollResult::Transient(_)
+        ));
     }
 
     // ── Search body parsing ───────────────────────────────────────────────────
